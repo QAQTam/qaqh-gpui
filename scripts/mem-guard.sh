@@ -8,7 +8,7 @@ set -euo pipefail
 THRESHOLD_MB="${1:-1100}"
 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then shift; fi
 
-avail_mb() { free -m | awk '/^Mem:/{print $7}'; }
+avail_mb() { LC_ALL=C free -m | awk '/^Mem:/{print $7}'; }
 
 while :; do
   avail="$(avail_mb)"
