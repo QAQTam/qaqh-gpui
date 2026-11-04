@@ -1,14 +1,15 @@
-//! 元素构建(M1):暗色主题常量 + 侧栏/时间线渲染。
+//! 元素构建(M2):暗色主题 + 侧栏/时间线/composer/交互应答按钮。
 //! `Entity<T: Render>` 即元素:DaemonStore 为根,SessionStore 经实体直接挂载。
 
 use gpui::prelude::*;
 use gpui::AnyElement;
-use gpui::FontWeight;
 use gpui::ClickEvent;
 use gpui::Context;
 use gpui::Div;
+use gpui::FontWeight;
 use gpui::InteractiveElement;
 use gpui::IntoElement;
+use gpui::KeyDownEvent;
 use gpui::ParentElement;
 use gpui::Render;
 use gpui::SharedString;
@@ -18,14 +19,17 @@ use gpui::Window;
 use gpui::div;
 use gpui::px;
 use gpui::rgb;
+use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
 use qaqh_ringing_contract::fact::ContentValue;
+use qaqh_ringing_contract::fact::InteractionKind;
 use qaqh_ringing_contract::state::TimelineEntry;
 use qaqh_ringing_contract::state::ToolCallState;
 use qaqh_ringing_contract::state::ToolCallView;
 
 use crate::store::DaemonStore;
 use crate::store::SessionStore;
+use crate::store::SessionRow;
 use crate::store::StreamState;
 
 const BG: u32 = 0x111419;
@@ -86,7 +90,7 @@ fn stream_badge(state: &StreamState) -> Div {
 }
 
 fn sidebar_row(
-    row: &crate::store::SessionRow,
+    row: &SessionRow,
     selected: bool,
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
@@ -149,7 +153,16 @@ impl Render for DaemonStore {
                     .text_color(rgb(DIM))
                     .child(format!("会话({})", self.sessions.len())),
             )
-            .child(div().id("session-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().children(rows))
+            .child(
+                div()
+                    .id("session-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
             .child(
                 div()
                     .px_3()
@@ -158,12 +171,7 @@ impl Render for DaemonStore {
                     .border_color(rgb(PANEL_LINE))
                     .text_xs()
                     .text_color(rgb(DIM))
-                    .child(
-                        self.lines
-                            .last()
-                            .cloned()
-                            .unwrap_or_default(),
-                    ),
+                    .child(self.lines.last().cloned().unwrap_or_default()),
             );
 
         let main = match self.current.clone() {
@@ -178,7 +186,13 @@ impl Render for DaemonStore {
                 .child("正在连接 daemon…"),
         };
 
-        div().size_full().flex().bg(rgb(BG)).text_color(rgb(TEXT)).child(sidebar).child(main)
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .child(sidebar)
+            .child(main)
     }
 }
 
@@ -276,12 +290,14 @@ fn tool_card(tool: &ToolCallView, tail: Option<&String>) -> Div {
 
 fn timeline_entry(entry: &TimelineEntry, store: &SessionStore) -> Option<AnyElement> {
     match entry {
-        TimelineEntry::Input { content, .. } => Some(user_bubble(content_text(content)).into_any_element()),
+        TimelineEntry::Input { content, .. } => {
+            Some(user_bubble(content_text(content)).into_any_element())
+        }
         TimelineEntry::AssistantBlock {
-            block_kind, content, ..
-        } => Some(
-            assistant_text(block_kind, content_text(content), false).into_any_element(),
-        ),
+            block_kind,
+            content,
+            ..
+        } => Some(assistant_text(block_kind, content_text(content), false).into_any_element()),
         TimelineEntry::ToolCall { call_id, .. } => {
             let tool = store.tools.iter().find(|tool| &tool.call_id == call_id)?;
             let tail = store
@@ -302,10 +318,101 @@ fn timeline_entry(entry: &TimelineEntry, store: &SessionStore) -> Option<AnyElem
     }
 }
 
+fn action_button(
+    id: String,
+    label: &'static str,
+    color: u32,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id))
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(rgb(0x1f2630))
+        .text_color(rgb(color))
+        .hover(|style| style.bg(rgb(0x27303d)))
+        .on_click(listener)
+        .child(label)
+}
+
+fn interaction_card(
+    kind_label: &str,
+    request: &str,
+    choices_note: Option<String>,
+    buttons: Vec<AnyElement>,
+) -> Div {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(WARN))
+        .bg(rgb(0x241f14));
+    card = card.child(
+        div()
+            .text_sm()
+            .text_color(rgb(WARN))
+            .child(SharedString::from(format!("待交互 · {kind_label}"))),
+    );
+    card = card.child(div().text_sm().child(SharedString::from(request.to_string())));
+    if let Some(note) = choices_note {
+        card = card.child(div().text_xs().text_color(rgb(DIM)).child(note));
+    }
+    if !buttons.is_empty() {
+        card = card.child(div().flex().gap_2().children(buttons));
+    }
+    card
+}
+
+impl SessionStore {
+    fn composer_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let modifiers = &keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return;
+        }
+        match keystroke.key.as_str() {
+            "enter" => {
+                if modifiers.shift {
+                    self.composer_push("\n");
+                } else {
+                    self.composer_send();
+                }
+                cx.notify();
+            }
+            "backspace" => {
+                self.composer_backspace();
+                cx.notify();
+            }
+            "space" => {
+                self.composer_push(" ");
+                cx.notify();
+            }
+            "tab" | "escape" | "up" | "down" | "left" | "right" | "home" | "end"
+            | "pageup" | "pagedown" | "delete" => {}
+            key => {
+                if let Some(key_char) = keystroke.key_char.clone() {
+                    self.composer_push(&key_char);
+                    cx.notify();
+                } else if key.len() == 1 {
+                    self.composer_push(key);
+                    cx.notify();
+                }
+            }
+        }
+    }
+}
+
 impl Render for SessionStore {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.title.clone().unwrap_or_else(|| self.session_id.clone());
-        let header = div()
+        let mut header = div()
             .flex()
             .items_center()
             .gap_2()
@@ -314,8 +421,29 @@ impl Render for SessionStore {
             .border_b_1()
             .border_color(rgb(PANEL_LINE))
             .bg(rgb(PANEL))
-            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
+            )
             .child(stream_badge(&self.stream));
+        if self.activity == Some(ActivityState::Running) {
+            let cancel = cx.listener(move |store: &mut SessionStore, _, _, cx| {
+                store.cancel_turn();
+                cx.notify();
+            });
+            header = header.child(
+                div().flex_1().child(div()).child(
+                    action_button(
+                        format!("cancel-{}", self.session_id),
+                        "中断",
+                        BAD,
+                        cancel,
+                    ),
+                ),
+            );
+        }
 
         let timeline = div()
             .id("timeline")
@@ -338,7 +466,9 @@ impl Render for SessionStore {
                 div()
                     .text_xs()
                     .text_color(rgb(DIM))
-                    .child(SharedString::from(format!("正在生成 {name} 参数… {text}")))
+                    .child(SharedString::from(format!(
+                        "正在生成 {name} 参数… {text}"
+                    )))
                     .into_any_element()
             }))
             .children(self.tools.iter().filter_map(|tool| {
@@ -366,6 +496,36 @@ impl Render for SessionStore {
                     .into_any_element()
             }));
 
+        let focused = self.composer_focus.is_focused(window);
+        let composer = div()
+            .id("composer")
+            .mx_3()
+            .mb_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .min_h(px(38.))
+            .border_1()
+            .border_color(rgb(if focused { ACCENT } else { PANEL_LINE }))
+            .bg(rgb(PANEL))
+            .cursor_pointer()
+            .key_context("Composer")
+            .track_focus(&self.composer_focus)
+            .on_click(cx.listener(
+                |store: &mut SessionStore,
+                 _,
+                 window: &mut Window,
+                 cx: &mut Context<SessionStore>| {
+                    window.focus(&store.composer_focus, cx);
+                },
+            ))
+            .on_key_down(cx.listener(Self::composer_key))
+            .child(if self.composer.is_empty() {
+                div().text_sm().text_color(rgb(DIM)).child("输入消息,Enter 发送…")
+            } else {
+                div().text_sm().child(self.composer.clone())
+            });
+
         let mut footer = div()
             .flex()
             .flex_col()
@@ -379,31 +539,93 @@ impl Render for SessionStore {
             if interaction.resolution.is_some() {
                 continue;
             }
-            footer = footer.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .text_sm()
-                    .child(
-                        div()
-                            .text_color(rgb(WARN))
-                            .child(SharedString::from(format!("待交互({:?})", interaction.kind))),
-                    )
-                    .child(div().text_color(rgb(TEXT)).child(
-                        SharedString::from(content_text(&interaction.request).to_string()),
-                    ))
-                    .child(div().text_xs().text_color(rgb(DIM)).child("M2 提供应答")),
-            );
+            let uid = interaction.interaction_id.0.clone();
+            let buttons: Vec<AnyElement> = match interaction.kind {
+                InteractionKind::Permission => {
+                    let Some(call_id) = &interaction.call_id else {
+                        continue;
+                    };
+                    let call = call_id.0.clone();
+                    let allow = cx.listener(
+                        move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
+                            store.respond_permission(call.clone(), true);
+                            cx.notify();
+                        },
+                    );
+                    let call = call_id.0.clone();
+                    let deny = cx.listener(
+                        move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
+                            store.respond_permission(call.clone(), false);
+                            cx.notify();
+                        },
+                    );
+                    vec![
+                        action_button(format!("{uid}-allow"), "允许", OK, allow).into_any_element(),
+                        action_button(format!("{uid}-deny"), "拒绝", BAD, deny).into_any_element(),
+                    ]
+                }
+                InteractionKind::Plan => {
+                    let iid = interaction.interaction_id.0.clone();
+                    let approve = cx.listener(
+                        move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
+                            store.respond_plan(iid.clone(), true);
+                            cx.notify();
+                        },
+                    );
+                    let iid = interaction.interaction_id.0.clone();
+                    let reject = cx.listener(
+                        move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
+                            store.respond_plan(iid.clone(), false);
+                            cx.notify();
+                        },
+                    );
+                    vec![
+                        action_button(format!("{uid}-approve"), "批准", OK, approve)
+                            .into_any_element(),
+                        action_button(format!("{uid}-reject"), "拒绝", BAD, reject)
+                            .into_any_element(),
+                    ]
+                }
+                InteractionKind::Ask => Vec::new(),
+            };
+            let choices_note = match interaction.kind {
+                InteractionKind::Ask if !interaction.choices.is_empty() => {
+                    let labels: Vec<String> =
+                        interaction.choices.iter().map(|c| c.label.clone()).collect();
+                    Some(format!("可选:{}", labels.join(" / ")))
+                }
+                _ => None,
+            };
+            footer = footer.child(interaction_card(
+                match interaction.kind {
+                    InteractionKind::Permission => "工具权限",
+                    InteractionKind::Plan => "计划评审",
+                    InteractionKind::Ask => "提问",
+                },
+                content_text(&interaction.request),
+                choices_note,
+                buttons,
+            ));
         }
         let activity = self
             .activity
             .map(|activity| format!("{activity:?}"))
             .unwrap_or_else(|| "未知".into());
-        footer = footer.child(div().text_xs().text_color(rgb(DIM)).child(SharedString::from(format!(
-            "活动状态:{activity}"
-        ))));
+        footer = footer.child(
+            div()
+                .text_xs()
+                .text_color(rgb(DIM))
+                .child(SharedString::from(format!("活动状态:{activity}"))),
+        );
 
-        div().flex_1().min_w_0().flex().flex_col().child(header).child(timeline).child(footer)
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(timeline)
+            .child(composer)
+            .child(footer)
     }
 }

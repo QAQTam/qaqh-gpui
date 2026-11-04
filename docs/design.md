@@ -185,12 +185,13 @@ GPUI 惯用法(已从 0.2.2 源码核实):
 
 ## 6. 风险与开放问题
 
-1. **构建内存**:-j1 下重包(wgpu/resvg/icu)单包峰值仍可能 ~1Gi;守卫阈值 1050MB,必要时降到 950MB 再试。build 期(链接)比 check 更险,放到白天人多时也可。
-2. **运行内存**:GPUI 渲染常驻估 200–400MB,与两个 ZCode 共存需实测;M0 起窗即记录。
-3. **wgpu/驱动**:zed fork wgpu 在本机 GPU 的表现未经窗口实测;`--probe` 只验协议层。
-4. **字体**:Linux 上 gpui 走系统字体;若默认字体族解析失败,参考 `examples/example_support/fonts.rs` 捆绑。
-5. **契约代际**:`ringing-commands-7` / `ringing-session-2` 仍在演进(exec spec 落地中);前端锁 SDK 即锁契约,无漂移风险。
-6. **qaqh-electron 功能面对照**:GPUI 版先覆盖 TUI 已验证的只读+交互路径,Electron 的设备配对/设置界面列 M3+ 再评。
+1. **构建内存**:-j1 下实测全树 rustc 峰值 ~200–400MB,check/build 均顺利(夜测 729 包 build ~10–15 分钟)。守卫阈值可保持 1100MB。
+2. **x11 后端**:本机为 Wayland 会话且缺 `libxkbcommon-x11-dev`(无 sudo),链接报 `unable to find library -lxkbcommon-x11`。已按本机事实配置为 **wayland-only**;要 x11:`sudo apt install libxkbcommon-x11-dev` 后在 Cargo.toml 加回 `x11` feature。
+3. **运行内存**:GPUI 渲染常驻估 200–400MB,与两个 ZCode 共存需实测;起窗即记录。
+4. **wgpu/驱动**:zed fork wgpu 在本机 GPU 的表现未经窗口实测;`--probe` 只验协议层。
+5. **字体**:Linux 上 gpui 走系统字体;若默认字体族解析失败,参考 `examples/example_support/fonts.rs` 捆绑。
+6. **契约代际**:`ringing-commands-7` / `ringing-session-2` 仍在演进(exec spec 落地中);前端锁 SDK 即锁契约,无漂移风险。
+7. **qaqh-electron 功能面对照**:GPUI 版先覆盖 TUI 已验证的只读+交互路径,Electron 的设备配对/设置界面列 M3+ 再评。
 
 ## 7. 烟雾版使用
 
@@ -199,3 +200,26 @@ cargo run -- --probe     # 无 GUI:打印 discovery → open_v2 → session.list
 cargo run                # 窗口:同序列状态行滚动显示
 scripts/mem-guard.sh 1050 cargo build -j1   # 低水位时的构建姿势
 ```
+
+## 8. 夜间实施与验证结果(2026-11-05 凌晨)
+
+M0/M1/M2 全部落地并实盘验证:
+
+| 验证项 | 结果 |
+|---|---|
+| 依赖树(729 包)`cargo check -j1` | ✅ 全绿 |
+| `cargo build -j1`(wayland-only) | ✅ 187MB debug 二进制 |
+| `--probe` 对真实 daemon(release 版) | ✅ discovery → v2 open(双契约代际 ringing-commands-7 / ringing-session-2 匹配)→ session.list |
+| 协议直发(curl)`session.create` | ✅ receipt `accepted` + sync_result(D2 形状),会话 `ses_01M6…` |
+| 窗口(Wayland)实盘 | ✅ 连接建立(/proc/net/tcp 实证)、稳定 30s+、零 stderr、RSS ~135MB、CPU ~7–26% |
+| M2(composer/权限/plan 应答/中断) | ✅ 已入 src,check/build 全绿 |
+
+夜间发现并修复的问题:
+1. **mem-guard locale 陷阱**:`free` 中文标签(内存:)使 `/^Mem:/` 永不匹配 → 守卫永久等待;修为 `LC_ALL=C free`。
+2. **x11 后端无法链接**:本机无 `libxkbcommon-x11-dev` 且无 sudo → 配置改为 wayland-only(Cargo.toml 注明恢复方法)。
+3. **"runtime inside runtime" panic**:`qaqh-client` 自带全局 tokio runtime,`Client::connect`(同步)内部 block_on;桥线程自建 runtime 必炸。修为 `runtime_handle().block_on` + `connect_async`。
+4. **Entity::update 返回 `()`**(此 gpui 版本)不能 `?`;`overflow_y_scroll` 需要 stateful(`.id()`);`min_0` 不存在(用 `min_w_0/min_h_0`);Keystroke 无 `ime` 字段(用 `key_char`)。
+
+环境备注:
+- daemon(release 版,夜间拉起)保持运行,discovery 在 `~/.config/qaqh/daemon.json`(注意本会话 HOME/XDG 被重定向到 zcode-double-open)。
+- 留下一个空测试会话 `ses_01M6KXWJSBE5EAX3C0NZR5DRC9`(night-probe 创建,无任何模型调用,可删)。

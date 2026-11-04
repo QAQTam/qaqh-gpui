@@ -1,9 +1,11 @@
-//! GPUI 实体状态(M1):字段直持 RingingV2 契约类型,零前端 DTO。
+//! GPUI 实体状态(M2):字段直持 RingingV2 契约类型,零前端 DTO。
+//! composer 为轻量 key_down 输入(gpui 0.2.2 无内置 Input 组件)。
 
 use futures::channel::mpsc::UnboundedSender;
 use gpui::AppContext as _;
 use gpui::Context;
 use gpui::Entity;
+use gpui::FocusHandle;
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
 use qaqh_ringing_contract::fact::BlockId;
@@ -53,10 +55,18 @@ pub struct SessionStore {
     pub exec_output_tail: Vec<(ExecSessionId, u64, String)>,
     pub driver: Option<DriverState>,
     pub stream: StreamState,
+    /// composer 状态(M2)。
+    pub composer: String,
+    pub composer_focus: FocusHandle,
+    requests: UnboundedSender<BridgeRequest>,
 }
 
 impl SessionStore {
-    pub fn new(session_id: String) -> Self {
+    pub fn new(
+        session_id: String,
+        requests: UnboundedSender<BridgeRequest>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             session_id,
             title: None,
@@ -75,7 +85,58 @@ impl SessionStore {
             exec_output_tail: Vec::new(),
             driver: None,
             stream: StreamState::Connecting,
+            composer: String::new(),
+            composer_focus: cx.focus_handle(),
+            requests,
         }
+    }
+
+    pub fn composer_push(&mut self, text: &str) {
+        self.composer.push_str(text);
+    }
+
+    pub fn composer_backspace(&mut self) {
+        self.composer.pop();
+    }
+
+    /// 发送 composer 内容;空文本不发。
+    pub fn composer_send(&mut self) {
+        let text = self.composer.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.composer.clear();
+        let _ = self.requests.unbounded_send(BridgeRequest::SendMessage {
+            seed: self.session_id.clone(),
+            text,
+        });
+    }
+
+    pub fn respond_permission(&mut self, tool_call_id: String, approved: bool) {
+        let _ = self
+            .requests
+            .unbounded_send(BridgeRequest::RespondPermission {
+                seed: self.session_id.clone(),
+                tool_call_id,
+                approved,
+            });
+    }
+
+    pub fn respond_plan(&mut self, interaction_id: String, approved: bool) {
+        let _ = self
+            .requests
+            .unbounded_send(BridgeRequest::RespondPlan {
+                seed: self.session_id.clone(),
+                interaction_id,
+                approved,
+            });
+    }
+
+    pub fn cancel_turn(&mut self) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Cancel {
+            seed: self.session_id.clone(),
+            turn_id: self.current_turn_id.as_ref().map(|id| id.0.clone()),
+        });
     }
 }
 
@@ -206,7 +267,8 @@ impl DaemonStore {
     }
 
     pub fn select(&mut self, seed: String, cx: &mut Context<Self>) {
-        self.current = Some(cx.new(|_| SessionStore::new(seed.clone())));
+        let requests = self.requests.clone();
+        self.current = Some(cx.new(|cx| SessionStore::new(seed.clone(), requests, cx)));
         let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
         cx.notify();
     }

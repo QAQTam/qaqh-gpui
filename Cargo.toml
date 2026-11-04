@@ -13,19 +13,19 @@ futures = "0.3"
 # gpui 固定在本地检出的 ../gpui 仓库:
 #   rev d1520011e6204b95b320ee40a5a6b11879082426(该仓无远端,path 依赖 + rev 记录替代 git rev 钉版)
 # 拆平台版结构:gpui 是平台无关核心,Linux 后端经 gpui_platform(wayland/x11)接线。
+# 本机为 Wayland 会话且无 libxkbcommon-x11-dev(无 sudo),x11 后端无法链接——
+# wayland-only 是本机的正确配置;要 x11:apt install libxkbcommon-x11-dev 后加回。
 gpui = { path = "../gpui/crates/gpui", default-features = false, features = [
     "font-kit",
     "wayland",
-    "x11",
 ] }
-gpui_platform = { path = "../gpui/crates/gpui_platform", features = ["wayland", "x11"] }
+gpui_platform = { path = "../gpui/crates/gpui_platform", features = ["wayland"] }
 # RingingV2 传输权威实现(与 qaqh-tui 同路:跨仓 path 依赖,后端仓必须与该相对路径共存)。
 # 协议类型经它转出,前端零自建、零转换层。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
 # 契约类型直用(store 字段直接持有 TimelineEntry/ToolCallView 等),非转换层。
 qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt"] }
 
 [patch.crates-io]
 # 与 ../gpui workspace 保持逐字一致:跨 workspace 时 [patch] 不传播,缺失会让

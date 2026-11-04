@@ -67,13 +67,10 @@ pub enum BridgeRequest {
 }
 
 /// `--probe`:无 GUI 连通性验证,打印与窗口相同的状态行。
+/// 复用 qaqh-client 的全局 tokio 运行时(SDK connect 内部会 block_on,
+/// 自建 runtime 会"runtime inside runtime"崩溃)。
 pub fn probe() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    runtime.block_on(async {
+    qaqh_client::runtime_handle().block_on(async {
         run_connection(|line| println!("{line}")).await;
     });
 }
@@ -107,10 +104,12 @@ pub async fn run_connection(report: impl Fn(String)) {
     };
 
     let _ = discovery;
-    let client = match Client::connect(ClientOptions {
+    let client = match Client::connect_async(ClientOptions {
         launch_daemon_if_missing: false,
         ..ClientOptions::default()
-    }) {
+    })
+    .await
+    {
         Ok(client) => client,
         Err(error) => {
             report(format!("连接失败:{error}"));
@@ -154,14 +153,9 @@ pub async fn run_connection(report: impl Fn(String)) {
     }
 }
 
-/// 桥线程主循环:在私有 tokio 运行时里连接 daemon,挂四个回调,然后服务请求。
+/// 桥线程主循环:复用 qaqh-client 的全局 tokio 运行时,挂四个回调,服务请求。
 pub fn run(to_ui: UnboundedSender<BridgeMsg>, requests: UnboundedReceiver<BridgeRequest>) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    runtime.block_on(serve(to_ui, requests));
+    qaqh_client::runtime_handle().block_on(serve(to_ui, requests));
 }
 
 async fn serve(
@@ -206,11 +200,13 @@ async fn serve(
         },
     };
 
-    let client = match Client::connect(ClientOptions {
+    let client = match Client::connect_async(ClientOptions {
         handlers,
         launch_daemon_if_missing: false,
         ..ClientOptions::default()
-    }) {
+    })
+    .await
+    {
         Ok(client) => client,
         Err(error) => {
             send_line(&to_ui, &format!("连接失败:{error}"));

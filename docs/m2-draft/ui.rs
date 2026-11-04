@@ -339,7 +339,6 @@ fn action_button(
 }
 
 fn interaction_card(
-    uid: String,
     kind_label: &str,
     request: &str,
     choices_note: Option<String>,
@@ -398,9 +397,8 @@ impl SessionStore {
             "tab" | "escape" | "up" | "down" | "left" | "right" | "home" | "end"
             | "pageup" | "pagedown" | "delete" => {}
             key => {
-                if let Some(ime) = &keystroke.ime {
-                    let owned = ime.clone();
-                    self.composer_push(&owned);
+                if let Some(key_char) = keystroke.key_char.clone() {
+                    self.composer_push(&key_char);
                     cx.notify();
                 } else if key.len() == 1 {
                     self.composer_push(key);
@@ -514,8 +512,11 @@ impl Render for SessionStore {
             .key_context("Composer")
             .track_focus(&self.composer_focus)
             .on_click(cx.listener(
-                |store: &mut SessionStore, _, window: &mut Window, _| {
-                    window.focus(&store.composer_focus);
+                |store: &mut SessionStore,
+                 _,
+                 window: &mut Window,
+                 cx: &mut Context<SessionStore>| {
+                    window.focus(&store.composer_focus, cx);
                 },
             ))
             .on_key_down(cx.listener(Self::composer_key))
@@ -596,7 +597,6 @@ impl Render for SessionStore {
                 _ => None,
             };
             footer = footer.child(interaction_card(
-                uid,
                 match interaction.kind {
                     InteractionKind::Permission => "工具权限",
                     InteractionKind::Plan => "计划评审",

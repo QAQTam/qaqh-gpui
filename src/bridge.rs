@@ -1,10 +1,4 @@
-//! tokio ↔ gpui 桥(M1)。
-//!
-//! `qaqh-client` 是 RingingV2 传输权威(TUI 同款),它活在 tokio 上;
-//! GPUI 活在自己的 executor 上。桥 = 一个独立 tokio 运行时线程:
-//! - 出向:`ClientHandlers` 四回调把 SDK 托管流的事件投进 `BridgeMsg` channel;
-//! - 入向:循环消费 `BridgeRequest`,驱动 attach/activate/bootstrap。
-//! 协议类型原样传递,不做任何转换层(宪法 #9)。
+//! tokio ↔ gpui 桥(M2:命令面直发)。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +9,10 @@ use qaqh_client::discovery::ensure_daemon_running;
 use qaqh_client::discovery::read_discovery;
 use qaqh_client::discovery::DiscoveryExt;
 use qaqh_client::v2_stream::V2StreamStatus;
-use qaqh_client::{Client, ClientHandlers, ClientOptions, RingingV2ResyncRequired};
+use qaqh_client::{
+    Client, ClientHandlers, ClientOptions, CommandOptions, CommandTarget, ConversationSendMessage,
+    InputPurpose, RingingCommand, RingingV2ResyncRequired,
+};
 use qaqh_ringing_contract::events::SessionEventFrame;
 use qaqh_ringing_contract::state::SessionState;
 use serde_json::json;
@@ -26,7 +23,7 @@ fn send_line(to_ui: &UnboundedSender<BridgeMsg>, text: &str) {
 
 /// 桥 → GPUI 方向的消息。
 pub enum BridgeMsg {
-    /// M0 风格的人类可读状态行。
+    /// 人类可读状态行(含命令受理/失败报告)。
     Line(String),
     /// `session.list` 结果(已 sanitize)。
     Sessions(serde_json::Value),
@@ -48,16 +45,32 @@ pub enum BridgeRequest {
     Select(String),
     /// 重新 bootstrap 并投递快照(reset 后)。
     Refill(String),
+    /// conversation.send_message。
+    SendMessage { seed: String, text: String },
+    /// tool.permission.respond。
+    RespondPermission {
+        seed: String,
+        tool_call_id: String,
+        approved: bool,
+    },
+    /// plan.review.respond。
+    RespondPlan {
+        seed: String,
+        interaction_id: String,
+        approved: bool,
+    },
+    /// conversation.cancel。
+    Cancel {
+        seed: String,
+        turn_id: Option<String>,
+    },
 }
 
 /// `--probe`:无 GUI 连通性验证,打印与窗口相同的状态行。
+/// 复用 qaqh-client 的全局 tokio 运行时(SDK connect 内部会 block_on,
+/// 自建 runtime 会"runtime inside runtime"崩溃)。
 pub fn probe() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    runtime.block_on(async {
+    qaqh_client::runtime_handle().block_on(async {
         run_connection(|line| println!("{line}")).await;
     });
 }
@@ -91,10 +104,12 @@ pub async fn run_connection(report: impl Fn(String)) {
     };
 
     let _ = discovery;
-    let client = match Client::connect(ClientOptions {
+    let client = match Client::connect_async(ClientOptions {
         launch_daemon_if_missing: false,
         ..ClientOptions::default()
-    }) {
+    })
+    .await
+    {
         Ok(client) => client,
         Err(error) => {
             report(format!("连接失败:{error}"));
@@ -138,14 +153,9 @@ pub async fn run_connection(report: impl Fn(String)) {
     }
 }
 
-/// 桥线程主循环:在私有 tokio 运行时里连接 daemon,挂四个回调,然后服务请求。
+/// 桥线程主循环:复用 qaqh-client 的全局 tokio 运行时,挂四个回调,服务请求。
 pub fn run(to_ui: UnboundedSender<BridgeMsg>, requests: UnboundedReceiver<BridgeRequest>) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    runtime.block_on(serve(to_ui, requests));
+    qaqh_client::runtime_handle().block_on(serve(to_ui, requests));
 }
 
 async fn serve(
@@ -190,11 +200,13 @@ async fn serve(
         },
     };
 
-    let client = match Client::connect(ClientOptions {
+    let client = match Client::connect_async(ClientOptions {
         handlers,
         launch_daemon_if_missing: false,
         ..ClientOptions::default()
-    }) {
+    })
+    .await
+    {
         Ok(client) => client,
         Err(error) => {
             send_line(&to_ui, &format!("连接失败:{error}"));
@@ -246,7 +258,91 @@ async fn serve(
                 refill(&client, &to_ui, &seed).await;
             }
             BridgeRequest::Refill(seed) => refill(&client, &to_ui, &seed).await,
+            BridgeRequest::SendMessage { seed, text } => {
+                send_command(
+                    &client,
+                    &to_ui,
+                    &seed,
+                    RingingCommand::ConversationSendMessage(ConversationSendMessage {
+                        text,
+                        images: Vec::new(),
+                        attachments: None,
+                        message_id: None,
+                        input_purpose: InputPurpose::default(),
+                        as_system: false,
+                        inter_agent: None,
+                        subagent_terminal: None,
+                    }),
+                )
+                .await;
+            }
+            BridgeRequest::RespondPermission {
+                seed,
+                tool_call_id,
+                approved,
+            } => {
+                send_command(
+                    &client,
+                    &to_ui,
+                    &seed,
+                    RingingCommand::ToolPermissionRespond {
+                        tool_call_id,
+                        approved,
+                        trust_folder: false,
+                    },
+                )
+                .await;
+            }
+            BridgeRequest::RespondPlan {
+                seed,
+                interaction_id,
+                approved,
+            } => {
+                send_command(
+                    &client,
+                    &to_ui,
+                    &seed,
+                    RingingCommand::PlanReviewRespond {
+                        interaction_id,
+                        approved,
+                        message: None,
+                        autonomous: false,
+                    },
+                )
+                .await;
+            }
+            BridgeRequest::Cancel { seed, turn_id } => {
+                send_command(
+                    &client,
+                    &to_ui,
+                    &seed,
+                    RingingCommand::ConversationCancel { turn_id },
+                )
+                .await;
+            }
         }
+    }
+}
+
+/// 命令直发(target = Session);ack/错误如实上报。
+async fn send_command(
+    client: &Client,
+    to_ui: &UnboundedSender<BridgeMsg>,
+    seed: &str,
+    command: RingingCommand,
+) {
+    let target = CommandTarget::Session {
+        session_id: seed.to_string(),
+    };
+    match client
+        .send_command_v2_typed(target, command, CommandOptions::default())
+        .await
+    {
+        Ok(ack) => send_line(
+            to_ui,
+            &format!("命令 {} 受理:{:?}", ack.command_id, ack.status),
+        ),
+        Err(error) => send_line(to_ui, &format!("命令发送失败:{error}")),
     }
 }
 
