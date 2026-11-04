@@ -36,7 +36,10 @@ calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee
 async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 
-# 内存受限环境(可用 ~1.5Gi):限制调试信息体积,降低链接期峰值。
+# 内存受限环境(可用 ~1.5Gi):与 ../gpui workspace 同款的 dev profile——
+# 16 个 codegen 单元压低单 crate 编译峰值,limited 调试信息压低产物与链接期峰值。
 [profile.dev]
 incremental = true
+codegen-units = 16
+split-debuginfo = "unpacked"
 debug = "limited"
