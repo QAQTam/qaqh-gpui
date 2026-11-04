@@ -1,0 +1,5 @@
+[toolchain]
+# 与 ../gpui 的 rust-toolchain.toml 对齐,复用已装工具链(无额外下载)。
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

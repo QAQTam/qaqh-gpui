@@ -1,0 +1,41 @@
+[package]
+name = "qaqh-gpui"
+version = "0.1.0"
+edition = "2024"
+description = "QAQ-Harness GPUI 桌面前端(RingingV2 客户端)"
+
+[[bin]]
+name = "qaqh-gpui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+futures = "0.3"
+# gpui 固定在本地检出的 ../gpui 仓库:
+#   rev d1520011e6204b95b320ee40a5a6b11879082426(该仓无远端,path 依赖 + rev 记录替代 git rev 钉版)
+# 拆平台版结构:gpui 是平台无关核心,Linux 后端经 gpui_platform(wayland/x11)接线。
+gpui = { path = "../gpui/crates/gpui", default-features = false, features = [
+    "font-kit",
+    "wayland",
+    "x11",
+] }
+gpui_platform = { path = "../gpui/crates/gpui_platform", features = ["wayland", "x11"] }
+# RingingV2 传输权威实现(与 qaqh-tui 同路:跨仓 path 依赖,后端仓必须与该相对路径共存)。
+# 协议类型(qaqh-ringing / qaqh-ringing-contract)经它转出,前端零自建、零转换层。
+qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+
+[patch.crates-io]
+# 与 ../gpui workspace 保持逐字一致:跨 workspace 时 [patch] 不传播,缺失会让
+# calloop/async-process 等编译到上游版本而失败。
+windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+
+# 内存受限环境(可用 ~1.5Gi):限制调试信息体积,降低链接期峰值。
+[profile.dev]
+incremental = true
+debug = "limited"
