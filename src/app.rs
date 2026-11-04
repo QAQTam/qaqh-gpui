@@ -1,10 +1,9 @@
-//! GPUI 壳(烟雾版):一个窗口滚动显示 daemon 连接状态行。
+//! GPUI 壳(M1):窗口根 = DaemonStore 实体;桥线程 + 前台消息泵。
 
 use futures::StreamExt;
 use gpui::App;
 use gpui::AppContext as _;
 use gpui::Bounds;
-use gpui::Context;
 use gpui::Entity;
 use gpui::Render;
 use gpui::TitlebarOptions;
@@ -14,71 +13,43 @@ use gpui::WindowOptions;
 use gpui::div;
 use gpui::prelude::*;
 use gpui::px;
-use gpui::rgb;
 use gpui::size;
 
-struct StatusLog {
-    lines: Vec<String>,
+use crate::bridge;
+use crate::bridge::BridgeMsg;
+use crate::bridge::BridgeRequest;
+use crate::store::DaemonStore;
+
+struct RootShell {
+    daemon: Entity<DaemonStore>,
 }
 
-impl Render for StatusLog {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .bg(rgb(0x10141a))
-            .text_color(rgb(0xd8dee9))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_4()
-            .overflow_y_scroll()
-            .children(self.lines.iter().map(|line| div().child(line.clone())))
-    }
-}
-
-struct ShellView {
-    log: Entity<StatusLog>,
-}
-
-impl Render for ShellView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.log.clone())
+impl Render for RootShell {
+    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.daemon.clone())
     }
 }
 
 pub fn launch() {
     gpui_platform::application().run(|cx: &mut App| {
-        let status = cx.new(|_| StatusLog {
-            lines: vec!["qaqh-gpui 启动…".into()],
-        });
+        let (to_ui, mut from_bridge) = futures::channel::mpsc::unbounded::<BridgeMsg>();
+        let (request_tx, request_rx) = futures::channel::mpsc::unbounded::<BridgeRequest>();
+        let daemon = cx.new(|_| DaemonStore::new(request_tx));
+        let root = daemon.clone();
 
-        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<String>();
         std::thread::Builder::new()
             .name("qaqh-bridge".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                    .expect("tokio runtime");
-                runtime.block_on(crate::runtime::run_connection(move |line| {
-                    let _ = sender.unbounded_send(line);
-                }));
-            })
+            .spawn(move || bridge::run(to_ui, request_rx))
             .expect("spawn bridge thread");
 
         cx.spawn(async move |cx| {
-            while let Some(line) = receiver.next().await {
-                status.update(cx, |log, cx| {
-                    log.lines.push(line);
-                    cx.notify();
-                })?;
+            while let Some(message) = from_bridge.next().await {
+                daemon.update(cx, |store, cx| store.handle(message, cx));
             }
-            anyhow::Ok(())
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(720.), px(480.)), cx);
+        let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -89,9 +60,7 @@ pub fn launch() {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|_| ShellView {
-                    log: status.clone(),
-                })
+                cx.new(|_| RootShell { daemon: root.clone() })
             },
         )
         .expect("open window");

@@ -67,6 +67,19 @@ qaqh-client    = { path = "../qaqh-backend/crates/qaqh-client" }
 - 发送入口:`client.send_command_v2_typed(target: CommandTarget, command: RingingCommand, options: CommandOptions) -> RingingV2CommandAck`。ULID 自动生成;同 `command_id` 重发得幂等 receipt(D2,含 `sync_result`)。
 - `CommandTarget`:Global / Session / Workspace / ExecSession——target 即路由,前端按交互语境选。
 
+`RingingCommand` 词表(源码实测,serde tag = 命令名字符串):
+
+| 域 | 命令 |
+|---|---|
+| 会话 | `session.create { cwd,title,profile,effort,model_selection,tool_mode,custom_tools }` / `session.settings.patch` / `session.resume` / `session.attach` / `session.close` / `session.rename` / `session.archive` / `session.unarchive` / `session.delete` / `session.shutdown` |
+| 对话 | `conversation.send_message { text, images, attachments, message_id, input_purpose }` / `conversation.cancel { turn_id? }` |
+| 交互 | `interaction.ask.respond { interaction_id, answers }` / `interaction.ask.dismiss` / `plan.review.respond { approved, message?, autonomous }` / `tool.permission.respond { tool_call_id, approved, trust_folder }` |
+| 席位 | `driver.claim { client_session_id, stale_holder? }` / `driver.release` |
+| 执行会话 | `exec_session.interrupt` / `exec_session.terminate`(target 必为 ExecSession) |
+| 模型/配置 | `provider.list/upsert/delete`、`provider.model.upsert/delete`、`model.selection.set_default`、`config.save`、`config.set_permission_level`、`profile.create/set_default/apply/save_current/delete`、`agent.reload_config` |
+| 工作区 | `workspace.set/create/rename/delete/move_session/detach` |
+| 子代理 | `subagent.spawn { tools, model, base_url, max_tokens, workspace, … }` |
+
 ### 3.3 读模型同步(水位 + resync)
 
 - `seq` = epoch 内 0 基单调序号;bootstrap `state.seq` 是**互斥上界**(已覆盖 `seq < state.seq`)。客户端:跳 `<`,处理 `>=`(D1)。
@@ -110,19 +123,31 @@ qaqh-client    = { path = "../qaqh-backend/crates/qaqh-client" }
 3. **tokio ↔ GPUI 桥是必要的执行器对接,不是协议转换**:reqwest future 必须在 tokio context 上 await;GPUI future 必须在其前台 executor 上驱动。桥体 = 一个 tokio 线程 + unbounded channel;事件经泵(`cx.spawn` 循环)进 store。
 4. **命令是异步请求**:UI 事件 → `store` 调 `runtime` → tokio 上 `send_command_v2_typed` → ack 经同一 channel 回流更新 UI 状态。receipt 幂等交给协议,UI 不造重试。
 
-### 4.2 会话订阅生命周期(前端泵协议)
+### 4.2 会话订阅生命周期(SDK 托管流,前端只管回调)
+
+核实 `qaqh-client/src/v2_stream.rs` 后确认:**bootstrap / 游标推进 / 断线退避重连 / epoch 失效归零 / resync 后重订阅全部由 SDK 的 `V2Stream` 托管**,前端不自建订阅循环:
 
 ```text
-open_v2 → 校验双契约代际(不匹配即拒绝连接,给可读错误)
-        → bootstrap_v2(session_id) → SessionState(seq 水位 + timeline/tools/interactions 全量)
-        → subscribe_v2(session_id, since_cursor = epoch:state.seq)
-        → 循环 next():
-             Event(frame)   → 跳 seq < 水位;按 20 变体 reducer 进 store;记录游标
-             Reset(_)       → 清空暂态与游标 → 重新 bootstrap → 重订阅(D6 语义)
-             KeepAlive      → 字节层探活,直通忽略
+Client::connect(ClientOptions { handlers, … })      // 回调在 connect 前挂好
+  → open_v2(校验双契约代际,不匹配即拒绝连接)
+  → attach(session_id)            // = session.resume 命令;lease 重协商后 SDK 自动重放
+  → activate_stream(session_id)   // SDK 起一条 per-seed V2Stream:
+                                  //   无游标→bootstrap_v2 取 state.seq 作游标→subscribe
+                                  //   事件逐帧 on_v2_event(seed, SessionEventFrame),游标随 seq 推进
+                                  //   resync_required→游标归零→SDK 自动重新 bootstrap+重订阅
+                                  //   断线→退避重连;epoch 变化→游标失效归零
 ```
 
-多会话 = 每 session 一个泵任务 + 一个 `SessionStore` 实体;`session.list` service 做侧栏。
+前端回调(SDK tokio 线程上投递,TUI 已验证同款姿势):
+
+| 回调 | 前端动作 |
+|---|---|
+| `on_v2_event(seed, frame)` | 按 id 幂等进 reducer(D1 残余重叠吸收),更新 `SessionStore` |
+| `on_v2_reset(seed, reset)` | 清该会话暂态缓冲(未 seal 文本/参数),自行 `bootstrap_v2` 重灌快照(D6);SDK 侧已自行重订阅 |
+| `on_v2_status(seed, V2StreamStatus)` | 连接状态徽标(Connecting/Open/Reconnecting/Closed) |
+| `on_liveness()` | 字节层存活信号(keepalive 也算),驱动「失联」判定,禁止按时间猜 |
+
+多会话 = 每 seed 一条 SDK 流(按 seed 键控,互不干扰)+ 一个 `SessionStore` 实体;`session.list` service 做侧栏。前台只显示中的会话保持 activate,离开的会话 `deactivate_stream`。
 
 ### 4.3 GPUI 侧设计
 

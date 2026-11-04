@@ -9,7 +9,6 @@ name = "qaqh-gpui"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
 futures = "0.3"
 # gpui 固定在本地检出的 ../gpui 仓库:
 #   rev d1520011e6204b95b320ee40a5a6b11879082426(该仓无远端,path 依赖 + rev 记录替代 git rev 钉版)
@@ -21,8 +20,10 @@ gpui = { path = "../gpui/crates/gpui", default-features = false, features = [
 ] }
 gpui_platform = { path = "../gpui/crates/gpui_platform", features = ["wayland", "x11"] }
 # RingingV2 传输权威实现(与 qaqh-tui 同路:跨仓 path 依赖,后端仓必须与该相对路径共存)。
-# 协议类型(qaqh-ringing / qaqh-ringing-contract)经它转出,前端零自建、零转换层。
+# 协议类型经它转出,前端零自建、零转换层。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
+# 契约类型直用(store 字段直接持有 TimelineEntry/ToolCallView 等),非转换层。
+qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt"] }
 
