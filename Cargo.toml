@@ -2,6 +2,7 @@
 name = "qaqh-gpui"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "QAQ-Harness GPUI 桌面前端(RingingV2 客户端)"
 
 [[bin]]
@@ -14,8 +15,8 @@ string_slice = "deny"
 [dependencies]
 futures = "0.3"
 # gpui 固定在本地检出的 ../gpui 仓库:
-#   rev d1520011e6204b95b320ee40a5a6b11879082426(该仓无远端,path 依赖 + rev 记录替代 git rev 钉版;
-#   该 fork 自 zed-industries/zed 上游 e21ff1b 逐字 vendor,2026-11 时点)
+#   https://github.com/QAQTam/gpui-vendor @ d1520011e6204b95b320ee40a5a6b11879082426
+#   vendor 源码取自 zed-industries/zed @ e21ff1b。
 # 拆平台版结构:gpui 是平台无关核心,Linux 后端经 gpui_platform(wayland/x11)接线。
 # 本机为 Wayland 会话且无 libxkbcommon-x11-dev(无 sudo),x11 后端无法链接——
 # wayland-only 是本机的正确配置;要 x11:apt install libxkbcommon-x11-dev 后加回。
