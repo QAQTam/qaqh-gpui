@@ -23,6 +23,7 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.title = state.title;
     store.turns = state.turns;
     store.entries = state.timeline;
+    store.timeline_list.reset(store.entries.len() + 1);
     store.tools = state.tools;
     store.interactions = state.interactions;
     store.subagents = state.subagents;
@@ -37,6 +38,7 @@ pub fn clear_transient(store: &mut SessionStore) {
     store.arg_stream.clear();
     store.output_tail.clear();
     store.exec_output_tail.clear();
+    store.md_cache.clear();
 }
 
 pub fn apply_frame(store: &mut SessionStore, frame: SessionEventFrame) {

@@ -4,9 +4,17 @@
 //! 用于环境验证;默认启动窗口。
 
 mod app;
+mod ask;
 mod bridge;
+mod code_panel;
+mod highlight;
+mod markdown;
 mod reducer;
+mod settings;
+mod settings_ui;
 mod store;
+mod text_input;
+mod theme;
 mod ui;
 
 fn main() {

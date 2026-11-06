@@ -8,10 +8,14 @@ description = "QAQ-Harness GPUI 桌面前端(RingingV2 客户端)"
 name = "qaqh-gpui"
 path = "src/main.rs"
 
+[lints.clippy]
+string_slice = "deny"
+
 [dependencies]
 futures = "0.3"
 # gpui 固定在本地检出的 ../gpui 仓库:
-#   rev d1520011e6204b95b320ee40a5a6b11879082426(该仓无远端,path 依赖 + rev 记录替代 git rev 钉版)
+#   rev d1520011e6204b95b320ee40a5a6b11879082426(该仓无远端,path 依赖 + rev 记录替代 git rev 钉版;
+#   该 fork 自 zed-industries/zed 上游 e21ff1b 逐字 vendor,2026-11 时点)
 # 拆平台版结构:gpui 是平台无关核心,Linux 后端经 gpui_platform(wayland/x11)接线。
 # 本机为 Wayland 会话且无 libxkbcommon-x11-dev(无 sudo),x11 后端无法链接——
 # wayland-only 是本机的正确配置;要 x11:apt install libxkbcommon-x11-dev 后加回。
@@ -25,7 +29,25 @@ gpui_platform = { path = "../gpui/crates/gpui_platform", features = ["wayland"] 
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
 # 契约类型直用(store 字段直接持有 TimelineEntry/ToolCallView 等),非转换层。
 qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
+# ModelSelection/SettingValue wire 类型(session.settings.patch 组装用,零转换层)。
+qaqh-types = { path = "../qaqh-backend/crates/qaqh-types" }
+qaqh-config-api = { path = "../qaqh-backend/crates/qaqh-config-api" }
+qaqh-profile = { path = "../qaqh-backend/crates/qaqh-profile" }
+# Markdown 流式渲染(M4):pulldown-cmark 事件流,MIT/Apache。
+pulldown-cmark = { version = "0.13", default-features = false }
+# AST 代码高亮(M5):官方 highlighter + 各语言 grammar(MIT 系)。
+tree-sitter-highlight = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-bash = "0.23"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 仅用 tokio::time::sleep(桥线程等待重试);runtime 复用 qaqh-client 的全局运行时。
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [patch.crates-io]
 # 与 ../gpui workspace 保持逐字一致:跨 workspace 时 [patch] 不传播,缺失会让
