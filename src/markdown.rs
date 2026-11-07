@@ -117,15 +117,6 @@ fn block_id(section: usize, offset: usize) -> ElementId {
     ("mdb", section * 1_000_003 + offset).into()
 }
 
-fn fnv1a(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 /// 解析缓存:section key → (源哈希, 解析结果)。
 /// 流式追加只改尾部 section 的哈希,其余块跨帧复用解析结果。
 #[derive(Default)]
@@ -135,7 +126,7 @@ pub struct ParseCache {
 
 impl ParseCache {
     pub fn get(&self, section: usize, source: &str) -> Arc<Vec<MdBlock>> {
-        let hash = fnv1a(source);
+        let hash = crate::highlight::fnv1a(source);
         let mut entries = self.entries.borrow_mut();
         if let Some((previous, blocks)) = entries.get(&section)
             && *previous == hash
@@ -143,6 +134,7 @@ impl ParseCache {
             return blocks.clone();
         }
         let parsed = Arc::new(parse_blocks(source));
+        if entries.len() >= 512 { entries.clear(); }
         entries.insert(section, (hash, parsed.clone()));
         parsed
     }
@@ -415,13 +407,8 @@ pub fn parse_blocks(source: &str) -> Vec<MdBlock> {
                     push_text(&mut text, &mut runs, &styles, &chunk);
                 }
             }
-            // 数学块(M4):无渲染器,按行内/块级文本展示。
-            Event::InlineMath(chunk) | Event::DisplayMath(chunk) => {
-                if depth > 0 && matches!(blk, Some(Blk::Table(_))) {
-                    push_text(&mut text, &mut runs, &styles, &chunk);
-                }
-            }
-            Event::FootnoteReference(_) => {}
+            // 数学/脚注未启用(Options 未开 ENABLE_MATH/ENABLE_FOOTNOTES),事件不可达。
+            _ => {}
         }
     }
 
@@ -593,15 +580,13 @@ fn render_block(
             }))
             .into_any_element(),
         MdBlockKind::Table { columns, rows } => {
-            let mut table = div()
-                .id(block_id(section, block.offset))
-                .my_1p5()
+            // 行包进横向滚动容器(与代码块同法):宽表不裁切,可横向滚动;
+            // 单元格去掉 min_w_0,列宽随内容下限扩张,超出容器即触发滚动。
+            let mut body = div()
+                .id(("mdtable-content", section * 1_000_003 + block.offset))
+                .overflow_x_scroll()
                 .flex()
-                .flex_col()
-                .rounded_md()
-                .border_1()
-                .border_color(t.border)
-                .overflow_hidden();
+                .flex_col();
             for (index, row) in rows.iter().enumerate() {
                 let mut row_div = div().grid().grid_cols(columns.len() as u16).text_xs();
                 if index == 0 {
@@ -609,9 +594,9 @@ fn render_block(
                 } else {
                     row_div = row_div.border_t_1().border_color(t.border);
                 }
-                table = table.child(row_div.children(row.iter().zip(columns).enumerate().map(
+                body = body.child(row_div.children(row.iter().zip(columns).enumerate().map(
                     |(column, ((text, runs), alignment))| {
-                        let cell = div().min_w_0().px_2().py_1();
+                        let cell = div().px_2().py_1();
                         let cell = match alignment {
                             Alignment::Center => cell.text_center(),
                             Alignment::Right => cell.text_right(),
@@ -626,7 +611,17 @@ fn render_block(
                     },
                 )));
             }
-            table.into_any_element()
+            div()
+                .id(block_id(section, block.offset))
+                .my_1p5()
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .border_1()
+                .border_color(t.border)
+                .overflow_hidden()
+                .child(body)
+                .into_any_element()
         }
         MdBlockKind::Code { lang, code } => {
             let mut card = div()

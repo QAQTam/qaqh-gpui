@@ -1,5 +1,12 @@
 # HANDOFF — qaqh-gpui 工作状态(防上下文压缩丢失)
 
+> 用户因额度要求暂停。最新且完整的续接说明见 [PRIMARY-CLIENT-HANDOFF.md](PRIMARY-CLIENT-HANDOFF.md)：功能和原生验收已完成，最终身份修复后的优化重打包尚未完成，旧候选包不可发布。
+
+> 2026-11-07：主力客户端交付正在收尾，以 [PRIMARY-CLIENT.md](PRIMARY-CLIENT.md) 的当前清单和验收记录为准。下文保留早期里程碑历史，不代表当前缺口。
+>
+> 新增模块：delivery（发送状态）、workbench（桌面状态持久化）、desktop/sidebar（桌面控制和侧栏）、content/media（引用与图片）、diagnostics（白名单诊断）。
+> 后端原生修改：session.list 支持 include_archived；Todo 读模型移入 ringing-contract；SDK 回收自行启动的 daemon 子进程。打包源修正集中在 packaging/backend-client.patch。
+
 > 更新:2026-11-06(第四轮)。M1-M10 + **M11 会话级换模型 + M12 分组管理** 全部落地。
 > `cargo check` 0 错 / `cargo test` 5/5 / `cargo build` 链接成功;唯一 warning =
 > windows-capture patch 未用(有意 mirror ../gpui workspace)。

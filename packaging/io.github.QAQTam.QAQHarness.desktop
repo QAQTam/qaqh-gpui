@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Name=QAQHarness
+Comment=Native RingingV2 desktop client
+Exec=qaqh-gpui
+Icon=io.github.QAQTam.QAQHarness
+Terminal=false
+Categories=Development;
+StartupWMClass=io.github.QAQTam.QAQHarness

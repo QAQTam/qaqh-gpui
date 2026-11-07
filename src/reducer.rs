@@ -26,6 +26,11 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.timeline_list.reset(store.entries.len() + 1);
     store.tools = state.tools;
     store.interactions = state.interactions;
+    // 快照替换了交互列表:清掉孤儿 ask 草稿与提示,避免引用悬空的 interaction。
+    store
+        .ask_drafts
+        .retain(|(id, _)| store.interactions.iter().any(|view| &view.interaction_id == id));
+    store.ask_hint = None;
     store.subagents = state.subagents;
     store.exec_sessions = state.exec_sessions;
     store.driver = state.driver;
@@ -47,6 +52,15 @@ pub fn apply_frame(store: &mut SessionStore, frame: SessionEventFrame) {
     }
     store.seq = frame.seq + 1;
     apply_event(store, frame.event);
+    for (_, text) in &mut store.output_tail { trim_tail(text, store.output_budget); }
+    for (_, _, text) in &mut store.exec_output_tail { trim_tail(text, store.output_budget); }
+}
+
+fn trim_tail(text: &mut String, budget: usize) {
+    if text.len() <= budget { return; }
+    let mut start = text.len() - budget;
+    while !text.is_char_boundary(start) { start += 1; }
+    text.drain(..start);
 }
 
 fn apply_event(store: &mut SessionStore, event: SessionEvent) {
@@ -168,6 +182,8 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent) {
             code_delta,
             effects,
         } => {
+            store.output_tail.retain(|slot| slot.0 != call_id);
+            store.arg_stream.retain(|slot| slot.0 != call_id);
             let updated = upsert_tool(store, &call_id, |existing| {
                 existing.exec_session_id = exec_session_id.clone();
                 existing.output = output.clone();
@@ -195,7 +211,10 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent) {
         }
         SessionEvent::ExecSessionStarted { session } => upsert_exec(store, session),
         SessionEvent::ExecSessionStateChanged { session } => upsert_exec(store, session),
-        SessionEvent::ExecSessionFinished { session } => upsert_exec(store, session),
+        SessionEvent::ExecSessionFinished { session } => {
+            store.exec_output_tail.retain(|slot| slot.0 != session.id);
+            upsert_exec(store, session);
+        }
         SessionEvent::ExecSessionOutputDelta {
             exec_session_id,
             start_offset,
@@ -236,6 +255,8 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent) {
         SessionEvent::InteractionResolved {
             interaction_id, ..
         } => {
+            store.ask_drafts.retain(|(id, _)| id != &interaction_id);
+            store.ask_hint = None;
             store
                 .interactions
                 .retain(|slot| slot.interaction_id != interaction_id);
@@ -251,6 +272,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent) {
             }
         }
         SessionEvent::SessionMetaChanged { title } => {
+            if store.renaming.as_ref().is_some_and(|draft| Some(draft.text.trim()) == title.as_deref()) { store.renaming = None; }
             store.title = title;
         }
         SessionEvent::DriverChanged { driver } => {

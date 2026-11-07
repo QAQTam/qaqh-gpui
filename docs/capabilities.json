@@ -1,0 +1,169 @@
+{
+  "command_revision": "ringing-commands-7",
+  "session_revision": "ringing-session-2",
+  "commands": {
+    "session.create": {
+      "status": "supported"
+    },
+    "session.settings.patch": {
+      "status": "supported"
+    },
+    "session.resume": {
+      "status": "supported"
+    },
+    "session.attach": {
+      "status": "deferred",
+      "reason": "只读附加模式尚未提供入口，当前使用 SDK resume"
+    },
+    "session.close": {
+      "status": "deferred",
+      "reason": "当前仅停止本机订阅，不关闭远端会话"
+    },
+    "session.rename": {
+      "status": "supported"
+    },
+    "session.archive": {
+      "status": "supported"
+    },
+    "session.unarchive": {
+      "status": "supported"
+    },
+    "session.delete": {
+      "status": "supported"
+    },
+    "session.shutdown": {
+      "status": "supported"
+    },
+    "agent.reload_config": {
+      "status": "supported"
+    },
+    "conversation.send_message": {
+      "status": "supported"
+    },
+    "conversation.cancel": {
+      "status": "supported"
+    },
+    "interaction.ask.respond": {
+      "status": "supported"
+    },
+    "interaction.ask.dismiss": {
+      "status": "supported"
+    },
+    "driver.claim": {
+      "status": "supported"
+    },
+    "driver.release": {
+      "status": "supported"
+    },
+    "plan.review.respond": {
+      "status": "supported"
+    },
+    "tool.permission.respond": {
+      "status": "supported"
+    },
+    "exec_session.interrupt": {
+      "status": "supported"
+    },
+    "exec_session.terminate": {
+      "status": "supported"
+    },
+    "provider.list": {
+      "status": "supported"
+    },
+    "provider.upsert": {
+      "status": "supported"
+    },
+    "provider.delete": {
+      "status": "supported"
+    },
+    "provider.model.upsert": {
+      "status": "supported"
+    },
+    "provider.model.delete": {
+      "status": "supported"
+    },
+    "model.selection.set_default": {
+      "status": "supported"
+    },
+    "config.save": {
+      "status": "supported"
+    },
+    "config.set_permission_level": {
+      "status": "deferred",
+      "reason": "权限策略通过 config.save 编辑"
+    },
+    "profile.create": {
+      "status": "supported"
+    },
+    "profile.set_default": {
+      "status": "excluded",
+      "reason": "模型默认值统一通过 model.selection.set_default；不提供旧 profile 默认值入口"
+    },
+    "profile.apply": {
+      "status": "supported"
+    },
+    "profile.save_current": {
+      "status": "supported"
+    },
+    "profile.delete": {
+      "status": "supported"
+    },
+    "workspace.set": {
+      "status": "deferred",
+      "reason": "新建会话选择 cwd；已有会话不切换执行根目录"
+    },
+    "workspace.create": {
+      "status": "supported"
+    },
+    "workspace.rename": {
+      "status": "supported"
+    },
+    "workspace.delete": {
+      "status": "supported"
+    },
+    "workspace.move_session": {
+      "status": "supported"
+    },
+    "workspace.detach": {
+      "status": "supported"
+    },
+    "subagent.spawn": {
+      "status": "deferred",
+      "reason": "当前展示代理结果，手动创建代理留待团队工作流"
+    },
+    "todo.set": {
+      "status": "deferred",
+      "reason": "任务列表只读，任务由 agent 管理"
+    },
+    "todo.cancel": {
+      "status": "deferred",
+      "reason": "任务列表只读"
+    },
+    "plan.action": {
+      "status": "deferred",
+      "reason": "当前支持交互评审；计划管理单独演进"
+    },
+    "diagnostics.memory.start": {
+      "status": "deferred",
+      "reason": "本轮提供本机诊断导出，daemon 内存采样独立工具"
+    },
+    "diagnostics.memory.stop": {
+      "status": "deferred",
+      "reason": "同 diagnostics.memory.start"
+    }
+  },
+  "services": [
+    "session.list",
+    "session.meta",
+    "workspace.list",
+    "config.load",
+    "todo.list"
+  ],
+  "release_gate": [
+    "install-first-message",
+    "send-failure-recovery",
+    "daemon-restart",
+    "driver-handoff",
+    "long-session"
+  ]
+}

@@ -1,0 +1,295 @@
+--- a/crates/qaqh-runtime/src/ringing/service_methods.rs
++++ b/crates/qaqh-runtime/src/ringing/service_methods.rs
+@@ -77,10 +77,13 @@
+     pub content: String,
+ }
+ 
+-/// `session.list` 无参数；params 恒为 `{}`。
+-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+-#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
+-pub struct SessionListParams {}
++/// `session.list` optionally includes archived sessions.
++#[derive(Debug, Clone, Serialize, serde::Deserialize)]
++#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
++pub struct SessionListParams {
++    #[serde(default)]
++    pub include_archived: bool,
++}
+ 
+ /// `session.meta` 定位单条会话；meta 不存在时 result 为 `null`（键不缺、
+ /// 整个结果就是 null）。
+@@ -301,39 +304,7 @@
+     pub status: Option<String>,
+ }
+ 
+-/// `todo.list` 结果条目(status 为 todo 词表字符串)。
+-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+-#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
+-pub struct TodoItemSnapshot {
+-    pub id: String,
+-    pub title: String,
+-    pub description: String,
+-    pub status: String,
+-    #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub evidence: Option<String>,
+-}
+-
+-/// `todo.list` 结果的计数投影。
+-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+-#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
+-pub struct TodoCountsSnapshot {
+-    pub pending: usize,
+-    pub in_progress: usize,
+-    pub completed: usize,
+-    pub cancelled: usize,
+-    pub total: usize,
+-}
+-
+-/// `todo.list` 结果(items + 当前项 + 计数;service 面不再注入旧信封的
+-/// `timeis`/`status` 键——那是工具信封的遗留,不属于查询结果契约)。
+-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+-#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
+-pub struct TodoListSnapshot {
+-    pub items: Vec<TodoItemSnapshot>,
+-    #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub current_id: Option<String>,
+-    pub counts: TodoCountsSnapshot,
+-}
++pub use qaqh_ringing_contract::todo::{TodoItemSnapshot, TodoCountsSnapshot, TodoListSnapshot};
+ 
+ /// `todo.status` 参数。
+ #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+--- a/tools/qaqh-contract-export/src/main.rs
++++ b/tools/qaqh-contract-export/src/main.rs
+@@ -357,7 +357,7 @@
+     write_fixture(
+         stage,
+         "service-session-list-params.json",
+-        &SessionListParams {},
++        &SessionListParams { include_archived: false },
+     )?;
+     write_fixture(
+         stage,
+--- a/crates/qaqh-ringing-contract/src/lib.rs
++++ b/crates/qaqh-ringing-contract/src/lib.rs
+@@ -12,6 +12,7 @@
+ pub mod fact;
+ pub mod state;
+ pub mod team;
++pub mod todo;
+ pub mod ulid;
+ pub mod workspace;
+ 
+--- a/crates/qaqh-client/src/discovery.rs
++++ b/crates/qaqh-client/src/discovery.rs
+@@ -230,7 +230,13 @@
+         .stdout(std::process::Stdio::null())
+         .stderr(std::process::Stdio::null());
+     configure_detached(&mut command);
+-    let _ = command.spawn()?;
++    let mut child = command.spawn()?;
++    // Keep the daemon detached while reaping it when it exits. Dropping Child
++    // without wait leaves a zombie under a long-lived desktop client; the
++    // stale lock then appears alive and prevents the next daemon launch.
++    std::thread::Builder::new().name("qaqh-daemon-reaper".into()).spawn(move || {
++        if let Err(error) = child.wait() { log::warn!("daemon wait failed: {error}"); }
++    })?;
+     Ok(())
+ }
+ 
+--- a/crates/qaqh-client/src/client.rs
++++ b/crates/qaqh-client/src/client.rs
+@@ -152,6 +152,8 @@
+ }
+ 
+ pub struct ClientOptions {
++    /// Logical shell identity, stable across lease negotiation and durable retries.
++    pub client_instance_id: String,
+     pub handlers: ClientHandlers,
+     /// Spawn `qaqh-daemon run` when no discovery file exists yet.
+     pub launch_daemon_if_missing: bool,
+@@ -179,6 +181,7 @@
+ impl Default for ClientOptions {
+     fn default() -> Self {
+         Self {
++            client_instance_id: uuid::Uuid::new_v4().to_string(),
+             handlers: ClientHandlers::default(),
+             launch_daemon_if_missing: false,
+             daemon_path: None,
+@@ -315,6 +318,7 @@
+             base_url.clone(),
+             token.clone(),
+             http.clone(),
++            options.client_instance_id.clone(),
+         ));
+         // 远端直连模式不得从本机 `daemon.json` 刷新凭据（会覆盖成另一台机器
+         // 的记录）；只有本地发现模式才允许 daemon 重启后的自愈。
+--- a/crates/qaqh-client/src/session.rs
++++ b/crates/qaqh-client/src/session.rs
+@@ -19,6 +19,7 @@
+ 
+ /// Ringing v2 session: open + background lease renewal.
+ pub struct RingingSession {
++    client_instance_id: String,
+     /// 可热更新：daemon 重启会换端口与随机 token，靠 [`Self::refresh_discovery`]
+     /// 原地换值。旧的不可变实现只会拿着死端点/旧 token 永久重试，客户端再也
+     /// 回不去（TUI 侧 BUG-2026-09-14-01 的同款根因）。
+@@ -56,9 +57,10 @@
+ const RENEW_TIMEOUT_SECS: u64 = 10;
+ 
+ impl RingingSession {
+-    pub fn new(base_url: String, token: String, http: reqwest::Client) -> Self {
++    pub fn new(base_url: String, token: String, http: reqwest::Client, client_instance_id: String) -> Self {
+         let (session_ctx, _) = watch::channel(None);
+         Self {
++            client_instance_id,
+             credentials: std::sync::RwLock::new(Credentials {
+                 base_url: base_url.trim_end_matches('/').to_string(),
+                 token,
+@@ -72,7 +74,7 @@
+     }
+ 
+     pub fn client_instance_id(&self) -> String {
+-        uuid::Uuid::new_v4().to_string()
++        self.client_instance_id.clone()
+     }
+ 
+     /// 当前凭据快照。**拷贝出锁**——调用方常在 `await` 前使用，持有
+@@ -171,11 +173,6 @@
+             state.client_session_id.clone(),
+         )));
+         Ok(state)
+-    }
+-
+-    /// 显式 v2 握手路径（`Client::open_v2`）写入的状态。
+-    pub(crate) async fn adopt_v2_state(&self, state: crate::v2::ClientV2SessionState) {
+-        *self.state.lock().await = Some(state);
+     }
+ 
+     /// Subscribe to the current `(server_epoch, client_session_id)`.
+@@ -368,7 +365,7 @@
+ 
+     fn session(base_url: &str, token: &str) -> RingingSession {
+         crate::client::ensure_crypto_provider();
+-        RingingSession::new(base_url.into(), token.into(), reqwest::Client::new())
++        RingingSession::new(base_url.into(), token.into(), reqwest::Client::new(), "test-instance".into())
+     }
+ 
+     /// 默认**不得**采纳本机 `daemon.json`。
+@@ -390,6 +387,9 @@
+     /// 尾随斜杠归一化：否则会拼出 `http://host:port//ringing/v2/...`。
+     #[test]
+     fn constructor_normalizes_trailing_slash() {
++        let identity = session("http://127.0.0.1:9/", "t");
++        assert_eq!(identity.client_instance_id(), "test-instance");
++        assert_eq!(identity.client_instance_id(), identity.client_instance_id());
+         assert_eq!(
+             session("http://127.0.0.1:9/", "t").credentials().base_url,
+             "http://127.0.0.1:9"
+--- a/crates/qaqh-client/src/v2.rs
++++ b/crates/qaqh-client/src/v2.rs
+@@ -131,15 +131,7 @@
+ impl Client {
+     /// `POST /ringing/v2/clients/open`.
+     pub async fn open_v2(&self) -> Result<RingingV2OpenResponse> {
+-        self.open_v2_with_instance_id(uuid::Uuid::new_v4().to_string())
+-            .await
+-    }
+-
+-    pub async fn open_v2_with_instance_id(
+-        &self,
+-        client_instance_id: impl Into<String>,
+-    ) -> Result<RingingV2OpenResponse> {
+-        let client_instance_id = client_instance_id.into();
++        let client_instance_id = self.inner.session.client_instance_id();
+         let request = RingingV2OpenRequest::new(client_instance_id.clone());
+         let path = format!("{RINGING_V2_BASE_PATH}/clients/open");
+         let response = self
+@@ -155,7 +147,7 @@
+         }
+         let response: RingingV2OpenResponse = response.json().await?;
+         let state = ClientV2SessionState::from_open(client_instance_id, response.clone())?;
+-        self.inner.session.adopt_v2_state(state).await;
++        self.inner.session.adopt(state).await;
+         Ok(response)
+     }
+ 
+--- a/crates/qaqh-client/tests/lease_renew_timeout.rs
++++ b/crates/qaqh-client/tests/lease_renew_timeout.rs
+@@ -104,6 +104,7 @@
+         base_url.to_string(),
+         "test-token".into(),
+         http,
++        "test-instance".into(),
+     ))
+ }
+ 
+--- a/crates/qaqh-runtime/src/service.rs
++++ b/crates/qaqh-runtime/src/service.rs
+@@ -637,12 +637,12 @@
+     /// 返回类型化值后，**新增字段的唯一途径是改类型**：想在回包里塞个临时键，
+     /// 必须先拆掉类型才行。形状锁在 `qaqh-types` 的
+     /// `session_list_entry_wire_keys_are_locked`。
+-    fn list_sessions(&self) -> QaqhResult<Vec<qaqh_types::SessionListEntry>> {
++    fn list_sessions(&self, include_archived: bool) -> QaqhResult<Vec<qaqh_types::SessionListEntry>> {
+         let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+         let rows = self
+             .owners
+             .db()
+-            .read_blocking(|conn| qaqh_session::db::store::list_sessions(conn, false, 256))
++            .read_blocking(|conn| qaqh_session::db::store::list_sessions(conn, include_archived, 256))
+             .map_err(QaqhError::message)?;
+         let mut workspace_ids = self
+             .owners
+--- a/crates/qaqh-runtime/src/service/handlers/session.rs
++++ b/crates/qaqh-runtime/src/service/handlers/session.rs
+@@ -14,8 +14,8 @@
+ 
+ pub(crate) fn handle(service: &QaqhService, command: SessionCommand) -> QaqhResult<Value> {
+     match command {
+-        SessionCommand::SessionList(_) => {
+-            QaqhError::to_value("session list", service.list_sessions()?)
++        SessionCommand::SessionList(args) => {
++            QaqhError::to_value("session list", service.list_sessions(args.include_archived)?)
+         }
+         SessionCommand::SessionMeta(args) => {
+             let session_id = args.session_id;
+--- /dev/null
++++ b/crates/qaqh-ringing-contract/src/todo.rs
+@@ -0,0 +1,36 @@
++//! Canonical todo service read model, shared by daemon and native clients.
++use serde::Serialize;
++
++/// `todo.list` 结果条目(status 为 todo 词表字符串)。
++#[derive(Debug, Clone, Serialize, serde::Deserialize)]
++#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
++pub struct TodoItemSnapshot {
++    pub id: String,
++    pub title: String,
++    pub description: String,
++    pub status: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub evidence: Option<String>,
++}
++
++/// `todo.list` 结果的计数投影。
++#[derive(Debug, Clone, Serialize, serde::Deserialize)]
++#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
++pub struct TodoCountsSnapshot {
++    pub pending: usize,
++    pub in_progress: usize,
++    pub completed: usize,
++    pub cancelled: usize,
++    pub total: usize,
++}
++
++/// `todo.list` 结果(items + 当前项 + 计数;service 面不再注入旧信封的
++/// `timeis`/`status` 键——那是工具信封的遗留,不属于查询结果契约)。
++#[derive(Debug, Clone, Serialize, serde::Deserialize)]
++#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "qaqh/"))]
++pub struct TodoListSnapshot {
++    pub items: Vec<TodoItemSnapshot>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub current_id: Option<String>,
++    pub counts: TodoCountsSnapshot,
++}

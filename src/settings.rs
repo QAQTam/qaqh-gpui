@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::theme::ThemeMode;
 
-/// UI 密度:影响时间线/侧栏留白(electron 的 --space 节奏三档)。
+/// UI 密度:影响时间线留白(electron 的 --space 节奏三档)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Density {
     Compact,
@@ -172,14 +172,13 @@ pub fn get(cx: &App) -> &SettingsContent {
     &cx.global::<SettingsState>().content
 }
 
-/// 唯一写入口:改内存 → 原子落盘 → 应用主题副作用 → refresh_windows。
+/// 唯一写入口:改内存 → 原子落盘 → 应用主题副作用(内部已 refresh_windows)。
 pub fn update(cx: &mut App, f: impl FnOnce(&mut SettingsContent)) {
     let state = cx.global_mut::<SettingsState>();
     f(&mut state.content);
     save(&state.path, &state.content);
     let mode = state.content.appearance.theme_mode;
     crate::theme::apply_mode(mode, cx);
-    cx.refresh_windows();
 }
 
 /// tmp + rename 原子写,防半截文件。

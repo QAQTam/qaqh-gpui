@@ -178,12 +178,14 @@ impl Engine {
             }
         }
         let runs = Arc::new(runs);
+        if self.cache.len() >= 256 { self.cache.clear(); }
         self.cache.insert(key, runs.clone());
         Some(runs)
     }
 }
 
-fn fnv1a(text: &str) -> u64 {
+/// FNV-1a 64 位内容哈希(markdown 缓存与本模块共用)。
+pub(crate) fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);

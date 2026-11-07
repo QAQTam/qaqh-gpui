@@ -27,7 +27,6 @@ use qaqh_ringing_contract::state::TimelineEntry;
 use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_ringing_contract::state::TurnView;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
-use serde_json::Value;
 
 use crate::bridge::BridgeMsg;
 use crate::bridge::BridgeRequest;
@@ -56,6 +55,18 @@ pub struct AskDraft {
 }
 
 pub struct SessionStore {
+    pub snapshot_pending: bool,
+    pub buffered_frames: Vec<qaqh_ringing_contract::events::SessionEventFrame>,
+    pub outbox: Option<crate::delivery::Outbox>,
+    pub images: Vec<qaqh_client::ImageBlock>,
+    pub attachments: Vec<qaqh_client::ContentRef>,
+    pub attachment_pending: bool,
+    pub operation_error: Option<String>,
+    pub client_session_id: Option<String>,
+    pub output_budget: usize,
+    pub search: TextField,
+    pub search_focus: FocusHandle,
+    pub search_open: bool,
     pub code_panel: crate::code_panel::CodePanel,
     pub session_id: String,
     pub title: Option<String>,
@@ -98,17 +109,42 @@ pub struct SessionStore {
     pub rename_focus: FocusHandle,
     /// ask 卡草稿,按 interaction_id。
     pub ask_drafts: Vec<(InteractionId, AskDraft)>,
+    /// ask 卡未答提示(上次提交被拒时显示,成功提交/跳过/解决后清除)。
+    pub ask_hint: Option<String>,
     requests: UnboundedSender<BridgeRequest>,
 }
 
 impl SessionStore {
+    #[cfg(feature = "acceptance")]
+    pub fn simulate_closed_bridge(&mut self) {
+        let original = self.requests.clone();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        drop(rx);
+        self.requests = tx;
+        self.composer_send();
+        self.requests = original;
+    }
+    pub fn requests(&self) -> &UnboundedSender<BridgeRequest> { &self.requests }
     pub fn new(
         session_id: String,
         requests: UnboundedSender<BridgeRequest>,
+        draft: crate::workbench::Draft,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            code_panel: Default::default(),
+            snapshot_pending: true,
+            buffered_frames: Vec::new(),
+            code_panel: crate::code_panel::CodePanel::with_root(draft.local_root),
+            outbox: draft.outbox,
+            images: draft.images,
+            attachments: draft.attachments,
+            attachment_pending: false,
+            operation_error: None,
+            client_session_id: None,
+            output_budget: crate::settings::get(cx).behavior.output_tail_max,
+            search: TextField::default(),
+            search_focus: cx.focus_handle(),
+            search_open: false,
             session_id,
             title: None,
             activity: None,
@@ -134,21 +170,31 @@ impl SessionStore {
             settings_pending: false,
             catalog: None,
             confirm_delete: false,
-            composer: TextField::default(),
+            composer: TextField::with_text(&draft.text),
             composer_focus: cx.focus_handle(),
             renaming: None,
             rename_focus: cx.focus_handle(),
             ask_drafts: Vec::new(),
+            ask_hint: None,
             requests,
         }
     }
 
     /// 发送受阻原因(与 composer 提示同一来源)。
     pub fn send_block_reason(&self) -> Option<&'static str> {
-        if let StreamState::Closed { .. } = self.stream {
-            return Some("连接已断开");
+        if !matches!(self.stream, StreamState::Open) {
+            return Some("等待连接恢复");
         }
-        if !self.interactions.is_empty() {
+        if self.snapshot_pending { return Some("会话状态正在同步"); }
+        if self.attachment_pending { return Some("附件正在准备"); }
+        if self.outbox.as_ref().is_some_and(|o| matches!(o.state,
+            crate::delivery::DeliveryState::Sending | crate::delivery::DeliveryState::Accepted | crate::delivery::DeliveryState::Uncertain)) {
+            return Some("上一条消息尚未确认，请先查回执");
+        }
+        if self.driver.as_ref().and_then(|d| d.holder.as_ref()).is_some_and(|holder| Some(holder) != self.client_session_id.as_ref()) {
+            return Some("其他客户端持有控制权，可显式接管");
+        }
+        if self.interactions.iter().any(|i| i.resolution.is_none()) {
             return Some("有待应答的交互");
         }
         if self.activity == Some(ActivityState::Running) {
@@ -177,15 +223,53 @@ impl SessionStore {
             return Some(reason);
         }
         let text = self.composer.text.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.images.is_empty() && self.attachments.is_empty() {
             return None;
         }
-        self.composer.clear();
-        let _ = self.requests.unbounded_send(BridgeRequest::SendMessage {
-            seed: self.session_id.clone(),
-            text,
-        });
+        let outbox = crate::delivery::Outbox {
+            command_id: qaqh_ringing_contract::ulid::generate_ulid(),
+            message: qaqh_client::ConversationSendMessage {
+                text, images: self.images.clone(), attachments: Some(self.attachments.clone()),
+                message_id: None, input_purpose: Default::default(), as_system: false,
+                inter_agent: None, subagent_terminal: None,
+            },
+            state: crate::delivery::DeliveryState::Sending, detail: String::new(),
+        };
+        self.outbox = Some(outbox);
+        if let Err(error) = self.persist_draft() {
+            self.operation_error = Some(format!("发送前保存失败：{error}"));
+            self.outbox = None;
+            return Some("草稿未能保存，消息尚未发送");
+        }
+        self.retry_message();
         None
+    }
+
+    pub fn draft(&self) -> crate::workbench::Draft {
+        crate::workbench::Draft {
+            text: self.composer.text.clone(), images: self.images.clone(),
+            attachments: self.attachments.clone(), outbox: self.outbox.clone(),
+            local_root: self.code_panel.local_root(),
+        }
+    }
+    pub fn persist_draft(&self) -> Result<(), String> {
+        let mut state = crate::workbench::load()?;
+        state.drafts.insert(self.session_id.clone(), self.draft());
+        crate::workbench::save(&state)
+    }
+    pub fn retry_message(&mut self) {
+        if let Some(outbox) = &mut self.outbox {
+            outbox.state = crate::delivery::DeliveryState::Sending;
+            if self.requests.unbounded_send(BridgeRequest::SendMessage { seed: self.session_id.clone(), outbox: outbox.clone() }).is_err() {
+                outbox.state = crate::delivery::DeliveryState::Uncertain;
+                outbox.detail = "连接已关闭，请重新连接".into();
+            }
+        }
+    }
+    pub fn check_receipt(&self) {
+        if let Some(outbox) = &self.outbox {
+            let _ = self.requests.unbounded_send(BridgeRequest::Receipt { seed: self.session_id.clone(), command_id: outbox.command_id.clone() });
+        }
     }
 
     pub fn respond_permission(&mut self, tool_call_id: String, approved: bool, trust_folder: bool) {
@@ -210,6 +294,7 @@ impl SessionStore {
     }
 
     /// 取(或建)ask 卡草稿;focus 句柄需 cx 创建。
+    /// 请求被引用内容解析替换后题数可能变化,题数不匹配时重建,防越界。
     pub fn ask_draft(
         &mut self,
         interaction_id: &InteractionId,
@@ -221,7 +306,20 @@ impl SessionStore {
             .iter()
             .position(|(id, _)| id == interaction_id);
         let index = match position {
-            Some(index) => index,
+            Some(index) => {
+                if self.ask_drafts[index].1.answers.len() != question_count {
+                    self.ask_drafts[index].1 = AskDraft {
+                        answers: vec![None; question_count],
+                        customs: (0..question_count)
+                            .map(|_| TextField::default())
+                            .collect(),
+                        focuses: (0..question_count)
+                            .map(|_| cx.focus_handle())
+                            .collect(),
+                    };
+                }
+                index
+            }
             None => {
                 self.ask_drafts.push((
                     interaction_id.clone(),
@@ -269,7 +367,6 @@ impl SessionStore {
                 answer,
             });
         }
-        self.ask_drafts.remove(index);
         let _ = self
             .requests
             .unbounded_send(BridgeRequest::RespondAsk {
@@ -281,8 +378,6 @@ impl SessionStore {
     }
 
     pub fn ask_dismiss(&mut self, interaction_id: &InteractionId) {
-        self.ask_drafts
-            .retain(|(id, _)| id != interaction_id);
         let _ = self
             .requests
             .unbounded_send(BridgeRequest::DismissAsk {
@@ -304,16 +399,15 @@ impl SessionStore {
         self.renaming = Some(TextField::with_text(&current));
     }
 
-    /// 提交重命名:乐观改本地标题,命令失败由 SessionMetaChanged 对账。
+    /// Keep the edit until the authoritative metadata event confirms it.
     pub fn rename_commit(&mut self) {
-        let Some(draft) = self.renaming.take() else {
+        let Some(draft) = self.renaming.as_ref() else {
             return;
         };
         let title = draft.text.trim().to_string();
         if title.is_empty() {
             return;
         }
-        self.title = Some(title.clone());
         let _ = self
             .requests
             .unbounded_send(BridgeRequest::RenameSession {
@@ -422,23 +516,25 @@ pub struct SessionRow {
     pub status: String,
     pub workspace_id: Option<String>,
     pub cwd: Option<String>,
+    pub archived: bool,
 }
 
-fn rows_from(value: &Value) -> Vec<SessionRow> {
-    value
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
+fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
+    entries.iter()
         .map(|entry| SessionRow {
-            id: entry["session_id"].as_str().unwrap_or("").to_string(),
-            title: entry["title"]
-                .as_str()
-                .unwrap_or("(无标题)")
-                .to_string(),
-            updated_at: entry["updated_at"].as_str().unwrap_or("").to_string(),
-            status: entry["status"].as_str().unwrap_or("not_running").to_string(),
-            workspace_id: entry["workspace_id"].as_str().map(str::to_string),
-            cwd: entry["cwd"].as_str().map(str::to_string),
+            id: entry.meta.session_id.clone(),
+            title: entry.meta.title.clone().unwrap_or_else(|| "(无标题)".into()),
+            updated_at: entry.meta.updated_at.to_string(),
+            status: match entry.status {
+                qaqh_types::SessionRunStatus::NotRunning => "not_running",
+                qaqh_types::SessionRunStatus::Idle => "idle",
+                qaqh_types::SessionRunStatus::Running => "running",
+                qaqh_types::SessionRunStatus::WaitingUser => "waiting_user",
+                qaqh_types::SessionRunStatus::Cancelling => "cancelling",
+            }.into(),
+            workspace_id: entry.workspace_id.clone(),
+            cwd: entry.meta.cwd.clone(),
+            archived: entry.meta.archived,
         })
         .filter(|row| !row.id.is_empty())
         .collect()
@@ -450,15 +546,11 @@ pub struct TodoRow {
     pub status: String,
 }
 
-fn todos_from(value: &Value) -> Vec<TodoRow> {
-    value
-        .get("items")
-        .and_then(Value::as_array)
-        .unwrap_or(&Vec::new())
-        .iter()
+fn todos_from(value: &qaqh_ringing_contract::todo::TodoListSnapshot) -> Vec<TodoRow> {
+    value.items.iter()
         .map(|item| TodoRow {
-            title: item["title"].as_str().unwrap_or("").to_string(),
-            status: item["status"].as_str().unwrap_or("pending").to_string(),
+            title: item.title.clone(),
+            status: item.status.clone(),
         })
         .collect()
 }
@@ -471,7 +563,7 @@ pub struct WorkspaceGroup {
 }
 
 pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<WorkspaceGroup> {
-    let mut ordered: Vec<(Option<&WorkspaceEntry>, Vec<&SessionRow>)> = Vec::new();
+    let mut ordered: Vec<(Option<&WorkspaceEntry>, Vec<&SessionRow>)> = workspaces.iter().map(|entry| (Some(entry), Vec::new())).collect();
     for row in sessions {
         let workspace = row
             .workspace_id
@@ -507,9 +599,16 @@ pub enum SettingsEditor {
     Config,
     Catalog,
     Session,
+    Workspaces,
 }
 
 pub struct DaemonStore {
+    pub last_operation: Option<String>,
+    pub connection: crate::bridge::ConnectionState,
+    pub workbench: crate::workbench::Workbench,
+    pub session_search: TextField,
+    pub session_search_focus: FocusHandle,
+    pub show_archived: bool,
     pub lines: Vec<String>,
     pub sessions: Vec<SessionRow>,
     pub workspaces: Vec<WorkspaceEntry>,
@@ -540,11 +639,21 @@ pub struct DaemonStore {
 
 impl DaemonStore {
     pub fn new(requests: UnboundedSender<BridgeRequest>, cx: &mut Context<Self>) -> Self {
+        let (workbench, error) = match crate::workbench::load() {
+            Ok(state) => (state, None),
+            Err(error) => (Default::default(), Some(format!("工作状态读取失败：{error}"))),
+        };
         Self {
-            lines: vec!["qaqh-gpui 启动…".into()],
+            last_operation: None,
+            connection: crate::bridge::ConnectionState::Connecting,
+            collapsed: workbench.collapsed.iter().cloned().collect(),
+            workbench,
+            session_search: TextField::default(),
+            session_search_focus: cx.focus_handle(),
+            show_archived: false,
+            lines: vec![error.unwrap_or_else(|| "qaqh-gpui 启动…".into())],
             sessions: Vec::new(),
             workspaces: Vec::new(),
-            collapsed: HashSet::new(),
             settings_open: false,
             config: None,
             providers: None,
@@ -565,11 +674,102 @@ impl DaemonStore {
 
     pub fn handle(&mut self, message: BridgeMsg, cx: &mut Context<Self>) {
         match message {
+            BridgeMsg::FromConnection(generation, message) => {
+                if generation == crate::bridge::connection_generation() { self.handle(*message, cx); }
+            }
+            BridgeMsg::Operation(name, target, result) => {
+                let label = match name.split('.').next().unwrap_or_default() {
+                    "session" => "会话操作", "workspace" => "工作区操作", "provider" => "服务商设置",
+                    "profile" => "预设设置", "model" => "模型设置", "config" => "全局设置",
+                    "interaction" => "提问应答", "plan" => "计划评审", "tool" => "工具授权",
+                    "conversation" => "对话操作", "exec_session" => "执行会话操作", "driver" => "控制权操作",
+                    _ => "操作",
+                };
+                self.last_operation = Some(match result {
+                    Ok(ack) => {
+                        crate::diagnostics::record(if ack.status == qaqh_client::RingingCommandAckStatus::Accepted { "command_accepted" } else { "command_rejected" },
+                            match &target { qaqh_client::CommandTarget::Session { session_id } => Some(session_id.as_str()), _ => None }, Some(&ack.command_id), None);
+                        let status = if ack.status == qaqh_client::RingingCommandAckStatus::Rejected { "被拒绝" }
+                            else if ack.result.is_some() { "已完成" } else { "已受理" };
+                        format!("{label} · {status} · {} {}", ack.code.unwrap_or_default(), ack.message.unwrap_or_default())
+                    }
+                    Err(error) => format!("{label} · 结果待确认：{error}"),
+                });
+                cx.notify();
+            }
+            BridgeMsg::Connection(state) => {
+                let id = match &state { crate::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None };
+                self.connection = state;
+                for store in &self.stores {
+                    store.update(cx, |store, cx| {
+                        if store.client_session_id != id {
+                            store.snapshot_pending = true;
+                            store.buffered_frames.clear();
+                        }
+                        store.client_session_id = id.clone();
+                        if id.is_none() { store.stream = StreamState::Connecting; }
+                        cx.notify();
+                    });
+                }
+                cx.notify();
+            }
+            BridgeMsg::Delivery(seed, id, result) => {
+                if let Some(store) = self.stores.iter().find(|store| store.read(cx).session_id == seed) {
+                    store.update(cx, |store, cx| {
+                        if let Some(outbox) = &mut store.outbox && outbox.command_id == id {
+                            let was_pending = matches!(outbox.state, crate::delivery::DeliveryState::Sending | crate::delivery::DeliveryState::Uncertain);
+                            match result {
+                                crate::bridge::DeliveryResult::Ack(ack) => outbox.acknowledge(&ack),
+                                crate::bridge::DeliveryResult::Receipt(status) => outbox.receipt(&status),
+                                crate::bridge::DeliveryResult::Unknown(detail) => {
+                                    outbox.state = crate::delivery::DeliveryState::Uncertain;
+                                    outbox.detail = detail;
+                                }
+                            }
+                            if was_pending && matches!(outbox.state, crate::delivery::DeliveryState::Accepted | crate::delivery::DeliveryState::Succeeded)
+                                && store.composer.text.trim() == outbox.message.text {
+                                store.composer.clear(); store.images.clear(); store.attachments.clear();
+                            }
+                            if outbox.state == crate::delivery::DeliveryState::Succeeded {
+                                outbox.message.images.clear(); outbox.message.attachments = None; outbox.message.text.clear();
+                            }
+                        }
+                        if let Err(error) = store.persist_draft() { store.operation_error = Some(error); }
+                        cx.notify();
+                    });
+                }
+            }
+            BridgeMsg::Attachment(seed, result) => {
+                if let Some(store) = self.stores.iter().find(|store| store.read(cx).session_id == seed) {
+                    store.update(cx, |store, cx| {
+                        store.attachment_pending = false;
+                        match result {
+                            Ok(crate::bridge::PreparedAttachment::Image(image)) => store.images.push(image),
+                            Ok(crate::bridge::PreparedAttachment::Content(reference)) => store.attachments.push(reference),
+                            Err(error) => store.operation_error = Some(error),
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+            BridgeMsg::ResolvedContent(seed, reference, result) => {
+                if let Some(store) = self.stores.iter().find(|store| store.read(cx).session_id == seed) {
+                    store.update(cx, |store, cx| {
+                        match result {
+                            Ok(text) => crate::content::replace(store, &reference, text),
+                            Err(error) => store.operation_error = Some(error),
+                        }
+                        cx.notify();
+                    });
+                }
+            }
             BridgeMsg::Line(text) => {
                 self.lines.push(text);
+                if self.lines.len() > 200 { self.lines.drain(..100); }
                 cx.notify();
             }
             BridgeMsg::Sessions(value) => {
+                crate::desktop::roster_notifications(&self.sessions, &value, cx);
                 self.sessions = rows_from(&value);
                 for store in &self.stores {
                     let id = &store.read(cx).session_id;
@@ -579,7 +779,9 @@ impl DaemonStore {
                     }
                 }
                 if self.current.is_none()
-                    && let Some(id) = self.sessions.first().map(|row| row.id.clone())
+                    && let Some(id) = self.workbench.recent_session.as_ref()
+                        .and_then(|id| self.sessions.iter().find(|row| &row.id == id))
+                        .or_else(|| self.sessions.iter().find(|row| !row.archived)).map(|row| row.id.clone())
                 {
                     self.select(id, cx);
                     return;
@@ -601,6 +803,14 @@ impl DaemonStore {
                 }
             }
             BridgeMsg::Event(seed, frame) => {
+                let notification = match &frame.event {
+                    SessionEvent::InteractionRequested { .. } => Some("会话等待你的响应"),
+                    SessionEvent::TurnEnded { outcome, .. } => Some(match outcome {
+                        qaqh_ringing_contract::state::TurnOutcome::Finished { error: Some(_), .. } => "本轮工作失败，请查看会话",
+                        _ => "本轮工作已结束",
+                    }),
+                    _ => None,
+                };
                 let review_turn = match &frame.event {
                     SessionEvent::TurnEnded { turn_id, .. }
                         if self.current.as_ref().is_some_and(|store| store.read(cx).session_id == seed) =>
@@ -623,8 +833,17 @@ impl DaemonStore {
                     return;
                 };
                 store.update(cx, |store, cx| {
+                    if store.snapshot_pending {
+                        store.buffered_frames.push(frame);
+                        if store.buffered_frames.len() >= 256 {
+                            store.buffered_frames.clear();
+                            let _ = store.requests.unbounded_send(BridgeRequest::Refill(store.session_id.clone()));
+                        }
+                        return;
+                    }
                     let previous_seq = store.seq;
                     crate::reducer::apply_frame(store, frame);
+                    if store.seq > previous_seq && let Some(title) = notification { crate::desktop::notify(cx, &store.session_id, title); }
                     if store.seq > previous_seq && let Some(turn) = review_turn {
                         crate::code_panel::auto_review(store, turn);
                     }
@@ -644,6 +863,8 @@ impl DaemonStore {
                     .cloned();
                 if let Some(store) = store {
                     store.update(cx, |store, cx| {
+                        store.snapshot_pending = true;
+                        store.buffered_frames.clear();
                         crate::reducer::clear_transient(store);
                         cx.notify();
                     });
@@ -666,6 +887,9 @@ impl DaemonStore {
                 };
                 store.update(cx, |store, cx| {
                     crate::reducer::apply_snapshot(store, *state);
+                    crate::diagnostics::record("snapshot", Some(&store.session_id), None, Some(store.seq));
+                    store.snapshot_pending = false;
+                    for frame in std::mem::take(&mut store.buffered_frames) { crate::reducer::apply_frame(store, frame); }
                     cx.notify();
                 });
                 let _ = self.requests.unbounded_send(BridgeRequest::QueryTodo { seed });
@@ -693,7 +917,6 @@ impl DaemonStore {
                     });
                 }
             }
-            BridgeMsg::Liveness => {}
             BridgeMsg::Created(seed, cwd) => {
                 self.lines.push(format!("会话已创建:{seed}"));
                 self.new_session_open = false;
@@ -788,6 +1011,8 @@ impl DaemonStore {
     }
 
     pub fn select(&mut self, seed: String, cx: &mut Context<Self>) {
+        self.persist(cx);
+        self.workbench.recent_session = Some(seed.clone());
         // 已访问过的会话直接复用 store(状态/流保持);新会话才 attach。
         let existing = self
             .stores
@@ -796,15 +1021,23 @@ impl DaemonStore {
             .cloned();
         match existing {
             Some(store) => {
-                let _ = self.requests.unbounded_send(BridgeRequest::QuerySessionSettings(seed));
+                // LRU:复用的会话移到末尾,避免被新会话挤出缓存。
+                self.stores.retain(|cached| cached != &store);
+                self.stores.push(store.clone());
+                store.update(cx, |store, _| { store.snapshot_pending = true; store.buffered_frames.clear(); });
+                let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
                 self.current = Some(store);
                 cx.notify();
             }
             None => {
                 let requests = self.requests.clone();
-                let store = cx.new(|cx| SessionStore::new(seed.clone(), requests, cx));
+                let draft = self.workbench.drafts.get(&seed).cloned().unwrap_or_default();
+                let store = cx.new(|cx| SessionStore::new(seed.clone(), requests, draft, cx));
                 store.update(cx, |store, _| {
                     store.catalog = self.providers.clone();
+                    store.client_session_id = match &self.connection {
+                        crate::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None,
+                    };
                 });
                 if let Some(cwd) = self.sessions.iter().find(|row| row.id == seed)
                     .and_then(|row| row.cwd.as_deref())
@@ -813,9 +1046,23 @@ impl DaemonStore {
                 }
                 self.stores.push(store.clone());
                 self.current = Some(store);
+                if self.stores.len() > 4 {
+                    self.stores.remove(0);
+                }
                 let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
                 cx.notify();
             }
+        }
+    }
+
+    pub fn persist(&mut self, cx: &gpui::App) {
+        for store in &self.stores {
+            let store = store.read(cx);
+            self.workbench.drafts.insert(store.session_id.clone(), store.draft());
+        }
+        self.workbench.collapsed = self.collapsed.iter().cloned().collect();
+        if let Err(error) = crate::workbench::save(&self.workbench) {
+            if self.lines.last() != Some(&error) { self.lines.push(error); }
         }
     }
 }

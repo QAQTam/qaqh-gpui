@@ -48,17 +48,17 @@ use crate::store::DaemonStore;
 use crate::store::SessionRow;
 use crate::store::{SessionStore, SettingsEditor};
 use crate::store::StreamState;
-use crate::store::WorkspaceGroup;
 use crate::text_input::InputElement;
 use crate::text_input::TextField;
 use crate::theme::ActiveTheme;
 use crate::theme::Palette;
 use crate::theme::ThemeMode;
 
-fn content_text(value: &ContentValue) -> &str {
+pub(crate) fn content_text(value: &ContentValue) -> &str {
     match value {
         ContentValue::Inline { text } => text,
-        _ => "(引用内容,按需下载)",
+        ContentValue::Ref { .. } => "引用内容：点击上方「加载引用内容」读取",
+        ContentValue::Unavailable(_) => "内容不可用",
     }
 }
 
@@ -156,7 +156,7 @@ fn stream_badge(state: &StreamState, t: &Palette) -> Div {
 
 /// 侧栏条目:选中 = accent 左边条 + selected 底色(借鉴 zed project_panel
 /// 的「背景 + 侧边状态边」模式,不搞圆角高亮)。
-fn sidebar_row(
+pub(crate) fn sidebar_row(
     row: &SessionRow,
     selected: bool,
     t: &Palette,
@@ -197,265 +197,9 @@ fn sidebar_row(
         .child(div().text_xs().text_color(t.dim).child(row.updated_at.clone()))
 }
 
-impl Render for DaemonStore {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *cx.colors();
-        let mode = cx.theme_mode();
-        let settings = settings::get(cx).clone();
-        // rem 缩放:改设置里的界面字号 → 全 UI(rem 字号)等比缩放。
-        window.set_rem_size(px(settings.typography.ui_font_size));
-        let groups: Vec<WorkspaceGroup> = crate::store::groups(&self.sessions, &self.workspaces);
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for group in &groups {
-            let collapsed = self.collapsed.contains(&group.title);
-            let title = group.title.clone();
-            let was_collapsed = collapsed;
-            let group_id = group.id.clone();
-            // 分组头:可折叠 disclosure(借鉴 zed Disclosure chevron 模式)+
-            // hover 显现「移入」(把当前会话移进该分组,electron move_session 同语义)。
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("grp-{}", group.title)))
-                    .group("grp")
-                    .px_2p5()
-                    .pt_2()
-                    .pb_1()
-                    .mx_0p5()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(t.hover))
-                    .on_click(cx.listener(
-                        move |daemon: &mut DaemonStore, _, _, cx: &mut Context<DaemonStore>| {
-                            if was_collapsed {
-                                daemon.collapsed.remove(&title);
-                            } else {
-                                daemon.collapsed.insert(title.clone());
-                            }
-                            cx.notify();
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.dim)
-                            .child(if collapsed { "▸" } else { "▾" }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.dim)
-                            .child(SharedString::from(format!(
-                                "{} ({})",
-                                group.title,
-                                group.rows.len()
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "move-in-{}",
-                                group.title
-                            )))
-                            .px_1()
-                            .text_xs()
-                            .text_color(t.accent)
-                            .cursor_pointer()
-                            .opacity(0.0)
-                            .group_hover("grp", |style| style.opacity(1.0))
-                            .on_click(cx.listener(
-                                move |daemon: &mut DaemonStore, _, _, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(current) = daemon.current.clone() {
-                                        current.update(cx, |store, _| {
-                                            store.move_to_workspace(group_id.clone().unwrap_or_default());
-                                        });
-                                    }
-                                    cx.notify();
-                                },
-                            ))
-                            .child("移入"),
-                    )
-                    .into_any_element(),
-            );
-            if collapsed {
-                continue;
-            }
-            for row in &group.rows {
-                let selected = self
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.read(cx).session_id == row.id);
-                let id = row.id.clone();
-                let listener = cx.listener(move |daemon: &mut DaemonStore, _event, _window, cx| {
-                    daemon.select(id.clone(), cx);
-                });
-                rows.push(sidebar_row(row, selected, &t, listener).into_any_element());
-            }
-        }
 
-        let sidebar = div()
-            .w(px(260.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(t.panel)
-            .border_r_1()
-            .border_color(t.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.dim)
-                            .child(format!("会话({})", self.sessions.len())),
-                    )
-                    .child(
-                        div().flex().items_center().gap_1()
-                            .child(
-                                div()
-                                    .id("new-session")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(t.btn)
-                                    .text_color(t.dim)
-                                    .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        daemon.new_session_open = !daemon.new_session_open;
-                                        daemon.settings_form = None;
-                                        if daemon.new_session_open {
-                                            daemon.settings_open = false;
-                                            let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child("新建"),
-                            )
-                            .child(
-                                div()
-                                    .id("theme-toggle")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(t.btn)
-                                    .text_color(t.dim)
-                                    .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        let next = settings::get(cx).appearance.theme_mode.next();
-                                        settings::update(cx, |content| {
-                                            content.appearance.theme_mode = next;
-                                        });
-                                    }))
-                                    .child(mode.label()),
-                            )
-                            .child(
-                                div()
-                                    .id("open-settings")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(if self.settings_open { t.accent_bg } else { t.btn })
-                                    .text_color(if self.settings_open { t.accent } else { t.dim })
-                                    .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        daemon.settings_open = !daemon.settings_open;
-                                        if daemon.settings_open {
-                                            daemon.new_session_open = false;
-                                            daemon.settings_form = None;
-                                            // 打开时把当前值种进输入框,避免显示漂移;
-                                            // 同时拉取 daemon 侧配置与服务商列表。
-                                            let family =
-                                                settings::get(cx).typography.ui_font_family.clone();
-                                            daemon.font_field = TextField::with_text(&family);
-                                            let _ = daemon
-                                                .requests
-                                                .unbounded_send(BridgeRequest::QueryConfig);
-                                            let _ = daemon
-                                                .requests
-                                                .unbounded_send(BridgeRequest::ListProviders);
-                                        } else {
-                                            daemon.settings_form = None;
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child("设置"),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("session-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .children(rows),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(t.border)
-                    .text_xs()
-                    .text_color(t.dim)
-                    .child(self.lines.last().cloned().unwrap_or_default()),
-            );
-
-        let main = if self.new_session_open {
-            new_session_panel(self, window, cx)
-        } else if self.settings_open {
-            settings_page(self, window, cx)
-        } else {
-            match self.current.clone() {
-                Some(session) => div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .child(session)
-                    .child(todo_dock(self, cx)),
-                None => div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(t.dim)
-                    .child("正在连接 daemon…"),
-            }
-        };
-
-        let family = settings.typography.ui_font_family;
-        div()
-            .size_full()
-            .flex()
-            .bg(t.bg)
-            .text_color(t.text)
-            .when(!family.is_empty(), |root| {
-                root.font_family(SharedString::from(family))
-            })
-            .child(sidebar)
-            .child(main)
-    }
-}
-
-/// 右栏任务 dock:当前会话的 todo 快照。
-fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) -> Div {
+/// 右栏任务 dock:当前会话的 todo 快照。无数据/无任务时不渲染,不占正文宽度。
+pub(crate) fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) -> Option<Div> {
     let t = *cx.colors();
     let seed = daemon
         .current
@@ -465,6 +209,12 @@ fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) -> Div {
         (Some((cached_seed, items)), Some(current)) if cached_seed == current => Some(items),
         _ => None,
     };
+    let Some(items) = todos else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
     let mut dock = div()
         .w(px(260.))
         .h_full()
@@ -483,18 +233,6 @@ fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) -> Div {
                 .border_color(t.border)
                 .child("任务"),
         );
-    let Some(items) = todos else {
-        return dock.child(
-            div()
-                .p_3()
-                .text_xs()
-                .text_color(t.dim)
-                .child("无任务数据"),
-        );
-    };
-    if items.is_empty() {
-        return dock.child(div().p_3().text_xs().text_color(t.dim).child("无任务"));
-    }
     let done = items
         .iter()
         .filter(|item| item.status == "completed")
@@ -540,13 +278,13 @@ fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) -> Div {
                 ),
         );
     }
-    dock.child(list)
+    Some(dock.child(list))
 }
 
 /// 设置页(M6):本地偏好(外观/排版/行为)。结构借鉴 zed settings_ui 的
 /// 「分区头 + 行(左标题描述、右控件)+ 行间分隔线」;数据模型是无状态 UI:
 /// 控件不存值,全部经 settings::update(落盘 + refresh_windows)。
-fn settings_page(
+pub(crate) fn settings_page(
     daemon: &mut DaemonStore,
     window: &Window,
     cx: &mut Context<DaemonStore>,
@@ -630,23 +368,15 @@ fn settings_page(
     let font_field = daemon.font_field.clone();
     let font_focused = daemon.font_focus.is_focused(window);
     let font_display = font_field.display(font_focused, window);
-    let font_input_div = div()
-        .id("font-input")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .min_w(px(220.))
-        .border_1()
-        .border_color(if font_focused { t.accent } else { t.border })
-        .bg(t.panel)
-        .text_sm()
-        .cursor_pointer()
-        .track_focus(&daemon.font_focus)
-        .on_click(cx.listener(|daemon: &mut DaemonStore, _, window, cx| {
+    let font_input_div = field_box(
+        "font-input",
+        &daemon.font_focus,
+        if font_focused { t.accent } else { t.border },
+        cx.listener(|daemon: &mut DaemonStore, _, window, cx| {
             window.focus(&daemon.font_focus, cx);
             cx.notify();
-        }))
-        .on_key_down(cx.listener(
+        }),
+        cx.listener(
             |daemon: &mut DaemonStore, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "enter" {
                     let text = daemon.font_field.text.trim().to_string();
@@ -655,12 +385,16 @@ fn settings_page(
                 }
                 basic_field_key(&mut daemon.font_field, event, cx);
             },
-        ))
-        .child(if font_field.text.is_empty() && !font_focused {
-            div().text_color(t.dim).child("系统默认…")
-        } else {
-            div().child(font_display)
-        });
+        ),
+    )
+    .min_w(px(220.))
+    .bg(t.panel)
+    .text_sm()
+    .child(if font_field.text.is_empty() && !font_focused {
+        div().text_color(t.dim).child("系统默认…")
+    } else {
+        div().child(font_display)
+    });
     let font_input = InputElement::new(cx.entity(), daemon.font_focus.clone(), font_input_div);
 
     let code_size_display = SharedString::from(format!("{:.0}", typo.code_font_size));
@@ -855,7 +589,7 @@ fn settings_page(
         ))
         .child(setting_row(
             "密度",
-            "时间线与侧栏留白节奏",
+            "时间线留白节奏",
             div().flex().gap_1().children(density_buttons).into_any_element(),
             &t,
         ))
@@ -958,7 +692,7 @@ fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaqh_ty
 }
 
 /// 新建会话面板从后端目录选择模型与模型支持的推理档位。
-fn new_session_panel(
+pub(crate) fn new_session_panel(
     daemon: &mut DaemonStore,
     window: &Window,
     cx: &mut Context<DaemonStore>,
@@ -1499,7 +1233,11 @@ fn timeline_entry(
     tail_max: usize,
 ) -> Option<AnyElement> {
     Some(match entry {
-        TimelineEntry::Input { content, .. } => user_bubble(content_text(content), t).into_any_element(),
+        TimelineEntry::Input { content, images, attachments, .. } => div()
+            .child(user_bubble(content_text(content), t))
+            .child(div().flex().flex_wrap().gap_2().children(images.iter().map(crate::media::preview)))
+            .children((!attachments.is_empty()).then(|| div().text_xs().child(format!("{} 个文本附件", attachments.len()))))
+            .into_any_element(),
         TimelineEntry::AssistantBlock { block_kind, content, .. } => {
             assistant_section(block_kind, content_text(content), false, index * 2, store, entity, t, ty)
                 .into_any_element()
@@ -1536,6 +1274,28 @@ pub(crate) fn action_button(
         .hover(|style| style.bg(t.btn_hover))
         .on_click(listener)
         .child(label)
+}
+
+/// 带边框可聚焦输入框的公共骨架:所有 TextField 容器(设置/搜索/ask 卡)
+/// 共用的统一形态;调用方追加宽度/背景/占位内容。
+pub(crate) fn field_box(
+    id: impl Into<SharedString>,
+    focus: &gpui::FocusHandle,
+    border_color: Hsla,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    on_key: impl Fn(&KeyDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id.into())
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(border_color)
+        .cursor_pointer()
+        .track_focus(focus)
+        .on_click(on_click)
+        .on_key_down(on_key)
 }
 
 fn interaction_card(
@@ -1587,6 +1347,11 @@ pub(crate) fn basic_field_key<E: 'static>(
         "home" => field.move_home(modifiers.shift),
         "end" => field.move_end(modifiers.shift),
         "a" if modifiers.control => field.select_all(),
+        "c" if modifiers.control => cx.write_to_clipboard(gpui::ClipboardItem::new_string(field.selected_text())),
+        "x" if modifiers.control => {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(field.selected_text()));
+            field.insert("");
+        }
         "v" if modifiers.control => {
             if let Some(item) = cx.read_from_clipboard()
                 && let Some(text) = item.text()
@@ -1652,6 +1417,15 @@ impl SessionStore {
             Ok(questions) if !questions.is_empty() => {
                 let ids: Vec<String> = questions.iter().map(|q| q.id.clone()).collect();
                 let mut body: Vec<AnyElement> = Vec::new();
+                if let Some(hint) = &self.ask_hint {
+                    body.push(
+                        div()
+                            .text_xs()
+                            .text_color(t.bad)
+                            .child(SharedString::from(hint.clone()))
+                            .into_any_element(),
+                    );
+                }
                 for (index, question) in questions.iter().enumerate() {
                     let focus = self.ask_draft(&iid, questions.len(), cx).focuses[index].clone();
                     let field = self.ask_draft(&iid, questions.len(), cx).customs[index].clone();
@@ -1705,22 +1479,15 @@ impl SessionStore {
                         let iid_key = iid.clone();
                         let focused = focus.is_focused(window);
                         let display = field.display(focused, window);
-                        let input = div()
-                            .id(SharedString::from(format!("ask-custom-{iid}-{index}")))
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if custom_text.trim().is_empty() {
+                        let input = field_box(
+                            format!("ask-custom-{iid}-{index}"),
+                            &focus,
+                            if custom_text.trim().is_empty() {
                                 t.border
                             } else {
                                 t.accent
-                            })
-                            .bg(t.panel)
-                            .text_sm()
-                            .cursor_pointer()
-                            .track_focus(&focus)
-                            .on_click(cx.listener(
+                            },
+                            cx.listener(
                                 move |store: &mut SessionStore,
                                       _,
                                       window: &mut Window,
@@ -1731,20 +1498,23 @@ impl SessionStore {
                                     window.focus(&focus, cx);
                                     cx.notify();
                                 },
-                            ))
-                            .on_key_down(cx.listener(
+                            ),
+                            cx.listener(
                                 move |store: &mut SessionStore,
                                       event: &KeyDownEvent,
                                       _window,
                                       cx| {
                                     store.custom_key(&iid_key, index, event, cx);
                                 },
-                            ))
-                            .child(if custom_text.is_empty() && !focused {
-                                div().text_sm().text_color(t.dim).child("其它…")
-                            } else {
-                                div().text_sm().child(display)
-                            });
+                            ),
+                        )
+                        .bg(t.panel)
+                        .text_sm()
+                        .child(if custom_text.is_empty() && !focused {
+                            div().text_sm().text_color(t.dim).child("其它…")
+                        } else {
+                            div().text_sm().child(display)
+                        });
                         row = row.child(InputElement::new(cx.entity(), focus, input));
                     }
                     body.push(row.into_any_element());
@@ -1752,14 +1522,21 @@ impl SessionStore {
                 let submit = {
                     let iid_submit = iid.clone();
                     let ids = ids.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, _| {
-                        let _ = store.ask_submit(&iid_submit, &ids);
+                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
+                        if store.ask_submit(&iid_submit, &ids).is_some() {
+                            store.ask_hint = None;
+                        } else {
+                            store.ask_hint = Some("请先选择答案或填写自定义回答".into());
+                        }
+                        cx.notify();
                     })
                 };
                 let skip = {
                     let iid_skip = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, _| {
+                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
                         store.ask_dismiss(&iid_skip);
+                        store.ask_hint = None;
+                        cx.notify();
                     })
                 };
                 interaction_card(
@@ -1790,51 +1567,65 @@ impl SessionStore {
                 let iid_key = iid.clone();
                 let focused = focus.is_focused(window);
                 let display = field.display(focused, window);
-                let input = div()
-                    .id(SharedString::from(format!("ask-free-{iid}")))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if custom_text.trim().is_empty() {
+                let input = field_box(
+                    format!("ask-free-{iid}"),
+                    &focus,
+                    if custom_text.trim().is_empty() {
                         t.border
                     } else {
                         t.accent
-                    })
-                    .bg(t.panel)
-                    .text_sm()
-                    .cursor_pointer()
-                    .track_focus(&focus)
-                    .on_click(cx.listener(
+                    },
+                    cx.listener(
                         move |store: &mut SessionStore, _, window: &mut Window, cx| {
                             let focus = store.ask_draft(&iid_focus, 1, cx).focuses[0].clone();
                             window.focus(&focus, cx);
                             cx.notify();
                         },
-                    ))
-                    .on_key_down(cx.listener(
+                    ),
+                    cx.listener(
                         move |store: &mut SessionStore, event: &KeyDownEvent, _window, cx| {
                             store.custom_key(&iid_key, 0, event, cx);
                         },
-                    ))
-                    .child(if custom_text.is_empty() && !focused {
-                        div().text_sm().text_color(t.dim).child("输入回答…")
-                    } else {
-                        div().text_sm().child(display)
-                    });
+                    ),
+                )
+                .bg(t.panel)
+                .text_sm()
+                .child(if custom_text.is_empty() && !focused {
+                    div().text_sm().text_color(t.dim).child("输入回答…")
+                } else {
+                    div().text_sm().child(display)
+                });
                 let submit = {
                     let ids = vec!["q1".to_string()];
                     let iid_submit = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, _| {
-                        let _ = store.ask_submit(&iid_submit, &ids);
+                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
+                        if store.ask_submit(&iid_submit, &ids).is_some() {
+                            store.ask_hint = None;
+                        } else {
+                            store.ask_hint = Some("请填写回答".into());
+                        }
+                        cx.notify();
                     })
                 };
                 let skip = {
                     let iid_skip = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, _| {
+                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
                         store.ask_dismiss(&iid_skip);
+                        store.ask_hint = None;
+                        cx.notify();
                     })
                 };
+                let mut body: Vec<AnyElement> = Vec::new();
+                if let Some(hint) = &self.ask_hint {
+                    body.push(
+                        div()
+                            .text_xs()
+                            .text_color(t.bad)
+                            .child(SharedString::from(hint.clone()))
+                            .into_any_element(),
+                    );
+                }
+                body.push(InputElement::new(cx.entity(), focus, input).into_any_element());
                 interaction_card(
                     "提问",
                     content_text(&interaction.request),
@@ -1844,7 +1635,7 @@ impl SessionStore {
                         action_button(format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)
                             .into_any_element(),
                     ],
-                    vec![InputElement::new(cx.entity(), focus, input).into_any_element()],
+                    body,
                     &t,
                 )
             }
@@ -2108,6 +1899,7 @@ impl Render for SessionStore {
         let settings = settings::get(cx).clone();
         let ty = settings.typography();
         let tail_max = settings.behavior.output_tail_max;
+        self.output_budget = tail_max;
 
         let list_state = self.timeline_list.clone();
         let old_history_len = list_state.item_count() - 1;
@@ -2349,27 +2141,18 @@ impl Render for SessionStore {
                 }
             }
         }
-        let activity = self
-            .activity
-            .map(activity_label)
-            .unwrap_or("未知")
-            .to_string();
-        footer = footer.child(
-            div()
-                .text_xs()
-                .text_color(t.dim)
-                .child(SharedString::from(format!("活动状态:{activity}"))),
-        );
-
         let conversation = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
             .child(header)
+            .child(crate::desktop::session_controls(self, cx, &t))
+            .children(crate::desktop::search(self, window, cx, &t))
             .child(timeline)
             .children(crate::code_panel::review_button(self, &t, cx))
             .child(composer)
+            .child(crate::desktop::composer_tools(self, cx, &t))
             .child(footer);
         div().flex().flex_1().min_w_0()
             .child(conversation)

@@ -12,8 +12,13 @@ path = "src/main.rs"
 [lints.clippy]
 string_slice = "deny"
 
+[features]
+# Local native acceptance driver; deliberately absent from release builds.
+acceptance = []
+
 [dependencies]
 futures = "0.3"
+base64 = "0.22"
 # gpui 固定在本地检出的 ../gpui 仓库:
 #   https://github.com/QAQTam/gpui-vendor @ d1520011e6204b95b320ee40a5a6b11879082426
 #   vendor 源码取自 zed-industries/zed @ e21ff1b。
@@ -66,3 +71,9 @@ incremental = true
 codegen-units = 16
 split-debuginfo = "unpacked"
 debug = "limited"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+strip = true

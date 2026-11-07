@@ -1,0 +1,45 @@
+name: Native client
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-wayland:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: source/qaqh-gpui
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev libvulkan-dev libegl1-mesa-dev libglib2.0-dev libssl-dev mesa-vulkan-drivers weston
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+      - name: Materialize pinned sources
+        working-directory: source/qaqh-gpui
+        run: python3 scripts/prepare-sources.py
+      - name: Review contract and check native client
+        working-directory: source/qaqh-gpui
+        run: |
+          python3 scripts/check-capabilities.py
+          cargo check --locked -j1
+          cargo test --release --locked -j1 delivery::tests::accepted_is_not_completed
+      - name: Build and package
+        working-directory: source/qaqh-gpui
+        run: bash scripts/build-release.sh
+      - name: Native acceptance
+        working-directory: source/qaqh-gpui
+        run: |
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          weston --backend=headless-backend.so --socket=wayland-acceptance --idle-time=0 > /tmp/weston.log 2>&1 &
+          export WAYLAND_DISPLAY=wayland-acceptance
+          cargo build --release --locked --features acceptance -j1
+          python3 scripts/acceptance.py --client target/release/qaqh-gpui --daemon target/release/qaqh-daemon
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qaqh-gpui-linux-x86_64
+          path: source/qaqh-gpui/dist/

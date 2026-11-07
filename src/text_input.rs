@@ -52,9 +52,10 @@ pub struct TextField {
 
 impl TextField {
     pub fn with_text(text: &str) -> Self {
+        let end = utf16_len(text);
         Self {
             text: text.into(),
-            selection: 0..0,
+            selection: end..end,
             marked: None,
         }
     }
@@ -80,6 +81,10 @@ impl TextField {
         self.text.clear();
         self.selection = 0..0;
         self.marked = None;
+    }
+
+    pub fn selected_text(&self) -> String {
+        self.text.get(self.utf16_to_byte(self.selection.start)..self.utf16_to_byte(self.selection.end)).expect("selection is character aligned").to_string()
     }
 
     /// 用 text 替换给定范围(None = 组字或当前选区)并收拢光标。
@@ -158,7 +163,7 @@ impl TextField {
     }
 
     pub fn move_left(&mut self, extend: bool) {
-        if !extend {
+        if !extend && self.selection.start != self.selection.end {
             let pos = self.selection.start;
             self.selection = pos..pos;
             return;
@@ -170,11 +175,12 @@ impl TextField {
         let Some((_, ch)) = self.text.split_at(byte).0.char_indices().next_back() else {
             return;
         };
-        self.selection = (self.selection.start - ch.len_utf16())..self.selection.end;
+        let next = self.selection.start - ch.len_utf16();
+        self.selection = next..if extend { self.selection.end } else { next };
     }
 
     pub fn move_right(&mut self, extend: bool) {
-        if !extend {
+        if !extend && self.selection.start != self.selection.end {
             let pos = self.selection.end;
             self.selection = pos..pos;
             return;
@@ -186,7 +192,8 @@ impl TextField {
         let Some(ch) = self.text.split_at(byte).1.chars().next() else {
             return;
         };
-        self.selection = self.selection.start..(self.selection.end + ch.len_utf16());
+        let next = self.selection.end + ch.len_utf16();
+        self.selection = if extend { self.selection.start } else { next }..next;
     }
 
     pub fn move_home(&mut self, extend: bool) {
@@ -269,12 +276,20 @@ mod tests {
 
         field.replace_range(None, "中文");
         assert_eq!(field.display_parts(true), ("前中文▍后".into(), vec![]));
+        let mut field = TextField::with_text("汉😀");
+        field.move_left(false);
+        field.insert("A");
+        assert_eq!(field.text, "汉A😀");
+        field.move_right(false);
+        field.insert("B");
+        assert_eq!(field.text, "汉A😀B");
     }
 }
 
 impl SessionStore {
     /// 当前持焦点的输入框(composer > rename > ask 自定义输入)。
     fn focused_field(&mut self, window: &Window) -> Option<&mut TextField> {
+        if self.search_open && self.search_focus.is_focused(window) { return Some(&mut self.search); }
         if self.composer_focus.is_focused(window) {
             return Some(&mut self.composer);
         }
@@ -323,6 +338,7 @@ impl EntityInputHandler for SessionStore {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if self.search_open && self.search_focus.is_focused(window) { return self.search.marked.clone(); }
         if self.composer_focus.is_focused(window) {
             return self.composer.marked.clone();
         }
@@ -405,6 +421,7 @@ impl EntityInputHandler for SessionStore {
 
 impl DaemonStore {
     fn focused_settings_field(&self, window: &Window) -> Option<&TextField> {
+        if self.session_search_focus.is_focused(window) { return Some(&self.session_search); }
         if self.font_focus.is_focused(window) {
             Some(&self.font_field)
         } else {
@@ -413,6 +430,7 @@ impl DaemonStore {
     }
 
     fn focused_settings_field_mut(&mut self, window: &Window) -> Option<&mut TextField> {
+        if self.session_search_focus.is_focused(window) { return Some(&mut self.session_search); }
         if self.font_focus.is_focused(window) {
             Some(&mut self.font_field)
         } else {

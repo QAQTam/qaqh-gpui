@@ -56,6 +56,11 @@ pub struct CodePanel {
     request: usize,
 }
 
+impl CodePanel {
+    pub fn with_root(local_root: Option<PathBuf>) -> Self { Self { local_root, ..Self::default() } }
+    pub fn local_root(&self) -> Option<PathBuf> { self.local_root.clone() }
+}
+
 enum View {
     Source(Location, Result<Excerpt, String>),
     Loading(Location),
