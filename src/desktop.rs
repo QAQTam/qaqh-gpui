@@ -2,11 +2,12 @@
 use crate::{
     bridge::{BridgeRequest, ConnectionState},
     store::{DaemonStore, SessionRow, SessionStore},
-    text_input::InputElement,
     theme::Palette,
-    ui::{action_button, basic_field_key, field_box},
+    ui::action_button,
 };
-use gpui::{App, Context, Div, KeyDownEvent, PathPromptOptions, Window, div, prelude::*, px};
+use gpui::{App, Context, Div, KeyDownEvent, PathPromptOptions, div, prelude::*, px};
+use gpui_component::input::Input;
+use gpui_component::Sizable;
 use qaqh_client::{CommandTarget, RingingCommand, SessionListEntry};
 
 pub fn notify(cx: &App, session: &str, title: &str) {
@@ -56,7 +57,7 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
             div()
                 .flex()
                 .gap_2()
-                .child(action_button(
+                .child(action_button(cx, 
                     "reconnect".into(),
                     "重新连接",
                     t.accent,
@@ -67,7 +68,7 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                     }),
                     t,
                 ))
-                .child(action_button(
+                .child(action_button(cx, 
                     "diagnostics".into(),
                     "复制诊断",
                     t.dim,
@@ -89,43 +90,21 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
 
 pub fn sidebar_tools(
     daemon: &DaemonStore,
-    window: &Window,
     cx: &mut Context<DaemonStore>,
     t: &Palette,
 ) -> Div {
-    let field = field_box(
-        "session-search",
-        &daemon.session_search_focus,
-        t.border,
-        cx.listener(|daemon, _, window, cx| window.focus(&daemon.session_search_focus, cx)),
-        cx.listener(|daemon, event: &KeyDownEvent, _, cx| {
-            basic_field_key(&mut daemon.session_search, event, cx)
-        }),
-    )
-    .child(if daemon.session_search.text.is_empty() {
-        "搜索会话…".into_element().into_any_element()
-    } else {
-        daemon
-            .session_search
-            .display(daemon.session_search_focus.is_focused(window), window)
-            .into_any_element()
-    });
     div()
         .p_2()
         .flex()
         .flex_col()
         .gap_2()
-        .child(InputElement::new(
-            cx.entity(),
-            daemon.session_search_focus.clone(),
-            field,
-        ))
+        .child(Input::new(&daemon.session_search).small())
         .child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap_2()
-                .child(action_button(
+                .child(action_button(cx, 
                     "archive-filter".into(),
                     if daemon.show_archived {
                         "返回活动会话"
@@ -139,7 +118,7 @@ pub fn sidebar_tools(
                     }),
                     t,
                 ))
-                .child(action_button(
+                .child(action_button(cx, 
                     "workspace-settings".into(),
                     "工作区",
                     t.dim,
@@ -152,7 +131,7 @@ pub fn sidebar_tools(
                     }),
                     t,
                 ))
-                .child(action_button(
+                .child(action_button(cx, 
                     "sidebar-narrow".into(),
                     "窄",
                     t.dim,
@@ -163,7 +142,7 @@ pub fn sidebar_tools(
                     }),
                     t,
                 ))
-                .child(action_button(
+                .child(action_button(cx, 
                     "sidebar-wide".into(),
                     "宽",
                     t.dim,
@@ -187,7 +166,7 @@ pub fn welcome(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette)
         .child("欢迎使用 QAQHarness")
         .child("先在设置中添加服务商和模型，再选择工作目录并新建会话。")
         .child(connection(daemon, cx, t))
-        .child(action_button(
+        .child(action_button(cx, 
             "setup-model".into(),
             "配置服务商与模型",
             t.accent,
@@ -222,7 +201,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             Some(_) if own => "控制权：本客户端",
             _ => "控制权：其他客户端",
         })
-        .child(action_button(
+        .child(action_button(cx, 
             "driver-control".into(),
             if own {
                 "释放控制权"
@@ -241,7 +220,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(
+        .child(action_button(cx, 
             "archive-session".into(),
             if archived { "取消归档" } else { "归档" },
             t.dim,
@@ -259,7 +238,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(
+        .child(action_button(cx, 
             "reload-agent".into(),
             "重载配置",
             t.dim,
@@ -273,7 +252,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(
+        .child(action_button(cx, 
             "shutdown-agent".into(),
             "停止会话",
             t.dim,
@@ -287,18 +266,18 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(
+        .child(action_button(cx, 
             "message-search".into(),
             "搜索消息",
             t.dim,
             cx.listener(|store, _, window, cx| {
                 store.search_open = !store.search_open;
-                window.focus(&store.search_focus, cx);
+                store.search.update(cx, |field, cx| field.focus(window, cx));
                 cx.notify();
             }),
             t,
         ))
-        .child(action_button(
+        .child(action_button(cx, 
             "load-references".into(),
             "加载引用内容",
             t.dim,
@@ -314,7 +293,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(
+        .child(action_button(cx, 
             "copy-conversation".into(),
             "复制对话",
             t.dim,
@@ -345,7 +324,7 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
         div()
             .flex()
             .gap_2()
-            .child(action_button(
+            .child(action_button(cx, 
                 "attach-file".into(),
                 "图片 / 文本附件",
                 t.accent,
@@ -389,7 +368,7 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
                 store.images.len(),
                 store.attachments.len()
             ))
-            .child(action_button(
+            .child(action_button(cx, 
                 "clear-attachments".into(),
                 "移除附件",
                 t.dim,
@@ -415,7 +394,7 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
                 div()
                     .flex()
                     .gap_2()
-                    .child(action_button(
+                    .child(action_button(cx, 
                         "check-receipt".into(),
                         "查回执",
                         t.accent,
@@ -425,7 +404,7 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
                     .children(
                         matches!(outbox.state, crate::delivery::DeliveryState::Uncertain).then(
                             || {
-                                action_button(
+                                action_button(cx, 
                                     "retry-message".into(),
                                     "重试原请求",
                                     t.warn,
@@ -445,15 +424,16 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
                                 | crate::delivery::DeliveryState::Failed
                         )
                         .then(|| {
-                            action_button(
+                            action_button(cx, 
                                 "restore-message".into(),
                                 "恢复为草稿",
                                 t.dim,
-                                cx.listener(|store, _, _, cx| {
+                                cx.listener(|store, _, window, cx| {
                                     if let Some(outbox) = store.outbox.take() {
-                                        store.composer = crate::text_input::TextField::with_text(
-                                            &outbox.message.text,
-                                        );
+                                        let text = outbox.message.text.clone();
+                                        store.composer.update(cx, |composer, cx| {
+                                            composer.set_value(text.as_str(), window, cx)
+                                        });
                                         store.images = outbox.message.images;
                                         store.attachments =
                                             outbox.message.attachments.unwrap_or_default();
@@ -474,33 +454,23 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
 
 pub fn search(
     store: &SessionStore,
-    window: &Window,
     cx: &mut Context<SessionStore>,
-    t: &Palette,
 ) -> Option<gpui::AnyElement> {
     if !store.search_open {
         return None;
     }
-    let input = field_box(
-        "message-search-input",
-        &store.search_focus,
-        t.border,
-        cx.listener(|store, _, window, cx| window.focus(&store.search_focus, cx)),
-        cx.listener(|store, event: &KeyDownEvent, _, cx| {
+    // Escape 关闭搜索(祖先层截获,先于输入引擎的 Escape 动作)。
+    let input = div()
+        .id("message-search-input")
+        .on_key_down(cx.listener(|store, event: &KeyDownEvent, _, cx| {
             if event.keystroke.key == "escape" {
                 store.search_open = false;
-            } else {
-                basic_field_key(&mut store.search, event, cx);
+                cx.stop_propagation();
+                cx.notify();
             }
-            cx.notify();
-        }),
-    )
-    .child(
-        store
-            .search
-            .display(store.search_focus.is_focused(window), window),
-    );
-    let query = store.search.text.to_lowercase();
+        }))
+        .child(Input::new(&store.search).small());
+    let query = store.search.read(cx).value().to_lowercase();
     let matches: Vec<_> = store
         .entries
         .iter()
@@ -523,11 +493,7 @@ pub fn search(
             .id("search-results")
             .overflow_y_scroll()
             .p_2()
-            .child(InputElement::new(
-                cx.entity(),
-                store.search_focus.clone(),
-                input,
-            ))
+            .child(input)
             .child(format!("{} 处匹配", matches.len()))
             .children(matches.into_iter().map(|(index, preview)| {
                 div()

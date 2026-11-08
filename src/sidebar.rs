@@ -3,7 +3,6 @@ use crate::{
     bridge::BridgeRequest,
     settings,
     store::{DaemonStore, WorkspaceGroup},
-    text_input::TextField,
     theme::ActiveTheme,
 };
 use gpui::prelude::*;
@@ -16,7 +15,7 @@ impl Render for DaemonStore {
         let settings = settings::get(cx).clone();
         // rem 缩放:改设置里的界面字号 → 全 UI(rem 字号)等比缩放。
         window.set_rem_size(px(settings.typography.ui_font_size));
-        let query = self.session_search.text.to_lowercase();
+        let query = self.session_search.read(cx).value().to_lowercase();
         let visible: Vec<_> = self
             .sessions
             .iter()
@@ -111,8 +110,8 @@ impl Render for DaemonStore {
                     .as_ref()
                     .is_some_and(|current| current.read(cx).session_id == row.id);
                 let id = row.id.clone();
-                let listener = cx.listener(move |daemon: &mut DaemonStore, _event, _window, cx| {
-                    daemon.select(id.clone(), cx);
+                let listener = cx.listener(move |daemon: &mut DaemonStore, _event, window, cx| {
+                    daemon.select(id.clone(), window, cx);
                 });
                 rows.push(sidebar_row(row, selected, &t, listener).into_any_element());
             }
@@ -202,32 +201,38 @@ impl Render for DaemonStore {
                                     })
                                     .text_color(if self.settings_open { t.accent } else { t.dim })
                                     .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        daemon.settings_open = !daemon.settings_open;
-                                        if daemon.settings_open {
-                                            daemon.new_session_open = false;
-                                            daemon.settings_form = None;
-                                            // 打开时把当前值种进输入框,避免显示漂移;
-                                            // 同时拉取 daemon 侧配置与服务商列表。
-                                            let family =
-                                                settings::get(cx).typography.ui_font_family.clone();
-                                            daemon.font_field = TextField::with_text(&family);
-                                            let _ = daemon
-                                                .requests
-                                                .unbounded_send(BridgeRequest::QueryConfig);
-                                            let _ = daemon
-                                                .requests
-                                                .unbounded_send(BridgeRequest::ListProviders);
-                                        } else {
-                                            daemon.settings_form = None;
-                                        }
-                                        cx.notify();
-                                    }))
+                                    .on_click(cx.listener(
+                                        |daemon: &mut DaemonStore, _, window: &mut Window, cx| {
+                                            daemon.settings_open = !daemon.settings_open;
+                                            if daemon.settings_open {
+                                                daemon.new_session_open = false;
+                                                daemon.settings_form = None;
+                                                // 打开时把当前值种进输入框,避免显示漂移;
+                                                // 同时拉取 daemon 侧配置与服务商列表。
+                                                let family = settings::get(cx)
+                                                    .typography
+                                                    .ui_font_family
+                                                    .clone();
+                                                daemon.font_field.update(cx, |field, cx| {
+                                                    field.set_value(&family, window, cx)
+                                                });
+                                                let _ = daemon
+                                                    .requests
+                                                    .unbounded_send(BridgeRequest::QueryConfig);
+                                                let _ = daemon
+                                                    .requests
+                                                    .unbounded_send(BridgeRequest::ListProviders);
+                                            } else {
+                                                daemon.settings_form = None;
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
                                     .child("设置"),
                             ),
                     ),
             )
-            .child(crate::desktop::sidebar_tools(self, window, cx, &t))
+            .child(crate::desktop::sidebar_tools(self, cx, &t))
             .child(
                 div()
                     .id("session-list")
@@ -251,9 +256,9 @@ impl Render for DaemonStore {
             );
 
         let main = if self.new_session_open {
-            new_session_panel(self, window, cx)
+            new_session_panel(self, cx)
         } else if self.settings_open {
-            settings_page(self, window, cx)
+            settings_page(self, cx)
         } else {
             match self.current.clone() {
                 Some(session) => div()
@@ -286,14 +291,18 @@ impl Render for DaemonStore {
                                 .unbounded_send(BridgeRequest::ListProviders);
                         }
                     }
-                    "k" => window.focus(&daemon.session_search_focus, cx),
+                    "k" => daemon
+                        .session_search
+                        .update(cx, |field, cx| field.focus(window, cx)),
                     "," => {
                         if !daemon.settings_open {
                             daemon.settings_open = true;
                             daemon.new_session_open = false;
                             daemon.settings_form = None;
                             let family = settings::get(cx).typography.ui_font_family.clone();
-                            daemon.font_field = TextField::with_text(&family);
+                            daemon.font_field.update(cx, |field, cx| {
+                                field.set_value(&family, window, cx)
+                            });
                             let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
                             let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
                         }
@@ -302,7 +311,7 @@ impl Render for DaemonStore {
                         if let Some(current) = &daemon.current {
                             current.update(cx, |store, cx| {
                                 store.search_open = true;
-                                window.focus(&store.search_focus, cx);
+                                store.search.update(cx, |field, cx| field.focus(window, cx));
                                 cx.notify();
                             });
                         }

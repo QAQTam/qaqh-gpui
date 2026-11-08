@@ -1,15 +1,17 @@
 //! GPUI 实体状态(M3):字段直持 RingingV2 契约类型,零前端 DTO。
 //! 多会话:visited store 常驻缓存、事件按 seed 路由;输入框统一走
-//! text_input::TextField(gpui 0.2.2 无内置 Input 组件)。
+//! gpui-component 的 InputState/TextareaState(InputState::new 需要
+//! &mut Window,故实体构造一律在窗口上下文内完成)。
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
+use gpui::App;
 use gpui::AppContext as _;
 use gpui::Context;
 use gpui::Entity;
-use gpui::FocusHandle;
+use gpui::Window;
 use gpui::{ListAlignment, ListState, px};
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::fact::ActivityState;
@@ -17,6 +19,7 @@ use qaqh_ringing_contract::fact::AssistantBlockKind;
 use qaqh_ringing_contract::fact::BlockId;
 use qaqh_ringing_contract::fact::ExecSessionId;
 use qaqh_ringing_contract::fact::InteractionId;
+use qaqh_ringing_contract::fact::InteractionKind;
 use qaqh_ringing_contract::fact::ToolCallId;
 use qaqh_ringing_contract::fact::TurnId;
 use qaqh_ringing_contract::state::DriverState;
@@ -30,7 +33,8 @@ use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
 use crate::bridge::BridgeMsg;
 use crate::bridge::BridgeRequest;
-use crate::text_input::TextField;
+use gpui_component::input::{InputEvent, InputState, TextareaState};
+use gpui_component::WindowExt;
 use qaqh_client::{SessionSettingsPatch, ToolsSettingPatch};
 use qaqh_config_api::ConfigDto;
 use qaqh_profile::ProfilesDocument;
@@ -44,14 +48,12 @@ pub enum StreamState {
     Closed { reason: String },
 }
 
-/// ask 卡草稿:每题已选项 + 自定义输入框 + 输入焦点。
+/// ask 卡草稿:每题已选项 + 自定义输入框(焦点由 InputState 自管)。
 pub struct AskDraft {
     /// 每题点选的选项文本(与 customs 互斥生效)。
     pub answers: Vec<Option<String>>,
     /// 每题自定义输入框(非空时优先于 answers)。
-    pub customs: Vec<TextField>,
-    /// 每题自定义输入焦点。
-    pub focuses: Vec<FocusHandle>,
+    pub customs: Vec<Entity<InputState>>,
 }
 
 pub struct SessionStore {
@@ -64,8 +66,7 @@ pub struct SessionStore {
     pub operation_error: Option<String>,
     pub client_session_id: Option<String>,
     pub output_budget: usize,
-    pub search: TextField,
-    pub search_focus: FocusHandle,
+    pub search: Entity<InputState>,
     pub search_open: bool,
     pub code_panel: crate::code_panel::CodePanel,
     pub session_id: String,
@@ -101,12 +102,10 @@ pub struct SessionStore {
     pub catalog: Option<Arc<ProfilesDocument>>,
     /// 删除确认二段态(第一次点击武装,第二次执行)。
     pub confirm_delete: bool,
-    /// composer 状态(M2):TextField 缓冲 + IME。
-    pub composer: TextField,
-    pub composer_focus: FocusHandle,
+    /// composer 状态(M2):组件库 Textarea(auto_grow,Enter 提交,Shift+Enter 换行)。
+    pub composer: Entity<TextareaState>,
     /// 重命名草稿(Some = 重命名模式)。
-    pub renaming: Option<TextField>,
-    pub rename_focus: FocusHandle,
+    pub renaming: Option<Entity<InputState>>,
     /// ask 卡草稿,按 interaction_id。
     pub ask_drafts: Vec<(InteractionId, AskDraft)>,
     /// ask 卡未答提示(上次提交被拒时显示,成功提交/跳过/解决后清除)。
@@ -116,12 +115,12 @@ pub struct SessionStore {
 
 impl SessionStore {
     #[cfg(feature = "acceptance")]
-    pub fn simulate_closed_bridge(&mut self) {
+    pub fn simulate_closed_bridge(&mut self, cx: &mut Context<Self>) {
         let original = self.requests.clone();
         let (tx, rx) = futures::channel::mpsc::unbounded();
         drop(rx);
         self.requests = tx;
-        self.composer_send();
+        self.composer_send(cx);
         self.requests = original;
     }
     pub fn requests(&self) -> &UnboundedSender<BridgeRequest> { &self.requests }
@@ -129,8 +128,30 @@ impl SessionStore {
         session_id: String,
         requests: UnboundedSender<BridgeRequest>,
         draft: crate::workbench::Draft,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder("输入消息,Enter 发送…")
+        });
+        // Enter(无 Shift)提交;Shift+Enter 由引擎插入换行(submit_on_enter 语义)。
+        cx.subscribe(&composer, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.composer_send(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索消息…"));
+        // 搜索结果随输入实时过滤,Change 驱动父视图重渲染。
+        // 事件类型需显式标注:InputState 同时发 InputEvent/InputEditsEvent/NumberInputEvent。
+        cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+        if !draft.text.is_empty() {
+            composer.update(cx, |state, cx| state.set_value(draft.text.as_str(), window, cx));
+        }
         Self {
             snapshot_pending: true,
             buffered_frames: Vec::new(),
@@ -142,8 +163,7 @@ impl SessionStore {
             operation_error: None,
             client_session_id: None,
             output_budget: crate::settings::get(cx).behavior.output_tail_max,
-            search: TextField::default(),
-            search_focus: cx.focus_handle(),
+            search,
             search_open: false,
             session_id,
             title: None,
@@ -170,10 +190,8 @@ impl SessionStore {
             settings_pending: false,
             catalog: None,
             confirm_delete: false,
-            composer: TextField::with_text(&draft.text),
-            composer_focus: cx.focus_handle(),
+            composer,
             renaming: None,
-            rename_focus: cx.focus_handle(),
             ask_drafts: Vec::new(),
             ask_hint: None,
             requests,
@@ -218,11 +236,11 @@ impl SessionStore {
     }
 
     /// 发送 composer 内容;受阻返回原因,空文本静默忽略。
-    pub fn composer_send(&mut self) -> Option<&'static str> {
+    pub fn composer_send(&mut self, cx: &mut Context<Self>) -> Option<&'static str> {
         if let Some(reason) = self.send_block_reason() {
             return Some(reason);
         }
-        let text = self.composer.text.trim().to_string();
+        let text = self.composer.read(cx).value().trim().to_string();
         if text.is_empty() && self.images.is_empty() && self.attachments.is_empty() {
             return None;
         }
@@ -236,7 +254,7 @@ impl SessionStore {
             state: crate::delivery::DeliveryState::Sending, detail: String::new(),
         };
         self.outbox = Some(outbox);
-        if let Err(error) = self.persist_draft() {
+        if let Err(error) = self.persist_draft(cx) {
             self.operation_error = Some(format!("发送前保存失败：{error}"));
             self.outbox = None;
             return Some("草稿未能保存，消息尚未发送");
@@ -245,16 +263,16 @@ impl SessionStore {
         None
     }
 
-    pub fn draft(&self) -> crate::workbench::Draft {
+    pub fn draft(&self, cx: &App) -> crate::workbench::Draft {
         crate::workbench::Draft {
-            text: self.composer.text.clone(), images: self.images.clone(),
+            text: self.composer.read(cx).value().to_string(), images: self.images.clone(),
             attachments: self.attachments.clone(), outbox: self.outbox.clone(),
             local_root: self.code_panel.local_root(),
         }
     }
-    pub fn persist_draft(&self) -> Result<(), String> {
+    pub fn persist_draft(&self, cx: &App) -> Result<(), String> {
         let mut state = crate::workbench::load()?;
-        state.drafts.insert(self.session_id.clone(), self.draft());
+        state.drafts.insert(self.session_id.clone(), self.draft(cx));
         crate::workbench::save(&state)
     }
     pub fn retry_message(&mut self) {
@@ -293,12 +311,13 @@ impl SessionStore {
             });
     }
 
-    /// 取(或建)ask 卡草稿;focus 句柄需 cx 创建。
+    /// 取(或建)ask 卡草稿;输入框实体需窗口上下文创建。
     /// 请求被引用内容解析替换后题数可能变化,题数不匹配时重建,防越界。
     pub fn ask_draft(
         &mut self,
         interaction_id: &InteractionId,
         question_count: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> &mut AskDraft {
         let position = self
@@ -311,10 +330,7 @@ impl SessionStore {
                     self.ask_drafts[index].1 = AskDraft {
                         answers: vec![None; question_count],
                         customs: (0..question_count)
-                            .map(|_| TextField::default())
-                            .collect(),
-                        focuses: (0..question_count)
-                            .map(|_| cx.focus_handle())
+                            .map(|_| cx.new(|cx| InputState::new(window, cx).placeholder("其它…")))
                             .collect(),
                     };
                 }
@@ -326,10 +342,7 @@ impl SessionStore {
                     AskDraft {
                         answers: vec![None; question_count],
                         customs: (0..question_count)
-                            .map(|_| TextField::default())
-                            .collect(),
-                        focuses: (0..question_count)
-                            .map(|_| cx.focus_handle())
+                            .map(|_| cx.new(|cx| InputState::new(window, cx).placeholder("其它…")))
                             .collect(),
                     },
                 ));
@@ -344,6 +357,7 @@ impl SessionStore {
         &mut self,
         interaction_id: &InteractionId,
         question_ids: &[String],
+        cx: &Context<Self>,
     ) -> Option<Vec<qaqh_client::AskAnswer>> {
         let index = self
             .ask_drafts
@@ -355,7 +369,7 @@ impl SessionStore {
             let custom = draft
                 .customs
                 .get(position)
-                .map(|field| field.text.trim().to_string())
+                .map(|field| field.read(cx).value().trim().to_string())
                 .unwrap_or_default();
             let answer = if !custom.is_empty() {
                 custom
@@ -393,18 +407,24 @@ impl SessionStore {
         });
     }
 
-    /// 进入重命名模式,草稿取当前标题。
-    pub fn begin_rename(&mut self) {
-        let current = self.title.clone().unwrap_or_default();
-        self.renaming = Some(TextField::with_text(&current));
+    /// 进入重命名模式,草稿取当前标题;Enter 提交由输入事件订阅驱动。
+    pub fn begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder("新标题…"));
+        cx.subscribe(&state, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.rename_commit(cx);
+            }
+        })
+        .detach();
+        self.renaming = Some(state);
     }
 
     /// Keep the edit until the authoritative metadata event confirms it.
-    pub fn rename_commit(&mut self) {
+    pub fn rename_commit(&mut self, cx: &Context<Self>) {
         let Some(draft) = self.renaming.as_ref() else {
             return;
         };
-        let title = draft.text.trim().to_string();
+        let title = draft.read(cx).value().trim().to_string();
         if title.is_empty() {
             return;
         }
@@ -599,15 +619,60 @@ pub enum SettingsEditor {
     Config,
     Catalog,
     Session,
+    Accounts,
     Workspaces,
+}
+
+/// 服务面账号服务(siwc = ChatGPT 套餐 / dsaccount = DeepSeek 账号)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountService {
+    Siwc,
+    Dsaccount,
+}
+
+/// 进行中的浏览器登录流程:轮询 sign_in.status 至终态,过期自动收口。
+pub struct AccountSignIn {
+    pub service: AccountService,
+    /// siwc 是 flow_id;dsaccount 是 attempt_id。
+    pub flow_id: String,
+    pub expires_at_ms: u64,
+}
+
+impl AccountSignIn {
+    fn poll_request(&self) -> BridgeRequest {
+        let (method, key) = match self.service {
+            AccountService::Siwc => ("siwc.sign_in.status", "flow_id"),
+            AccountService::Dsaccount => ("dsaccount.sign_in.status", "attempt_id"),
+        };
+        let mut params = serde_json::Map::new();
+        params.insert(key.into(), serde_json::Value::String(self.flow_id.clone()));
+        BridgeRequest::Service {
+            method: method.into(),
+            params: serde_json::Value::Object(params),
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// 服务面响应 → SDK 类型;解析失败以 Err 上抛,契约问题必须可见。
+fn decode<T: serde::de::DeserializeOwned>(
+    method: &str,
+    value: serde_json::Value,
+) -> Result<T, String> {
+    serde_json::from_value(value).map_err(|error| format!("{method} 响应解析失败:{error}"))
 }
 
 pub struct DaemonStore {
     pub last_operation: Option<String>,
     pub connection: crate::bridge::ConnectionState,
     pub workbench: crate::workbench::Workbench,
-    pub session_search: TextField,
-    pub session_search_focus: FocusHandle,
+    pub session_search: Entity<InputState>,
     pub show_archived: bool,
     pub lines: Vec<String>,
     pub sessions: Vec<SessionRow>,
@@ -624,11 +689,18 @@ pub struct DaemonStore {
     pub new_session_open: bool,
     pub creating_session: bool,
     pub new_workspace: usize,
-    /// 设置页字体输入框(IME 经 DaemonStore 的 EntityInputHandler 路由)。
-    pub font_field: crate::text_input::TextField,
-    pub font_focus: FocusHandle,
+    /// 设置页字体输入框(Enter 应用,由订阅驱动)。
+    pub font_field: Entity<InputState>,
     pub settings_editor: SettingsEditor,
     pub settings_form: Option<crate::settings_ui::Form>,
+    /// 服务面账号状态(siwc=ChatGPT 套餐 / dsaccount=DeepSeek 账号)。
+    pub siwc: Option<qaqh_client::service_types::SiwcStatus>,
+    pub dsaccount: Option<qaqh_client::service_types::DsAccountStatus>,
+    pub ds_balance: Option<qaqh_client::service_types::DsAccountBalance>,
+    /// 进行中的浏览器登录流程(Some = 轮询中)。
+    pub sign_in: Option<AccountSignIn>,
+    /// 账号页操作结果行(错误/提示)。
+    pub account_line: Option<String>,
     /// 所有访问过的会话 store(事件按 seed 路由,后台不丢)。
     pub stores: Vec<Entity<SessionStore>>,
     pub current: Option<Entity<SessionStore>>,
@@ -638,20 +710,33 @@ pub struct DaemonStore {
 }
 
 impl DaemonStore {
-    pub fn new(requests: UnboundedSender<BridgeRequest>, cx: &mut Context<Self>) -> Self {
-        let (workbench, error) = match crate::workbench::load() {
-            Ok(state) => (state, None),
-            Err(error) => (Default::default(), Some(format!("工作状态读取失败：{error}"))),
-        };
+    pub fn new(
+        requests: UnboundedSender<BridgeRequest>,
+        workbench: crate::workbench::Workbench,
+        load_error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let session_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话…"));
+        // 侧栏过滤随输入实时刷新(事件类型标注同上,InputState 发多种事件)。
+        cx.subscribe(&session_search, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+        let font_field = cx.new(|cx| InputState::new(window, cx).placeholder("系统默认…"));
+        // Enter 应用字体设置。
+        cx.subscribe(&font_field, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                let text = this.font_field.read(cx).value().trim().to_string();
+                crate::settings::update(cx, |content| content.typography.ui_font_family = text);
+            }
+        })
+        .detach();
         Self {
             last_operation: None,
             connection: crate::bridge::ConnectionState::Connecting,
             collapsed: workbench.collapsed.iter().cloned().collect(),
             workbench,
-            session_search: TextField::default(),
-            session_search_focus: cx.focus_handle(),
+            session_search,
             show_archived: false,
-            lines: vec![error.unwrap_or_else(|| "qaqh-gpui 启动…".into())],
+            lines: vec![load_error.unwrap_or_else(|| "qaqh-gpui 启动…".into())],
             sessions: Vec::new(),
             workspaces: Vec::new(),
             settings_open: false,
@@ -661,10 +746,14 @@ impl DaemonStore {
             new_session_open: false,
             creating_session: false,
             new_workspace: 0,
-            font_field: crate::text_input::TextField::default(),
-            font_focus: cx.focus_handle(),
+            font_field,
             settings_editor: SettingsEditor::default(),
             settings_form: None,
+            siwc: None,
+            dsaccount: None,
+            ds_balance: None,
+            sign_in: None,
+            account_line: None,
             stores: Vec::new(),
             current: None,
             todos: None,
@@ -672,10 +761,10 @@ impl DaemonStore {
         }
     }
 
-    pub fn handle(&mut self, message: BridgeMsg, cx: &mut Context<Self>) {
+    pub fn handle(&mut self, message: BridgeMsg, window: &mut Window, cx: &mut Context<Self>) {
         match message {
             BridgeMsg::FromConnection(generation, message) => {
-                if generation == crate::bridge::connection_generation() { self.handle(*message, cx); }
+                if generation == crate::bridge::connection_generation() { self.handle(*message, window, cx); }
             }
             BridgeMsg::Operation(name, target, result) => {
                 let label = match name.split('.').next().unwrap_or_default() {
@@ -685,16 +774,27 @@ impl DaemonStore {
                     "conversation" => "对话操作", "exec_session" => "执行会话操作", "driver" => "控制权操作",
                     _ => "操作",
                 };
-                self.last_operation = Some(match result {
+                match result {
                     Ok(ack) => {
                         crate::diagnostics::record(if ack.status == qaqh_client::RingingCommandAckStatus::Accepted { "command_accepted" } else { "command_rejected" },
                             match &target { qaqh_client::CommandTarget::Session { session_id } => Some(session_id.as_str()), _ => None }, Some(&ack.command_id), None);
-                        let status = if ack.status == qaqh_client::RingingCommandAckStatus::Rejected { "被拒绝" }
-                            else if ack.result.is_some() { "已完成" } else { "已受理" };
-                        format!("{label} · {status} · {} {}", ack.code.unwrap_or_default(), ack.message.unwrap_or_default())
+                        if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
+                            self.last_operation = Some(format!("{label} · 被拒绝 · {} {}", ack.code.unwrap_or_default(), ack.message.unwrap_or_default()));
+                        } else {
+                            // 成功受理走瞬时气泡;常驻状态行只承载失败/待确认。
+                            let status = if ack.result.is_some() { "已完成" } else { "已受理" };
+                            window.push_notification(
+                                gpui_component::notification::Notification::success(
+                                    format!("{label} · {status}"),
+                                ),
+                                cx,
+                            );
+                        }
                     }
-                    Err(error) => format!("{label} · 结果待确认：{error}"),
-                });
+                    Err(error) => {
+                        self.last_operation = Some(format!("{label} · 结果待确认：{error}"));
+                    }
+                }
                 cx.notify();
             }
             BridgeMsg::Connection(state) => {
@@ -727,14 +827,15 @@ impl DaemonStore {
                                 }
                             }
                             if was_pending && matches!(outbox.state, crate::delivery::DeliveryState::Accepted | crate::delivery::DeliveryState::Succeeded)
-                                && store.composer.text.trim() == outbox.message.text {
-                                store.composer.clear(); store.images.clear(); store.attachments.clear();
+                                && store.composer.read(cx).value().trim() == outbox.message.text {
+                                store.composer.update(cx, |composer, cx| composer.set_value("", window, cx));
+                                store.images.clear(); store.attachments.clear();
                             }
                             if outbox.state == crate::delivery::DeliveryState::Succeeded {
                                 outbox.message.images.clear(); outbox.message.attachments = None; outbox.message.text.clear();
                             }
                         }
-                        if let Err(error) = store.persist_draft() { store.operation_error = Some(error); }
+                        if let Err(error) = store.persist_draft(cx) { store.operation_error = Some(error); }
                         cx.notify();
                     });
                 }
@@ -783,7 +884,7 @@ impl DaemonStore {
                         .and_then(|id| self.sessions.iter().find(|row| &row.id == id))
                         .or_else(|| self.sessions.iter().find(|row| !row.archived)).map(|row| row.id.clone())
                 {
-                    self.select(id, cx);
+                    self.select(id, window, cx);
                     return;
                 }
                 cx.notify();
@@ -803,6 +904,15 @@ impl DaemonStore {
                 }
             }
             BridgeMsg::Event(seed, frame) => {
+                // ask 请求在 frame 被消费前先摘出 id(apply_frame 会 move frame)。
+                let ask_arrival = match &frame.event {
+                    SessionEvent::InteractionRequested { interaction }
+                        if interaction.kind == InteractionKind::Ask =>
+                    {
+                        Some(interaction.interaction_id.clone())
+                    }
+                    _ => None,
+                };
                 let notification = match &frame.event {
                     SessionEvent::InteractionRequested { .. } => Some("会话等待你的响应"),
                     SessionEvent::TurnEnded { outcome, .. } => Some(match outcome {
@@ -842,13 +952,23 @@ impl DaemonStore {
                         return;
                     }
                     let previous_seq = store.seq;
-                    crate::reducer::apply_frame(store, frame);
+                    crate::reducer::apply_frame(store, frame, cx);
                     if store.seq > previous_seq && let Some(title) = notification { crate::desktop::notify(cx, &store.session_id, title); }
                     if store.seq > previous_seq && let Some(turn) = review_turn {
                         crate::code_panel::auto_review(store, turn);
                     }
                     cx.notify();
                 });
+                // ask 请求到达即弹模态应答卡(仅当前会话);关闭后可经 footer 按钮重开。
+                // 需在 seed 被 QueryTodo 移动之前判定。
+                if let Some(iid) = ask_arrival
+                    && let Some(entity) = self
+                        .current
+                        .as_ref()
+                        .filter(|store| store.read(cx).session_id == seed)
+                {
+                    crate::ui::open_ask_dialog(entity, iid, window, cx);
+                }
                 if refresh_todos {
                     let _ = self
                         .requests
@@ -889,7 +1009,7 @@ impl DaemonStore {
                     crate::reducer::apply_snapshot(store, *state);
                     crate::diagnostics::record("snapshot", Some(&store.session_id), None, Some(store.seq));
                     store.snapshot_pending = false;
-                    for frame in std::mem::take(&mut store.buffered_frames) { crate::reducer::apply_frame(store, frame); }
+                    for frame in std::mem::take(&mut store.buffered_frames) { crate::reducer::apply_frame(store, frame, cx); }
                     cx.notify();
                 });
                 let _ = self.requests.unbounded_send(BridgeRequest::QueryTodo { seed });
@@ -921,7 +1041,7 @@ impl DaemonStore {
                 self.lines.push(format!("会话已创建:{seed}"));
                 self.new_session_open = false;
                 self.creating_session = false;
-                self.select(seed, cx);
+                self.select(seed, window, cx);
                 if let Some(store) = &self.current {
                     store.update(cx, |store, cx| {
                         store.code_panel.cwd = cwd.map(Into::into);
@@ -991,6 +1111,195 @@ impl DaemonStore {
                     self.lines.push("取消超时:已本地收口并重灌快照".into());
                 }
             }
+            BridgeMsg::ServiceResult { method, result } => {
+                self.handle_service_result(&method, result, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// 服务面请求(空参)。
+    fn service(&self, method: &str) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Service {
+            method: method.into(),
+            params: serde_json::Value::Object(Default::default()),
+        });
+    }
+
+    /// 打开账号页:拉两路账号状态。
+    pub fn refresh_accounts(&self) {
+        self.service("siwc.status");
+        self.service("dsaccount.status");
+    }
+
+    /// 浏览器登录入口:起流程并打开授权页;轮询由 2s 定时器驱动。
+    pub fn sign_in_start(&mut self, service: AccountService) {
+        let method = match service {
+            AccountService::Siwc => "siwc.sign_in.start",
+            AccountService::Dsaccount => "dsaccount.sign_in.start",
+        };
+        self.service(method);
+    }
+
+    pub fn sign_in_cancel(&mut self) {
+        let Some(flow) = self.sign_in.take() else { return };
+        let (method, key) = match flow.service {
+            AccountService::Siwc => ("siwc.sign_in.cancel", "flow_id"),
+            AccountService::Dsaccount => ("dsaccount.sign_in.cancel", "attempt_id"),
+        };
+        let mut params = serde_json::Map::new();
+        params.insert(key.into(), serde_json::Value::String(flow.flow_id));
+        let _ = self.requests.unbounded_send(BridgeRequest::Service {
+            method: method.into(),
+            params: serde_json::Value::Object(params),
+        });
+    }
+
+    pub fn sign_out(&mut self, service: AccountService) {
+        let method = match service {
+            AccountService::Siwc => "siwc.sign_out",
+            AccountService::Dsaccount => "dsaccount.sign_out",
+        };
+        self.service(method);
+    }
+
+    /// 2s 定时器:登录流程轮询 + 过期收口。
+    pub fn poll_sign_in(&mut self) {
+        let Some(flow) = &self.sign_in else { return };
+        if now_ms() > flow.expires_at_ms {
+            self.sign_in = None;
+            self.account_line = Some("登录流程已过期，请重试".into());
+            return;
+        }
+        let request = flow.poll_request();
+        let _ = self.requests.unbounded_send(request);
+    }
+
+    /// 服务面结果路由:按 method 反序列化进 SDK service_types,桥侧零转换;
+    /// 解析失败显式报错,契约问题必须可见。
+    fn handle_service_result(
+        &mut self,
+        method: &str,
+        result: Result<serde_json::Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        use qaqh_client::service_types as st;
+        let Ok(value) = result else {
+            self.account_line = Some(result.unwrap_err());
+            return;
+        };
+        match method {
+            "siwc.status" => match decode(method, value) {
+                Ok(status) => self.siwc = Some(status),
+                Err(error) => self.account_line = Some(error),
+            },
+            "dsaccount.status" => {
+                match decode(method, value) {
+                    Ok(status) => self.dsaccount = Some(status),
+                    Err(error) => self.account_line = Some(error),
+                }
+                if self.dsaccount.as_ref().is_some_and(|status| status.signed_in)
+                    && self.ds_balance.is_none()
+                {
+                    self.service("dsaccount.balance");
+                }
+            }
+            "dsaccount.balance" => match decode(method, value) {
+                Ok(balance) => self.ds_balance = Some(balance),
+                Err(error) => self.account_line = Some(error),
+            },
+            "siwc.sign_in.start" => match decode::<st::SiwcSignInStart>(method, value) {
+                Ok(start) => {
+                    self.sign_in = Some(AccountSignIn {
+                        service: AccountService::Siwc,
+                        flow_id: start.flow_id,
+                        expires_at_ms: start.expires_at_ms,
+                    });
+                    cx.open_url(&start.authorize_url);
+                    self.account_line = Some("已在系统浏览器打开授权页，请在浏览器完成登录".into());
+                }
+                Err(error) => self.account_line = Some(error),
+            },
+            "siwc.sign_in.status" => match decode::<st::SiwcSignInStatus>(method, value) {
+                Ok(status) => match status.state {
+                    st::SiwcFlowState::Completed => {
+                        self.sign_in = None;
+                        self.service("siwc.status");
+                        self.account_line = Some("ChatGPT 套餐已登录".into());
+                    }
+                    st::SiwcFlowState::Failed => {
+                        self.sign_in = None;
+                        self.account_line = Some(match status.error {
+                            Some(error) => format!("登录失败:{}", error.message),
+                            None => "登录失败".into(),
+                        });
+                    }
+                    st::SiwcFlowState::Pending => {}
+                },
+                Err(error) => self.account_line = Some(error),
+            },
+            "siwc.sign_in.cancel" => {
+                self.sign_in = None;
+                self.service("siwc.status");
+            }
+            "siwc.sign_out" => match decode::<st::SiwcSignOutResult>(method, value) {
+                Ok(out) => {
+                    self.account_line = Some(if out.revoked {
+                        "已登出并撤销远端授权".into()
+                    } else {
+                        "已登出；远端撤销未成功，可稍后在 ChatGPT 设置中断开".into()
+                    });
+                    self.service("siwc.status");
+                }
+                Err(error) => self.account_line = Some(error),
+            },
+            "dsaccount.sign_in.start" => {
+                match decode::<st::DsAccountSignInStart>(method, value) {
+                    Ok(start) => {
+                        self.sign_in = Some(AccountSignIn {
+                            service: AccountService::Dsaccount,
+                            flow_id: start.attempt_id,
+                            expires_at_ms: now_ms() + start.expires_in.saturating_mul(1000),
+                        });
+                        cx.open_url(&start.authorize_url);
+                        self.account_line =
+                            Some("已在系统浏览器打开授权页，请在浏览器完成登录".into());
+                    }
+                    Err(error) => self.account_line = Some(error),
+                }
+            }
+            "dsaccount.sign_in.status" => {
+                match decode::<st::DsAccountSignInStatus>(method, value) {
+                    Ok(status) => match status.state {
+                        st::DsFlowState::SignedIn => {
+                            self.sign_in = None;
+                            self.ds_balance = None;
+                            self.service("dsaccount.status");
+                            self.account_line = Some("DeepSeek 账号已登录".into());
+                        }
+                        st::DsFlowState::Failed | st::DsFlowState::Cancelled => {
+                            self.sign_in = None;
+                            self.account_line = Some(match status.error {
+                                Some(error) => format!("登录未完成:{error}"),
+                                None => "登录未完成".into(),
+                            });
+                        }
+                        _ => {}
+                    },
+                    Err(error) => self.account_line = Some(error),
+                }
+            }
+            "dsaccount.sign_in.cancel" => {
+                self.sign_in = None;
+                self.service("dsaccount.status");
+            }
+            "dsaccount.sign_out" => {
+                self.dsaccount = None;
+                self.ds_balance = None;
+                self.service("dsaccount.status");
+                self.account_line = Some("已登出 DeepSeek 账号".into());
+            }
+            _ => {}
         }
     }
 
@@ -1010,7 +1319,7 @@ impl DaemonStore {
         }).is_ok();
     }
 
-    pub fn select(&mut self, seed: String, cx: &mut Context<Self>) {
+    pub fn select(&mut self, seed: String, window: &mut Window, cx: &mut Context<Self>) {
         self.persist(cx);
         self.workbench.recent_session = Some(seed.clone());
         // 已访问过的会话直接复用 store(状态/流保持);新会话才 attach。
@@ -1032,7 +1341,7 @@ impl DaemonStore {
             None => {
                 let requests = self.requests.clone();
                 let draft = self.workbench.drafts.get(&seed).cloned().unwrap_or_default();
-                let store = cx.new(|cx| SessionStore::new(seed.clone(), requests, draft, cx));
+                let store = cx.new(|cx| SessionStore::new(seed.clone(), requests, draft, window, cx));
                 store.update(cx, |store, _| {
                     store.catalog = self.providers.clone();
                     store.client_session_id = match &self.connection {
@@ -1058,7 +1367,7 @@ impl DaemonStore {
     pub fn persist(&mut self, cx: &gpui::App) {
         for store in &self.stores {
             let store = store.read(cx);
-            self.workbench.drafts.insert(store.session_id.clone(), store.draft());
+            self.workbench.drafts.insert(store.session_id.clone(), store.draft(cx));
         }
         self.workbench.collapsed = self.collapsed.iter().cloned().collect();
         if let Err(error) = crate::workbench::save(&self.workbench) {

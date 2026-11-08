@@ -86,6 +86,12 @@ pub enum BridgeMsg {
     Providers(ProfilesDocument),
     /// 取消看门狗到点:该会话仍未回终态(electron CANCEL_WATCHDOG 模式)。
     Watchdog(String),
+    /// 服务面结果(siwc/dsaccount 账号管理器):method 原样带回,
+    /// UI 按 SDK service_types 反序列化,桥侧零转换。
+    ServiceResult {
+        method: String,
+        result: Result<serde_json::Value, String>,
+    },
     SessionSettings {
         seed: String,
         settings: Option<SessionListEntry>,
@@ -180,6 +186,12 @@ pub enum BridgeRequest {
     DeleteSession { seed: String },
     /// 取消看门狗:after_ms 后仍无终态则通知 UI 本地收口。
     Watchdog { seed: String, after_ms: u64 },
+    /// 服务面透传(siwc/dsaccount);method 须在 SDK SERVICE_METHODS 白名单,
+    /// 越界由 SDK 客户端先拒。
+    Service {
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 /// `--probe`:无 GUI 连通性验证,打印与窗口相同的状态行。
@@ -305,6 +317,9 @@ async fn serve(
                             let _ = to_ui.unbounded_send(BridgeMsg::SessionSettings { seed, settings: None, write_completed: true });
                         }
                         BridgeRequest::CreateSession { .. } => { let _ = to_ui.unbounded_send(BridgeMsg::CreateFailed); }
+                        BridgeRequest::Service { method, .. } => {
+                            let _ = to_ui.unbounded_send(BridgeMsg::ServiceResult { method, result: Err("连接尚未恢复".into()) });
+                        }
                         _ => send_line(&to_ui, "连接尚未恢复，请连接成功后重试操作"),
                     }
                 }
@@ -725,6 +740,10 @@ async fn handle_request(
                 tokio::time::sleep(Duration::from_millis(after_ms)).await;
                 let _ = tx.unbounded_send(BridgeMsg::Watchdog(seed));
             });
+        }
+        BridgeRequest::Service { method, params } => {
+            let result = client.service_call(&method, params).await.map_err(|error| error.to_string());
+            let _ = to_ui.unbounded_send(BridgeMsg::ServiceResult { method, result });
         }
     }
 }

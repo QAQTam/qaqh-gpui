@@ -4,6 +4,7 @@
 //! 残余重叠,按 id 幂等吸收;resync 只丢暂态(streaming/arg_stream/尾窗),
 //! 已提交状态由快照重灌。
 
+use gpui::Context;
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::events::SessionEventFrame;
 use qaqh_ringing_contract::fact::ToolCallId;
@@ -46,12 +47,12 @@ pub fn clear_transient(store: &mut SessionStore) {
     store.md_cache.clear();
 }
 
-pub fn apply_frame(store: &mut SessionStore, frame: SessionEventFrame) {
+pub fn apply_frame(store: &mut SessionStore, frame: SessionEventFrame, cx: &mut Context<SessionStore>) {
     if frame.seq < store.seq {
         return;
     }
     store.seq = frame.seq + 1;
-    apply_event(store, frame.event);
+    apply_event(store, frame.event, cx);
     for (_, text) in &mut store.output_tail { trim_tail(text, store.output_budget); }
     for (_, _, text) in &mut store.exec_output_tail { trim_tail(text, store.output_budget); }
 }
@@ -63,7 +64,7 @@ fn trim_tail(text: &mut String, budget: usize) {
     text.drain(..start);
 }
 
-fn apply_event(store: &mut SessionStore, event: SessionEvent) {
+fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<SessionStore>) {
     match event {
         SessionEvent::ActivityChanged {
             activity,
@@ -272,7 +273,8 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent) {
             }
         }
         SessionEvent::SessionMetaChanged { title } => {
-            if store.renaming.as_ref().is_some_and(|draft| Some(draft.text.trim()) == title.as_deref()) { store.renaming = None; }
+            // 重命名草稿与权威标题一致才收口;草稿值经实体读取。
+            if store.renaming.as_ref().is_some_and(|draft| Some(draft.read(cx).value().trim()) == title.as_deref()) { store.renaming = None; }
             store.title = title;
         }
         SessionEvent::DriverChanged { driver } => {

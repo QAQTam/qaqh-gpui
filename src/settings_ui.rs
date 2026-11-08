@@ -1,5 +1,8 @@
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, FocusHandle, KeyDownEvent, Window, div, px};
+use gpui::{AnyElement, App, Context, Div, Entity, SharedString, Window, div, px};
+use gpui_component::input::{Input, InputState};
+use gpui_component::switch::Switch;
+use gpui_component::Sizable;
 use qaqh_client::{
     ProviderUpsertDto, RingingCommand, SecretWrite, SessionSettingsPatch, ToolsSettingPatch,
 };
@@ -9,11 +12,8 @@ use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
 use crate::bridge::BridgeRequest;
 use crate::store::{DaemonStore, SettingsEditor};
-use crate::text_input::{InputElement, TextField};
 use crate::theme::Palette;
-use crate::ui::{
-    action_button, basic_field_key, field_box, section_header, segmented_button, setting_row,
-};
+use crate::ui::{action_button, section_header, segmented_button, setting_row};
 
 type Submit = dyn Fn(&[Field], &mut DaemonStore, &mut Context<DaemonStore>) -> Result<(), String>;
 
@@ -27,26 +27,15 @@ struct Field {
     /// 具名 key:submit 闭包按 key 取字段,避免与构造顺序强耦合的魔法下标。
     key: &'static str,
     label: &'static str,
-    input: TextField,
-    focus: FocusHandle,
-    secret: bool,
-    choices: Vec<String>,
+    control: FieldControl,
 }
 
-impl Form {
-    pub fn focused_field(&self, window: &Window) -> Option<&TextField> {
-        self.fields
-            .iter()
-            .find(|field| field.focus.is_focused(window))
-            .map(|field| &field.input)
-    }
-
-    pub fn focused_field_mut(&mut self, window: &Window) -> Option<&mut TextField> {
-        self.fields
-            .iter_mut()
-            .find(|field| field.focus.is_focused(window))
-            .map(|field| &mut field.input)
-    }
+/// 表单控件:自由文本走组件库 Input(密钥用 masked),布尔走 Switch,
+/// 少量互斥固定值走分段按钮(Select 的 delegate 模型对三四个固定选项过重)。
+enum FieldControl {
+    Input(Entity<InputState>),
+    Switch(bool),
+    Choice { value: String, choices: Vec<String> },
 }
 
 impl Field {
@@ -54,22 +43,38 @@ impl Field {
         key: &'static str,
         label: &'static str,
         value: impl ToString,
+        window: &mut Window,
+        cx: &mut Context<DaemonStore>,
+    ) -> Self {
+        let initial = value.to_string();
+        let state = cx.new(|cx| InputState::new(window, cx));
+        state.update(cx, |state, cx| state.set_value(initial.as_str(), window, cx));
+        Self {
+            key,
+            label,
+            control: FieldControl::Input(state),
+        }
+    }
+
+    fn secret(
+        key: &'static str,
+        label: &'static str,
+        window: &mut Window,
         cx: &mut Context<DaemonStore>,
     ) -> Self {
         Self {
             key,
             label,
-            input: TextField::with_text(&value.to_string()),
-            focus: cx.focus_handle(),
-            secret: false,
-            choices: Vec::new(),
+            control: FieldControl::Input(cx.new(|cx| InputState::new(window, cx).masked(true))),
         }
     }
 
-    fn secret(key: &'static str, label: &'static str, cx: &mut Context<DaemonStore>) -> Self {
+    /// 布尔字段:渲染为 Switch;submit 侧仍按「是/否」取值(Field::value 映射)。
+    fn switch(key: &'static str, label: &'static str, value: bool) -> Self {
         Self {
-            secret: true,
-            ..Self::text(key, label, "", cx)
+            key,
+            label,
+            control: FieldControl::Switch(value),
         }
     }
 
@@ -78,11 +83,14 @@ impl Field {
         label: &'static str,
         value: &str,
         choices: impl IntoIterator<Item = impl Into<String>>,
-        cx: &mut Context<DaemonStore>,
     ) -> Self {
         Self {
-            choices: choices.into_iter().map(Into::into).collect(),
-            ..Self::text(key, label, value, cx)
+            key,
+            label,
+            control: FieldControl::Choice {
+                value: value.to_owned(),
+                choices: choices.into_iter().map(Into::into).collect(),
+            },
         }
     }
 
@@ -94,21 +102,26 @@ impl Field {
             .ok_or_else(|| format!("内部错误：表单缺少字段 {key}"))
     }
 
-    fn value(&self) -> &str {
-        self.input.text.trim()
+    fn value(&self, cx: &App) -> String {
+        match &self.control {
+            FieldControl::Input(state) => state.read(cx).value().trim().to_string(),
+            FieldControl::Switch(checked) => if *checked { "是" } else { "否" }.to_owned(),
+            FieldControl::Choice { value, .. } => value.trim().to_owned(),
+        }
     }
 
-    fn number<T: std::str::FromStr>(&self) -> Result<T, String> {
-        self.value()
+    fn number<T: std::str::FromStr>(&self, cx: &App) -> Result<T, String> {
+        self.value(cx)
             .parse()
             .map_err(|_| format!("{}的数字格式无效", self.label))
     }
 
-    fn required(&self) -> Result<String, String> {
-        if self.value().is_empty() {
+    fn required(&self, cx: &App) -> Result<String, String> {
+        let value = self.value(cx);
+        if value.is_empty() {
             return Err(format!("请填写{}", self.label));
         }
-        Ok(self.value().to_owned())
+        Ok(value)
     }
 }
 
@@ -131,14 +144,14 @@ fn button(
     t: &Palette,
     id: impl Into<String>,
     label: &'static str,
-    run: impl Fn(&mut DaemonStore, &mut Context<DaemonStore>) + 'static,
+    run: impl Fn(&mut DaemonStore, &mut Window, &mut Context<DaemonStore>) + 'static,
 ) -> AnyElement {
-    action_button(
+    action_button(cx, 
         id.into(),
         label,
         t.accent,
-        cx.listener(move |daemon, _, _, cx| {
-            run(daemon, cx);
+        cx.listener(move |daemon, _, window: &mut Window, cx| {
+            run(daemon, window, cx);
             cx.notify();
         }),
         t,
@@ -169,10 +182,10 @@ fn catalog_command(
 fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
     let mut body = div().flex().flex_col().gap_3().p_3()
         .child("工作区目录位于 daemon 所在机器。移除工作区只移除分组。")
-        .child(button(cx, t, "create-workspace", "添加工作区", |daemon, cx| {
-            begin(daemon, "添加工作区", vec![Field::text("path", "daemon 侧绝对目录", "", cx)], |fields, daemon, _| {
+        .child(button(cx, t, "create-workspace", "添加工作区", |daemon, window, cx| {
+            begin(daemon, "添加工作区", vec![Field::text("path", "daemon 侧绝对目录", "", window, cx)], |fields, daemon, cx| {
                 send(daemon, BridgeRequest::Command { target: qaqh_client::CommandTarget::Global,
-                    command: RingingCommand::WorkspaceCreate { path: fields[0].required()? } })
+                    command: RingingCommand::WorkspaceCreate { path: fields[0].required(cx)? } })
             });
         }));
     for workspace in &daemon.workspaces {
@@ -182,19 +195,231 @@ fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) 
         body = body.child(div().flex().flex_col().gap_2().p_2().border_1().border_color(t.border)
             .child(format!("{} · {}{}", title, workspace.path, if workspace.missing_dir { " · 目录不存在" } else { "" }))
             .child(div().flex().gap_2()
-                .child(button(cx, t, format!("rename-workspace-{id}"), "重命名", move |daemon, cx| {
+                .child(button(cx, t, format!("rename-workspace-{id}"), "重命名", move |daemon, window, cx| {
                     let id = rename_id.clone();
-                    begin(daemon, "重命名工作区", vec![Field::text("title", "名称", &title, cx)], move |fields, daemon, _| {
+                    begin(daemon, "重命名工作区", vec![Field::text("title", "名称", &title, window, cx)], move |fields, daemon, cx| {
                         send(daemon, BridgeRequest::Command { target: qaqh_client::CommandTarget::Workspace { workspace_id: id.clone() },
-                            command: RingingCommand::WorkspaceRename { title: fields[0].required()? } })
+                            command: RingingCommand::WorkspaceRename { title: fields[0].required(cx)? } })
                     });
                 }))
-                .child(button(cx, t, format!("remove-workspace-{id}"), "移除分组", move |daemon, _| {
+                .child(button(cx, t, format!("remove-workspace-{id}"), "移除分组", move |daemon, _, _| {
                     let result = send(daemon, BridgeRequest::Command { target: qaqh_client::CommandTarget::Workspace { workspace_id: id.clone() }, command: RingingCommand::WorkspaceDelete {} });
                     report(daemon, result);
                 }))));
     }
     body
+}
+
+/// 账号页:siwc(ChatGPT 套餐)与 dsaccount(DeepSeek 账号)两卡;
+/// 全部经 service_call 白名单方法透传,零自建协议。
+fn accounts(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_3()
+        .child(
+            div()
+                .text_xs()
+                .text_color(t.dim)
+                .child("登录走系统浏览器，凭据保存在本机账号管理器，不进入 daemon 配置。"),
+        )
+        .child(siwc_card(daemon, cx, t))
+        .child(dsaccount_card(daemon, cx, t));
+    if let Some(line) = &daemon.account_line {
+        body = body.child(div().text_xs().text_color(t.warn).child(line.clone()));
+    }
+    body
+}
+
+fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
+    use qaqh_client::service_types as st;
+    let card = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(t.border);
+    let Some(status) = &daemon.siwc else {
+        return card.child(div().text_xs().text_color(t.dim).child("ChatGPT 套餐：读取中…"));
+    };
+    let (state, color) = match status.status {
+        st::SiwcConnectionState::Connected if status.sharing => ("已登录，套餐直连可用", t.ok),
+        st::SiwcConnectionState::Connected => ("已登录，未授予套餐直连", t.warn),
+        st::SiwcConnectionState::Connecting => ("登录流程进行中", t.warn),
+        st::SiwcConnectionState::ReauthRequired => ("凭据已失效，需要重新登录", t.bad),
+        st::SiwcConnectionState::Disconnected => ("未登录", t.dim),
+    };
+    let who = status
+        .email
+        .as_deref()
+        .or(status.name.as_deref())
+        .unwrap_or_default();
+    let mut card = card
+        .child(div().text_sm().child("ChatGPT 套餐（SIWC）"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(color)
+                .child(SharedString::from(if who.is_empty() {
+                    state.to_string()
+                } else {
+                    format!("{state} · {who}")
+                })),
+        );
+    let signing = daemon
+        .sign_in
+        .as_ref()
+        .is_some_and(|flow| flow.service == crate::store::AccountService::Siwc);
+    if signing {
+        card = card.child(button(cx, t, "siwc-signin-cancel", "取消登录", move |daemon, _, _| {
+            daemon.sign_in_cancel();
+        }));
+    } else {
+        match status.status {
+            st::SiwcConnectionState::Connected | st::SiwcConnectionState::ReauthRequired => {
+                card = card
+                    .child(button(cx, t, "siwc-usage", "打开用量页", |daemon, _, cx| {
+                        if let Some(status) = &daemon.siwc {
+                            cx.open_url(&status.usage_url);
+                        }
+                    }))
+                    .child(button(cx, t, "siwc-signout", "登出", move |daemon, _, _| {
+                        daemon.sign_out(crate::store::AccountService::Siwc);
+                    }));
+                if status.status == st::SiwcConnectionState::ReauthRequired {
+                    card = card.child(button(cx, t, "siwc-signin", "重新登录", move |daemon, _, _| {
+                        daemon.sign_in_start(crate::store::AccountService::Siwc);
+                    }));
+                }
+            }
+            _ => {
+                card = card.child(button(cx, t, "siwc-signin", "登录 ChatGPT 套餐", move |daemon, _, _| {
+                    daemon.sign_in_start(crate::store::AccountService::Siwc);
+                }));
+            }
+        }
+    }
+    card
+}
+
+fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
+    let card = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(t.border);
+    let Some(status) = &daemon.dsaccount else {
+        return card.child(div().text_xs().text_color(t.dim).child("DeepSeek 账号：读取中…"));
+    };
+    let (state, color) = if status.signed_in {
+        ("已登录", t.ok)
+    } else if status.flow.state.is_running() {
+        ("登录流程进行中", t.warn)
+    } else {
+        ("未登录", t.dim)
+    };
+    let who = status
+        .account
+        .as_ref()
+        .map(|account| account.label.as_str())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_default();
+    let mut card = card
+        .child(div().text_sm().child("DeepSeek 账号"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(color)
+                .child(SharedString::from(if who.is_empty() {
+                    state.to_string()
+                } else {
+                    format!("{state} · {who}")
+                })),
+        );
+    if let Some(error) = &status.storage_error {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(t.bad)
+                .child(SharedString::from(format!("本地凭据读取失败:{error}"))),
+        );
+    }
+    let signing = daemon
+        .sign_in
+        .as_ref()
+        .is_some_and(|flow| flow.service == crate::store::AccountService::Dsaccount);
+    if signing {
+        card = card.child(button(cx, t, "ds-signin-cancel", "取消登录", move |daemon, _, _| {
+            daemon.sign_in_cancel();
+        }));
+    } else if status.signed_in {
+        card = card
+            .child(button(cx, t, "ds-topup", "充值", |daemon, _, cx| {
+                if let Some(status) = &daemon.dsaccount {
+                    cx.open_url(&status.top_up_url);
+                }
+            }))
+            .child(button(cx, t, "ds-signout", "登出", move |daemon, _, _| {
+                daemon.sign_out(crate::store::AccountService::Dsaccount);
+            }));
+    } else {
+        card = card.child(button(cx, t, "ds-signin", "登录 DeepSeek 账号", move |daemon, _, _| {
+            daemon.sign_in_start(crate::store::AccountService::Dsaccount);
+        }));
+    }
+    if let Some(balance) = &daemon.ds_balance {
+        for wallet in &balance.recharge {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child(SharedString::from(format!(
+                        "充值 {} {}",
+                        wallet.balance, wallet.currency
+                    ))),
+            );
+        }
+        for wallet in &balance.bonus {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(t.warn)
+                    .child(SharedString::from(format!(
+                        "赠金 {} {}",
+                        wallet.balance, wallet.currency
+                    ))),
+            );
+        }
+        for cost in &balance.total_cost {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child(SharedString::from(format!(
+                        "累计消费 {} {}",
+                        cost.amount, cost.currency
+                    ))),
+            );
+        }
+        if !balance.has_usable_balance {
+            card = card.child(div().text_xs().text_color(t.bad).child("没有可用余额"));
+        }
+    }
+    card
+}
+
+fn credential_label(credential: qaqh_types::CredentialSource) -> &'static str {
+    match credential {
+        qaqh_types::CredentialSource::ApiKey => "API 密钥",
+        qaqh_types::CredentialSource::ChatgptPlan => "ChatGPT 套餐",
+        qaqh_types::CredentialSource::DeepseekAccount => "DeepSeek 账号",
+    }
 }
 
 fn report(daemon: &mut DaemonStore, result: Result<(), String>) {
@@ -208,6 +433,7 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
         (SettingsEditor::Local, "本机偏好", "local"),
         (SettingsEditor::Config, "全局策略", "global"),
         (SettingsEditor::Catalog, "服务商与模型", "catalog"),
+        (SettingsEditor::Accounts, "账号", "accounts"),
         (SettingsEditor::Session, "当前会话", "session"),
         (SettingsEditor::Workspaces, "工作区", "workspaces"),
     ]
@@ -222,6 +448,10 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
                 if daemon.settings_editor != mode {
                     daemon.settings_form = None;
                     daemon.settings_editor = mode;
+                    // 账号页每次进入都重拉状态(管理器状态可在窗口外变化)。
+                    if mode == SettingsEditor::Accounts {
+                        daemon.refresh_accounts();
+                    }
                 }
                 cx.notify();
             }),
@@ -241,17 +471,17 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
 
 pub fn render(
     daemon: &DaemonStore,
-    window: &Window,
     cx: &mut Context<DaemonStore>,
     t: &Palette,
 ) -> Div {
     if let Some(form) = &daemon.settings_form {
-        return render_form(form, window, cx, t);
+        return render_form(form, cx, t);
     }
     match daemon.settings_editor {
         SettingsEditor::Local => div(),
         SettingsEditor::Config => global(daemon, cx, t),
         SettingsEditor::Catalog => catalog(daemon, cx, t),
+        SettingsEditor::Accounts => accounts(daemon, cx, t),
         SettingsEditor::Session => session(daemon, cx, t),
         SettingsEditor::Workspaces => workspaces(daemon, cx, t),
     }
@@ -259,7 +489,6 @@ pub fn render(
 
 pub(crate) fn render_form(
     form: &Form,
-    window: &Window,
     cx: &mut Context<DaemonStore>,
     t: &Palette,
 ) -> Div {
@@ -273,57 +502,55 @@ pub(crate) fn render_form(
         .border_color(t.border)
         .child(div().text_sm().child(form.title.clone()));
     for (index, field) in form.fields.iter().enumerate() {
-        let focused = field.focus.is_focused(window);
-        let control = if field.choices.is_empty() {
-            let content = if field.secret {
-                div().child("•".repeat(field.input.text.chars().count()))
-            } else {
-                div().child(field.input.display(focused, window))
-            };
-            let input = field_box(
-                format!("settings-field-{index}"),
-                &field.focus,
-                if focused { t.accent } else { t.border },
-                cx.listener(move |daemon: &mut DaemonStore, _, window, cx| {
-                    if let Some(form) = &daemon.settings_form {
-                        window.focus(&form.fields[index].focus, cx);
-                    }
-                }),
-                cx.listener(
-                    move |daemon: &mut DaemonStore, event: &KeyDownEvent, _, cx| {
-                        if let Some(form) = &mut daemon.settings_form {
-                            basic_field_key(&mut form.fields[index].input, event, cx);
-                        }
-                    },
-                ),
-            )
-            .w(px(300.))
-            .child(content);
-            InputElement::new(cx.entity(), field.focus.clone(), input).into_any_element()
-        } else {
-            let choices = field.choices.iter().map(|choice| {
-                segmented_button(
-                    format!("settings-choice-{index}-{choice}"),
-                    choice.clone(),
-                    field.value() == choice,
-                    t,
-                    {
-                        let choice = choice.clone();
-                        cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
-                            if let Some(form) = &mut daemon.settings_form {
-                                form.fields[index].input = TextField::with_text(&choice);
-                                cx.notify();
+        let control = match &field.control {
+            FieldControl::Input(state) => {
+                div().w(px(300.)).child(Input::new(state).small()).into_any_element()
+            }
+            FieldControl::Switch(checked) => {
+                // Switch 是受控组件:回写进表单字段,submit 仍按「是/否」读值。
+                let entity = cx.entity();
+                Switch::new(SharedString::from(format!("settings-switch-{index}")))
+                    .checked(*checked)
+                    .on_change(move |checked: &bool, _, cx: &mut gpui::App| {
+                        entity.update(cx, |daemon, cx| {
+                            if let Some(form) = &mut daemon.settings_form
+                                && let FieldControl::Switch(current) = &mut form.fields[index].control
+                            {
+                                *current = *checked;
                             }
-                        })
-                    },
-                )
-            });
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_1()
-                .children(choices)
-                .into_any_element()
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
+            }
+            FieldControl::Choice { value, choices } => {
+                let choices = choices.iter().map(|choice| {
+                    segmented_button(
+                        format!("settings-choice-{index}-{choice}"),
+                        choice.clone(),
+                        value.as_str() == choice.as_str(),
+                        t,
+                        {
+                            let choice = choice.clone();
+                            cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
+                                if let Some(form) = &mut daemon.settings_form
+                                    && let FieldControl::Choice { value, .. } =
+                                        &mut form.fields[index].control
+                                {
+                                    *value = choice.clone();
+                                }
+                                cx.notify();
+                            })
+                        },
+                    )
+                });
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(choices)
+                    .into_any_element()
+            }
         };
         body = body.child(setting_row(field.label, "", control, t));
     }
@@ -332,7 +559,7 @@ pub(crate) fn render_form(
             .flex()
             .justify_end()
             .gap_2()
-            .child(button(cx, t, "settings-cancel", "取消", |daemon, _| {
+            .child(button(cx, t, "settings-cancel", "取消", move |daemon, _, _| {
                 daemon.settings_form = None
             }))
             .child(button(
@@ -344,7 +571,7 @@ pub(crate) fn render_form(
                 } else {
                     "保存"
                 },
-                |daemon, cx| {
+                |daemon, _, cx| {
                     if let Some(form) = daemon.settings_form.take()
                         && let Err(error) = (form.submit)(&form.fields, daemon, cx)
                     {
@@ -361,16 +588,16 @@ fn edit_config(
     t: &Palette,
     label: &'static str,
     value: impl ToString,
-    patch: impl Fn(&Field) -> Result<ConfigPatch, String> + Clone + 'static,
+    patch: impl Fn(&Field, &App) -> Result<ConfigPatch, String> + Clone + 'static,
 ) -> Div {
     let value = value.to_string();
     let control = button(cx, t, format!("config-{label}"), "编辑", {
         let value = value.clone();
-        move |daemon, cx| {
-            let field = Field::text("value", label, &value, cx);
+        move |daemon, window, cx| {
+            let field = Field::text("value", label, &value, window, cx);
             let patch = patch.clone();
-            begin(daemon, label, vec![field], move |fields, daemon, _| {
-                save(daemon, patch(&fields[0])?)
+            begin(daemon, label, vec![field], move |fields, daemon, cx| {
+                save(daemon, patch(&fields[0], cx)?)
             });
         }
     });
@@ -422,9 +649,9 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
     };
     macro_rules! number {
         ($label:literal, $field:ident) => {
-            edit_config(cx, t, $label, config.$field, |field| {
+            edit_config(cx, t, $label, config.$field, |field, cx| {
                 Ok(ConfigPatch {
-                    $field: Some(field.number()?),
+                    $field: Some(field.number(cx)?),
                     ..Default::default()
                 })
             })
@@ -472,9 +699,9 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             t,
             "允许的工具（逗号分隔）",
             config.tool_allowlist.join(", "),
-            |field| {
+            |field, cx| {
                 Ok(ConfigPatch {
-                    tool_allowlist: Some(list(field.value())),
+                    tool_allowlist: Some(list(&field.value(cx))),
                     ..Default::default()
                 })
             },
@@ -489,10 +716,10 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             t,
             "默认 Shell",
             config.exec.default_shell.as_deref().unwrap_or("auto"),
-            |field| {
+            |field, cx| {
                 Ok(ConfigPatch {
                     exec: Some(ExecPatch {
-                        default_shell: Some(field.value().to_owned()),
+                        default_shell: Some(field.value(cx)),
                     }),
                     ..Default::default()
                 })
@@ -503,9 +730,9 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             t,
             "Tokenizer 路径（重启后生效）",
             config.tokenizer_path.as_deref().unwrap_or_default(),
-            |field| {
+            |field, cx| {
                 Ok(ConfigPatch {
-                    tokenizer_path: Some(field.value().to_owned()),
+                    tokenizer_path: Some(field.value(cx)),
                     ..Default::default()
                 })
             },
@@ -513,10 +740,10 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
         .child(section_header("子代理", t));
     macro_rules! subagent {
         ($label:literal, $field:ident, $read:expr, $convert:expr) => {
-            edit_config(cx, t, $label, $read, |field| {
+            edit_config(cx, t, $label, $read, |field, cx| {
                 Ok(ConfigPatch {
                     subagent: Some(SubagentPatch {
-                        $field: Some(($convert)(field)?),
+                        $field: Some(($convert)(field, cx)?),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -529,13 +756,13 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             "默认模型",
             model,
             &config.subagent.model,
-            |f: &Field| Ok::<_, String>(f.value().to_owned())
+            |f: &Field, cx| Ok::<_, String>(f.value(cx))
         ))
         .child(subagent!(
             "端点 URL",
             base_url,
             &config.subagent.base_url,
-            |f: &Field| Ok::<_, String>(f.value().to_owned())
+            |f: &Field, cx| Ok::<_, String>(f.value(cx))
         ))
         .child(subagent!(
             "输出 Token 上限",
@@ -571,7 +798,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             "默认工具（逗号分隔）",
             default_tools,
             config.subagent.default_tools.join(", "),
-            |f: &Field| Ok::<_, String>(list(f.value()))
+            |f: &Field, cx| Ok::<_, String>(list(&f.value(cx)))
         ))
         .child(setting_row(
             "子代理 API 密钥",
@@ -580,18 +807,18 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             } else {
                 "未配置"
             },
-            button(cx, t, "subagent-key", "更换", |daemon, cx| {
-                let fields = vec![Field::secret("api_key", "新 API 密钥", cx)];
+            button(cx, t, "subagent-key", "更换", |daemon, window, cx| {
+                let fields = vec![Field::secret("api_key", "新 API 密钥", window, cx)];
                 begin(
                     daemon,
                     "更换子代理 API 密钥",
                     fields,
-                    |fields, daemon, _| {
+                    |fields, daemon, cx| {
                         save(
                             daemon,
                             ConfigPatch {
                                 subagent: Some(SubagentPatch {
-                                    api_key: Some(fields[0].required()?),
+                                    api_key: Some(fields[0].required(cx)?),
                                     ..Default::default()
                                 }),
                                 ..Default::default()
@@ -638,6 +865,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
 
 fn provider_form(
     daemon: &mut DaemonStore,
+    window: &mut Window,
     cx: &mut Context<DaemonStore>,
     revision: u64,
     existing: Option<(String, ProviderDef)>,
@@ -646,29 +874,28 @@ fn provider_form(
     let wire = provider
         .map(|provider| provider.wire.as_str())
         .unwrap_or("chat");
-    let credential = match provider
-        .map(|provider| provider.credential)
-        .unwrap_or_default()
-    {
-        CredentialSource::ApiKey => "API 密钥",
-        CredentialSource::ChatgptPlan => "ChatGPT 套餐",
-        CredentialSource::DeepseekAccount => "DeepSeek 账号",
-    };
+    let credential = credential_label(
+        provider
+            .map(|provider| provider.credential)
+            .unwrap_or_default(),
+    );
     let mut fields = Vec::new();
     if existing.is_none() {
-        fields.push(Field::text("provider_id", "服务商 ID", "", cx));
+        fields.push(Field::text("provider_id", "服务商 ID", "", window, cx));
     }
     fields.extend([
         Field::text(
             "name",
             "显示名称",
             provider.map(|p| p.name.as_str()).unwrap_or_default(),
+            window,
             cx,
         ),
         Field::text(
             "base_url",
             "端点 URL",
             provider.map(|p| p.base_url.as_str()).unwrap_or_default(),
+            window,
             cx,
         ),
         Field::choice(
@@ -676,31 +903,29 @@ fn provider_form(
             "接口协议",
             wire,
             ["chat", "responses", "messages", "gemini"],
-            cx,
         ),
         Field::choice(
             "credential",
             "凭据来源",
             credential,
             ["API 密钥", "ChatGPT 套餐", "DeepSeek 账号"],
-            cx,
         ),
-        Field::secret("api_key", "新 API 密钥（留空保留）", cx),
-        Field::choice("clear_key", "清除已存密钥", "否", ["否", "是"], cx),
+        Field::secret("api_key", "新 API 密钥（留空保留）", window, cx),
+        Field::switch("clear_key", "清除已存密钥", false),
     ]);
     let title = existing
         .as_ref()
         .map(|(id, _)| format!("编辑服务商 · {id}"))
         .unwrap_or_else(|| "添加服务商".into());
-    begin(daemon, title, fields, move |fields, daemon, _| {
+    begin(daemon, title, fields, move |fields, daemon, cx| {
         let id = match &existing {
             Some((id, _)) => id.clone(),
-            None => Field::find(fields, "provider_id")?.required()?,
+            None => Field::find(fields, "provider_id")?.required(cx)?,
         };
         let provider = existing.as_ref().map(|(_, p)| p);
         let api_key = match (
-            Field::find(fields, "api_key")?.value(),
-            Field::find(fields, "clear_key")?.value(),
+            Field::find(fields, "api_key")?.value(cx).as_str(),
+            Field::find(fields, "clear_key")?.value(cx).as_str(),
         ) {
             ("", "是") => SecretWrite::Clear,
             ("", _) => SecretWrite::Keep,
@@ -713,11 +938,11 @@ fn provider_form(
             RingingCommand::ProviderUpsert {
                 id,
                 provider: ProviderUpsertDto {
-                    name: Field::find(fields, "name")?.required()?,
-                    base_url: Field::find(fields, "base_url")?.required()?,
-                    wire: Wire::parse(Field::find(fields, "wire")?.value())
+                    name: Field::find(fields, "name")?.required(cx)?,
+                    base_url: Field::find(fields, "base_url")?.required(cx)?,
+                    wire: Wire::parse(&Field::find(fields, "wire")?.value(cx))
                         .ok_or("请选择接口协议")?,
-                    credential: match Field::find(fields, "credential")?.value() {
+                    credential: match Field::find(fields, "credential")?.value(cx).as_str() {
                         "ChatGPT 套餐" => CredentialSource::ChatgptPlan,
                         "DeepSeek 账号" => CredentialSource::DeepseekAccount,
                         _ => CredentialSource::ApiKey,
@@ -733,6 +958,7 @@ fn provider_form(
 
 fn model_form(
     daemon: &mut DaemonStore,
+    window: &mut Window,
     cx: &mut Context<DaemonStore>,
     revision: u64,
     provider_id: String,
@@ -744,51 +970,28 @@ fn model_form(
         .unwrap_or_default();
     let mut fields = Vec::new();
     if existing.is_none() {
-        fields.push(Field::text("model_id", "模型 ID", "", cx));
+        fields.push(Field::text("model_id", "模型 ID", "", window, cx));
     }
-    let choice = |value| if value { "是" } else { "否" };
     fields.extend([
         Field::text(
             "display_name",
             "显示名称",
             model.display_name.as_deref().unwrap_or_default(),
+            window,
             cx,
         ),
-        Field::text("context_window", "上下文窗口", model.context_window, cx),
-        Field::text("max_output_tokens", "输出 Token 上限", model.max_output_tokens, cx),
-        Field::choice("enabled", "启用", choice(model.enabled), ["是", "否"], cx),
-        Field::choice(
-            "tool_calls",
-            "工具调用",
-            choice(model.capabilities.tool_calls),
-            ["是", "否"],
-            cx,
-        ),
-        Field::choice(
-            "image_input",
-            "图片输入",
-            choice(model.capabilities.image_input),
-            ["是", "否"],
-            cx,
-        ),
-        Field::choice(
-            "native_web_search",
-            "原生网页搜索",
-            choice(model.capabilities.native_web_search),
-            ["是", "否"],
-            cx,
-        ),
-        Field::choice(
-            "reasoning",
-            "推理",
-            choice(model.capabilities.reasoning),
-            ["是", "否"],
-            cx,
-        ),
+        Field::text("context_window", "上下文窗口", model.context_window, window, cx),
+        Field::text("max_output_tokens", "输出 Token 上限", model.max_output_tokens, window, cx),
+        Field::switch("enabled", "启用", model.enabled),
+        Field::switch("tool_calls", "工具调用", model.capabilities.tool_calls),
+        Field::switch("image_input", "图片输入", model.capabilities.image_input),
+        Field::switch("native_web_search", "原生网页搜索", model.capabilities.native_web_search),
+        Field::switch("reasoning", "推理", model.capabilities.reasoning),
         Field::text(
             "reasoning_levels",
             "推理档位（逗号分隔）",
             model.reasoning_levels.join(", "),
+            window,
             cx,
         ),
         Field::text(
@@ -799,6 +1002,7 @@ fn model_form(
                 .reasoning_effort
                 .as_deref()
                 .unwrap_or_default(),
+            window,
             cx,
         ),
         Field::text(
@@ -809,44 +1013,39 @@ fn model_form(
                 .max_output_tokens
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
+            window,
             cx,
         ),
-        Field::choice(
-            "default_native_web_search",
-            "默认启用原生搜索",
-            choice(model.defaults.native_web_search),
-            ["是", "否"],
-            cx,
-        ),
+        Field::switch("default_native_web_search", "默认启用原生搜索", model.defaults.native_web_search),
     ]);
     let title = existing
         .as_ref()
         .map(|(id, _)| format!("编辑模型 · {id}"))
         .unwrap_or_else(|| format!("添加模型 · {provider_id}"));
-    begin(daemon, title, fields, move |fields, daemon, _| {
+    begin(daemon, title, fields, move |fields, daemon, cx| {
         let model_id = match &existing {
             Some((id, _)) => id.clone(),
-            None => Field::find(fields, "model_id")?.required()?,
+            None => Field::find(fields, "model_id")?.required(cx)?,
         };
         let mut model = model.clone();
-        model.display_name = optional(Field::find(fields, "display_name")?.value());
-        model.context_window = Field::find(fields, "context_window")?.number()?;
-        model.max_output_tokens = Field::find(fields, "max_output_tokens")?.number()?;
-        model.enabled = Field::find(fields, "enabled")?.value() == "是";
-        model.capabilities.tool_calls = Field::find(fields, "tool_calls")?.value() == "是";
-        model.capabilities.image_input = Field::find(fields, "image_input")?.value() == "是";
+        model.display_name = optional(&Field::find(fields, "display_name")?.value(cx));
+        model.context_window = Field::find(fields, "context_window")?.number(cx)?;
+        model.max_output_tokens = Field::find(fields, "max_output_tokens")?.number(cx)?;
+        model.enabled = Field::find(fields, "enabled")?.value(cx) == "是";
+        model.capabilities.tool_calls = Field::find(fields, "tool_calls")?.value(cx) == "是";
+        model.capabilities.image_input = Field::find(fields, "image_input")?.value(cx) == "是";
         model.capabilities.native_web_search =
-            Field::find(fields, "native_web_search")?.value() == "是";
-        model.capabilities.reasoning = Field::find(fields, "reasoning")?.value() == "是";
-        model.reasoning_levels = list(Field::find(fields, "reasoning_levels")?.value());
+            Field::find(fields, "native_web_search")?.value(cx) == "是";
+        model.capabilities.reasoning = Field::find(fields, "reasoning")?.value(cx) == "是";
+        model.reasoning_levels = list(&Field::find(fields, "reasoning_levels")?.value(cx));
         model.defaults.reasoning_effort =
-            optional(Field::find(fields, "default_reasoning_effort")?.value());
+            optional(&Field::find(fields, "default_reasoning_effort")?.value(cx));
         let default_tokens = Field::find(fields, "default_max_output_tokens")?;
-        model.defaults.max_output_tokens = optional(default_tokens.value())
-            .map(|_| default_tokens.number())
+        model.defaults.max_output_tokens = optional(&default_tokens.value(cx))
+            .map(|_| default_tokens.number(cx))
             .transpose()?;
         model.defaults.native_web_search =
-            Field::find(fields, "default_native_web_search")?.value() == "是";
+            Field::find(fields, "default_native_web_search")?.value(cx) == "是";
         catalog_command(
             daemon,
             revision,
@@ -871,7 +1070,7 @@ fn confirm_command(
     revision: u64,
     command: RingingCommand,
 ) -> AnyElement {
-    button(cx, t, id, "删除", move |daemon, _| {
+    button(cx, t, id, "删除", move |daemon, _, _| {
         let command = command.clone();
         begin(daemon, title.clone(), vec![], move |_, daemon, _| {
             catalog_command(daemon, revision, command.clone())
@@ -889,7 +1088,7 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
         t,
         "provider-add",
         "添加服务商",
-        move |daemon, cx| provider_form(daemon, cx, revision, None),
+        move |daemon, window, cx| provider_form(daemon, window, cx, revision, None),
     );
     let mut body =
         div()
@@ -903,8 +1102,8 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             t,
             format!("model-add-{id}"),
             "添加模型",
-            move |daemon, cx| {
-                model_form(daemon, cx, revision, provider_id.clone(), None);
+            move |daemon, window, cx| {
+                model_form(daemon, window, cx, revision, provider_id.clone(), None);
             },
         );
         let existing = (id.clone(), provider.clone());
@@ -913,8 +1112,8 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             t,
             format!("provider-edit-{id}"),
             "编辑",
-            move |daemon, cx| {
-                provider_form(daemon, cx, revision, Some(existing.clone()));
+            move |daemon, window, cx| {
+                provider_form(daemon, window, cx, revision, Some(existing.clone()));
             },
         );
         let remove = confirm_command(
@@ -925,9 +1124,14 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             revision,
             RingingCommand::ProviderDelete { id: id.clone() },
         );
+        let desc = format!(
+            "{} · 凭据:{}",
+            provider.base_url,
+            credential_label(provider.credential)
+        );
         body = body.child(setting_row(
             &provider.name,
-            &provider.base_url,
+            &desc,
             div()
                 .flex()
                 .gap_1()
@@ -971,9 +1175,10 @@ fn model_row(
         t,
         format!("model-edit-{id}"),
         "编辑",
-        move |daemon, cx| {
+        move |daemon, window, cx| {
             model_form(
                 daemon,
+                window,
                 cx,
                 revision,
                 provider.clone(),
@@ -999,7 +1204,7 @@ fn model_row(
             t,
             format!("model-default-{id}"),
             "设为默认",
-            move |daemon, _| {
+            move |daemon, _, _| {
                 let result = catalog_command(
                     daemon,
                     revision,
@@ -1018,10 +1223,10 @@ fn model_row(
         t,
         format!("model-profile-{id}"),
         "创建预设",
-        move |daemon, cx| {
+        move |daemon, window, cx| {
             let fields = vec![
-                Field::text("name", "预设名称", "", cx),
-                Field::secret("api_key", "API 密钥（可选）", cx),
+                Field::text("name", "预设名称", "", window, cx),
+                Field::secret("api_key", "API 密钥（可选）", window, cx),
             ];
             let provider = provider.clone();
             let model = model_id.clone();
@@ -1029,12 +1234,12 @@ fn model_row(
                 daemon,
                 "从模型创建预设",
                 fields,
-                move |fields, daemon, _| {
+                move |fields, daemon, cx| {
                     catalog_command(
                         daemon,
                         revision,
                         RingingCommand::ProfileCreate {
-                            name: fields[0].required()?,
+                            name: fields[0].required(cx)?,
                             model: model.clone(),
                             id: None,
                             provider: Some(provider.clone()),
@@ -1043,7 +1248,7 @@ fn model_row(
                             reasoning_effort: None,
                             context_length: None,
                             max_tokens: None,
-                            api_key: optional(fields[1].value()),
+                            api_key: optional(&fields[1].value(cx)),
                         },
                     )
                 },
@@ -1082,18 +1287,18 @@ fn profiles(
             t,
             "profile-save-current",
             "另存为",
-            move |daemon, cx| {
-                let fields = vec![Field::text("name", "预设名称", "", cx)];
+            move |daemon, window, cx| {
+                let fields = vec![Field::text("name", "预设名称", "", window, cx)];
                 begin(
                     daemon,
                     "保存当前配置",
                     fields,
-                    move |fields, daemon, _| {
+                    move |fields, daemon, cx| {
                         catalog_command(
                             daemon,
                             revision,
                             RingingCommand::ProfileSaveCurrent {
-                                name: fields[0].required()?,
+                                name: fields[0].required(cx)?,
                             },
                         )
                     },
@@ -1109,7 +1314,7 @@ fn profiles(
             t,
             format!("profile-apply-{name}"),
             "设为当前",
-            move |daemon, _| {
+            move |daemon, _, _| {
                 let result = catalog_command(
                     daemon,
                     revision,
@@ -1183,7 +1388,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             .unwrap_or_else(|| "未选择".into());
         let model_picker = button(cx, t, "session-model", "选择模型", {
             let selected = selected.clone();
-            move |daemon, cx| {
+            move |daemon, _, cx| {
                 let target = target.clone();
                 choose_model(
                     daemon,
@@ -1384,15 +1589,15 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
     let names = meta.custom_tools.join(", ");
     let edit = button(cx, t, "session-custom-tools", "编辑", {
         let names = names.clone();
-        move |daemon, cx| {
+        move |daemon, window, cx| {
             let target = target.clone();
-            let fields = vec![Field::text("names", "工具名称（逗号分隔）", &names, cx)];
+            let fields = vec![Field::text("names", "工具名称（逗号分隔）", &names, window, cx)];
             begin(
                 daemon,
                 "自定义会话工具",
                 fields,
                 move |fields, daemon, cx| {
-                    let names = list(fields[0].value());
+                    let names = list(&fields[0].value(cx));
                     if names.is_empty() {
                         return Err("请至少填写一个工具名称".into());
                     }
@@ -1438,7 +1643,7 @@ pub fn choose_new_model(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>)
 
 fn choose_model(
     daemon: &mut DaemonStore,
-    cx: &mut Context<DaemonStore>,
+    _cx: &mut Context<DaemonStore>,
     title: &'static str,
     current: &str,
     select: impl Fn(ModelSelection, &mut DaemonStore, &mut Context<DaemonStore>) -> Result<(), String>
@@ -1458,12 +1663,11 @@ fn choose_model(
         "模型",
         current,
         options.iter().map(model_label),
-        cx,
     )];
     begin(daemon, title, fields, move |fields, daemon, cx| {
         let model = options
             .iter()
-            .find(|model| model_label(model) == fields[0].value())
+            .find(|model| model_label(model) == fields[0].value(cx))
             .cloned()
             .ok_or("请选择可用模型")?;
         select(model, daemon, cx)

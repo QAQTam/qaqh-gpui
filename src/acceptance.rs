@@ -3,7 +3,6 @@
 use crate::{
     bridge::{BridgeRequest, ConnectionState},
     store::{DaemonStore, StreamState},
-    text_input::TextField,
 };
 use gpui::Context;
 use serde::Deserialize;
@@ -50,7 +49,11 @@ enum Action {
     Welcome,
 }
 
-pub fn poll(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) {
+pub fn poll(
+    daemon: &mut DaemonStore,
+    window: &mut gpui::Window,
+    cx: &mut Context<DaemonStore>,
+) {
     let args: Vec<_> = std::env::args().collect();
     let Some(index) = args.iter().position(|arg| arg == "--acceptance-root") else {
         return;
@@ -68,7 +71,7 @@ pub fn poll(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) {
             Ok(control) if control.sequence > SEQUENCE.load(Ordering::Relaxed) => {
                 SEQUENCE.store(control.sequence, Ordering::Relaxed);
                 match control.action {
-                    Action::Select { session_id } => daemon.select(session_id, cx),
+                    Action::Select { session_id } => daemon.select(session_id, window, cx),
                     Action::Reconnect => {
                         let _ = daemon.requests.unbounded_send(BridgeRequest::Reconnect);
                     }
@@ -88,9 +91,9 @@ pub fn poll(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) {
                         if let Some(store) = daemon.current.clone() {
                             store.update(cx, |store, cx| {
                             match action {
-                                Action::Draft { text } => store.composer = TextField::with_text(&text),
-                                Action::Send => { if let Some(reason) = store.composer_send() { error = Some(reason.to_string()); } },
-                                Action::FailSend => store.simulate_closed_bridge(),
+                                Action::Draft { text } => store.composer.update(cx, |composer, cx| composer.set_value(&text, window, cx)),
+                                Action::Send => { if let Some(reason) = store.composer_send(cx) { error = Some(reason.to_string()); } },
+                                Action::FailSend => store.simulate_closed_bridge(cx),
                                 Action::Retry => store.retry_message(),
                                 Action::Receipt => store.check_receipt(),
                                 Action::Refill => { store.snapshot_pending = true; let _ = store.requests().unbounded_send(BridgeRequest::Refill(store.session_id.clone())); },
@@ -121,7 +124,7 @@ pub fn poll(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) {
     }
     let current = daemon.current.as_ref().map(|store| {
         let store = store.read(cx);
-        json!({"id": store.session_id, "draft":store.composer.text,"entries":store.entries.len(),
+        json!({"id": store.session_id, "draft":store.composer.read(cx).value().to_string(),"entries":store.entries.len(),
             "snapshot_pending":store.snapshot_pending,"stream_open":matches!(store.stream, StreamState::Open),
             "outbox":store.outbox,"driver":store.driver,"client_session_id":store.client_session_id,
             "images":store.images.len(),"attachments":store.attachments.len(),"attachment_pending":store.attachment_pending,

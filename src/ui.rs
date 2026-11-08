@@ -1,7 +1,7 @@
 //! 元素构建(M3):主题 token 化 + 分组侧栏/时间线/composer/交互应答卡/todo 右栏。
 //! `Entity<T: Render>` 即元素:DaemonStore 为根,SessionStore 经实体直接挂载。
-//! 颜色一律取 theme::Palette 语义槽;输入框经 text_input::InputElement 注册
-//! EntityInputHandler(IME 前提)。
+//! 颜色一律取 theme::Palette 语义槽;输入框用 gpui-component 的 Input/Textarea
+//! (状态实体 + 组件渲染,IME/选区/剪贴板由引擎承担)。
 
 use std::collections::HashSet;
 
@@ -27,6 +27,10 @@ use gpui::div;
 use gpui::list;
 use gpui::px;
 use gpui::transparent_black;
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_component::dialog::Dialog;
+use gpui_component::input::{Input, Textarea};
+use gpui_component::{Sizable, Size, WindowExt};
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
 use qaqh_ringing_contract::fact::ContentValue;
@@ -48,8 +52,6 @@ use crate::store::DaemonStore;
 use crate::store::SessionRow;
 use crate::store::{SessionStore, SettingsEditor};
 use crate::store::StreamState;
-use crate::text_input::InputElement;
-use crate::text_input::TextField;
 use crate::theme::ActiveTheme;
 use crate::theme::Palette;
 use crate::theme::ThemeMode;
@@ -286,7 +288,6 @@ pub(crate) fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>)
 /// 控件不存值,全部经 settings::update(落盘 + refresh_windows)。
 pub(crate) fn settings_page(
     daemon: &mut DaemonStore,
-    window: &Window,
     cx: &mut Context<DaemonStore>,
 ) -> Div {
     let t = *cx.colors();
@@ -365,37 +366,8 @@ pub(crate) fn settings_page(
             }),
         ));
 
-    let font_field = daemon.font_field.clone();
-    let font_focused = daemon.font_focus.is_focused(window);
-    let font_display = font_field.display(font_focused, window);
-    let font_input_div = field_box(
-        "font-input",
-        &daemon.font_focus,
-        if font_focused { t.accent } else { t.border },
-        cx.listener(|daemon: &mut DaemonStore, _, window, cx| {
-            window.focus(&daemon.font_focus, cx);
-            cx.notify();
-        }),
-        cx.listener(
-            |daemon: &mut DaemonStore, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "enter" {
-                    let text = daemon.font_field.text.trim().to_string();
-                    settings::update(cx, |content| content.typography.ui_font_family = text);
-                    return;
-                }
-                basic_field_key(&mut daemon.font_field, event, cx);
-            },
-        ),
-    )
-    .min_w(px(220.))
-    .bg(t.panel)
-    .text_sm()
-    .child(if font_field.text.is_empty() && !font_focused {
-        div().text_color(t.dim).child("系统默认…")
-    } else {
-        div().child(font_display)
-    });
-    let font_input = InputElement::new(cx.entity(), daemon.font_focus.clone(), font_input_div);
+    // 字体输入框:Enter 应用由 DaemonStore 的事件订阅驱动。
+    let font_input = div().w(px(220.)).child(Input::new(&daemon.font_field).small());
 
     let code_size_display = SharedString::from(format!("{:.0}", typo.code_font_size));
     let code_size_stepper = div()
@@ -535,7 +507,7 @@ pub(crate) fn settings_page(
         .border_color(t.border)
         .bg(t.panel)
         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("设置"))
-        .child(action_button(
+        .child(action_button(cx, 
             "close-settings".into(),
             "关闭",
             t.dim,
@@ -565,7 +537,7 @@ pub(crate) fn settings_page(
                     settings::config_path().display()
                 ))),
         )
-        .child(action_button(
+        .child(action_button(cx, 
             "reset-settings".into(),
             "恢复默认",
             t.bad,
@@ -659,7 +631,7 @@ pub(crate) fn settings_page(
                     div().max_w(px(840.)).mx_auto().child(if is_local {
                         local
                     } else {
-                        crate::settings_ui::render(daemon, window, cx, &t)
+                        crate::settings_ui::render(daemon, cx, &t)
                     }),
                 ),
         )
@@ -694,7 +666,6 @@ fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaqh_ty
 /// 新建会话面板从后端目录选择模型与模型支持的推理档位。
 pub(crate) fn new_session_panel(
     daemon: &mut DaemonStore,
-    window: &Window,
     cx: &mut Context<DaemonStore>,
 ) -> Div {
     let t = *cx.colors();
@@ -732,7 +703,7 @@ pub(crate) fn new_session_panel(
         .border_color(t.border)
         .bg(t.panel)
         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("新建会话"))
-        .child(action_button(
+        .child(action_button(cx, 
             "close-new-session".into(),
             "关闭",
             t.dim,
@@ -754,7 +725,7 @@ pub(crate) fn new_session_panel(
             .child(header)
             .child(
                 div().id("new-model-picker").flex_1().min_h_0().overflow_y_scroll().p_4()
-                    .child(crate::settings_ui::render_form(form, window, cx, &t)),
+                    .child(crate::settings_ui::render_form(form, cx, &t)),
             );
     }
 
@@ -833,7 +804,7 @@ pub(crate) fn new_session_panel(
                                 .flex()
                                 .justify_end()
                                 .pt_2()
-                                .child(action_button(
+                                .child(action_button(cx, 
                                     "create-session".into(),
                                     if daemon.creating_session { "创建中…" }
                                     else if daemon.new_model.is_some() { "创建" }
@@ -1042,6 +1013,7 @@ fn tool_toggle(
 }
 
 fn tool_card(
+    cx: &gpui::App,
     store: &SessionStore,
     entity: &Entity<SessionStore>,
     tool: &ToolCallView,
@@ -1174,8 +1146,8 @@ fn tool_card(
             div()
                 .flex()
                 .gap_2()
-                .child(action_button(format!("exec-int-{id}"), "中断", t.warn, control(false), t))
-                .child(action_button(format!("exec-term-{id}"), "终止", t.bad, control(true), t)),
+                .child(action_button(cx, format!("exec-int-{id}"), "中断", t.warn, control(false), t))
+                .child(action_button(cx, format!("exec-term-{id}"), "终止", t.bad, control(true), t)),
         );
     }
     card
@@ -1224,6 +1196,7 @@ fn assistant_section(
 }
 
 fn timeline_entry(
+    cx: &gpui::App,
     store: &SessionStore,
     entity: &Entity<SessionStore>,
     entry: &TimelineEntry,
@@ -1244,7 +1217,7 @@ fn timeline_entry(
         }
         TimelineEntry::ToolCall { call_id, .. } => {
             let tool = store.tools.iter().find(|tool| &tool.call_id == call_id)?;
-            tool_card(store, entity, tool, t, tail_max).into_any_element()
+            tool_card(cx, store, entity, tool, t, tail_max).into_any_element()
         }
         TimelineEntry::Compaction { .. } => div()
             .text_xs()
@@ -1256,46 +1229,26 @@ fn timeline_entry(
 }
 
 pub(crate) fn action_button(
+    cx: &gpui::App,
     id: String,
     label: &'static str,
     color: Hsla,
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
     t: &Palette,
 ) -> impl IntoElement {
-    div()
-        .id(SharedString::from(id))
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_xs()
-        .cursor_pointer()
-        .bg(t.btn)
-        .text_color(color)
-        .hover(|style| style.bg(t.btn_hover))
+    // gpui-component Button:保留"中性底 + 彩色字"的既有视觉语义,
+    // 换取统一的焦点环/按压态/禁用态;签名新增 cx,调用面已 rg 验证同步。
+    Button::new(SharedString::from(id))
+        .with_size(Size::XSmall)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(t.btn)
+                .foreground(color)
+                .hover(t.btn_hover)
+                .active(t.btn_hover),
+        )
+        .label(label)
         .on_click(listener)
-        .child(label)
-}
-
-/// 带边框可聚焦输入框的公共骨架:所有 TextField 容器(设置/搜索/ask 卡)
-/// 共用的统一形态;调用方追加宽度/背景/占位内容。
-pub(crate) fn field_box(
-    id: impl Into<SharedString>,
-    focus: &gpui::FocusHandle,
-    border_color: Hsla,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
-    on_key: impl Fn(&KeyDownEvent, &mut Window, &mut gpui::App) + 'static,
-) -> gpui::Stateful<Div> {
-    div()
-        .id(id.into())
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(border_color)
-        .cursor_pointer()
-        .track_focus(focus)
-        .on_click(on_click)
-        .on_key_down(on_key)
 }
 
 fn interaction_card(
@@ -1331,85 +1284,16 @@ fn interaction_card(
     card
 }
 
-/// 基础编辑键位。可打印字符由 GPUI InputHandler 插入。
-pub(crate) fn basic_field_key<E: 'static>(
-    field: &mut TextField,
-    event: &KeyDownEvent,
-    cx: &mut Context<E>,
-) {
-    let keystroke = &event.keystroke;
-    let modifiers = &keystroke.modifiers;
-    match keystroke.key.as_str() {
-        "backspace" => field.delete_backward(),
-        "delete" => field.delete_forward(),
-        "left" => field.move_left(modifiers.shift),
-        "right" => field.move_right(modifiers.shift),
-        "home" => field.move_home(modifiers.shift),
-        "end" => field.move_end(modifiers.shift),
-        "a" if modifiers.control => field.select_all(),
-        "c" if modifiers.control => cx.write_to_clipboard(gpui::ClipboardItem::new_string(field.selected_text())),
-        "x" if modifiers.control => {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(field.selected_text()));
-            field.insert("");
-        }
-        "v" if modifiers.control => {
-            if let Some(item) = cx.read_from_clipboard()
-                && let Some(text) = item.text()
-            {
-                field.insert(&text);
-            }
-        }
-        _ => return,
-    }
-    cx.notify();
-}
-
 impl SessionStore {
-    /// composer 键入(M2):Enter 发送 / Shift+Enter 换行,其余交给基础字段键位。
-    /// IME 组字期间合成器路由按键,不会与此冲突。
-    fn composer_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let modifiers = &keystroke.modifiers;
-        if keystroke.key == "enter" {
-            if modifiers.shift {
-                self.composer.insert("\n");
-            } else {
-                self.composer_send();
-            }
-            cx.notify();
-            return;
-        }
-        basic_field_key(&mut self.composer, event, cx);
-    }
-
-    /// ask 卡自定义输入键位。
-    fn custom_key(
-        &mut self,
-        interaction_id: &qaqh_ringing_contract::fact::InteractionId,
-        question_index: usize,
-        event: &KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((_, draft)) = self
-            .ask_drafts
-            .iter_mut()
-            .find(|(id, _)| id == interaction_id)
-        else {
-            return;
-        };
-        let Some(field) = draft.customs.get_mut(question_index) else {
-            return;
-        };
-        basic_field_key(field, event, cx);
-    }
-
-    /// ask 卡:解析 request 渲染问题/选项/自定义输入;解析失败回退自由文本。
-    fn ask_card(
+    /// ask 应答 Dialog 内容:解析 request 渲染问题/选项/自定义输入;
+    /// 解析失败回退自由文本。提交/跳过成功后收口对话框。
+    fn ask_dialog(
         &mut self,
         interaction: &qaqh_ringing_contract::state::InteractionView,
-        window: &Window,
+        dialog: Dialog,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Dialog {
         let t = *cx.colors();
         let iid = interaction.interaction_id.clone();
         let questions = ask::parse_request(&interaction.request);
@@ -1427,9 +1311,7 @@ impl SessionStore {
                     );
                 }
                 for (index, question) in questions.iter().enumerate() {
-                    let focus = self.ask_draft(&iid, questions.len(), cx).focuses[index].clone();
-                    let field = self.ask_draft(&iid, questions.len(), cx).customs[index].clone();
-                    let custom_text = field.text.clone();
+                    let field = self.ask_draft(&iid, questions.len(), window, cx).customs[index].clone();
                     let mut row = div().flex().flex_col().gap_1();
                     row = row.child(
                         div()
@@ -1441,7 +1323,7 @@ impl SessionStore {
                             ))),
                     );
                     for option in &question.options {
-                        let chosen = self.ask_draft(&iid, questions.len(), cx).answers[index]
+                        let chosen = self.ask_draft(&iid, questions.len(), window, cx).answers[index]
                             .as_deref()
                             == Some(option.as_str());
                         let opt = option.clone();
@@ -1461,10 +1343,10 @@ impl SessionStore {
                                 .text_color(if chosen { t.accent } else { t.text })
                                 .hover(|style| style.bg(t.btn_hover))
                                 .on_click(cx.listener(
-                                    move |store: &mut SessionStore, _, _, cx| {
-                                        let draft = store.ask_draft(&iid_click, index + 1, cx);
+                                    move |store: &mut SessionStore, _, window: &mut Window, cx| {
+                                        let draft = store.ask_draft(&iid_click, index + 1, window, cx);
                                         draft.answers[index] = Some(opt_click.clone());
-                                        draft.customs[index].clear();
+                                        draft.customs[index].update(cx, |custom, cx| custom.set_value("", window, cx));
                                         cx.notify();
                                     },
                                 ))
@@ -1475,56 +1357,17 @@ impl SessionStore {
                         );
                     }
                     if question.allow_custom {
-                        let iid_focus = iid.clone();
-                        let iid_key = iid.clone();
-                        let focused = focus.is_focused(window);
-                        let display = field.display(focused, window);
-                        let input = field_box(
-                            format!("ask-custom-{iid}-{index}"),
-                            &focus,
-                            if custom_text.trim().is_empty() {
-                                t.border
-                            } else {
-                                t.accent
-                            },
-                            cx.listener(
-                                move |store: &mut SessionStore,
-                                      _,
-                                      window: &mut Window,
-                                      cx: &mut Context<SessionStore>| {
-                                    let focus =
-                                        store.ask_draft(&iid_focus, index + 1, cx).focuses[index]
-                                            .clone();
-                                    window.focus(&focus, cx);
-                                    cx.notify();
-                                },
-                            ),
-                            cx.listener(
-                                move |store: &mut SessionStore,
-                                      event: &KeyDownEvent,
-                                      _window,
-                                      cx| {
-                                    store.custom_key(&iid_key, index, event, cx);
-                                },
-                            ),
-                        )
-                        .bg(t.panel)
-                        .text_sm()
-                        .child(if custom_text.is_empty() && !focused {
-                            div().text_sm().text_color(t.dim).child("其它…")
-                        } else {
-                            div().text_sm().child(display)
-                        });
-                        row = row.child(InputElement::new(cx.entity(), focus, input));
+                        row = row.child(Input::new(&field).small().w_full());
                     }
                     body.push(row.into_any_element());
                 }
                 let submit = {
                     let iid_submit = iid.clone();
                     let ids = ids.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
-                        if store.ask_submit(&iid_submit, &ids).is_some() {
+                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
+                        if store.ask_submit(&iid_submit, &ids, cx).is_some() {
                             store.ask_hint = None;
+                            window.close_dialog(cx);
                         } else {
                             store.ask_hint = Some("请先选择答案或填写自定义回答".into());
                         }
@@ -1533,74 +1376,32 @@ impl SessionStore {
                 };
                 let skip = {
                     let iid_skip = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
+                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
                         store.ask_dismiss(&iid_skip);
                         store.ask_hint = None;
+                        window.close_dialog(cx);
                         cx.notify();
                     })
                 };
-                interaction_card(
-                    "提问",
-                    "(见下方问题)",
-                    vec![
-                        action_button(
-                            format!("ask-submit-{iid}"),
-                            "提交回答",
-                            t.ok,
-                            submit,
-                            &t,
-                        )
-                        .into_any_element(),
-                        action_button(format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)
-                            .into_any_element(),
-                    ],
-                    body,
-                    &t,
-                )
+                dialog
+                    .title("会话提问")
+                    .children(body)
+                    .footer(
+                        div().flex().justify_end().gap_2()
+                            .child(action_button(cx, format!("ask-submit-{iid}"), "提交回答", t.ok, submit, &t))
+                            .child(action_button(cx, format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)),
+                    )
             }
             _ => {
                 // 解析失败:回退自由文本(q1),不猜语法。
-                let focus = self.ask_draft(&iid, 1, cx).focuses[0].clone();
-                let field = self.ask_draft(&iid, 1, cx).customs[0].clone();
-                let custom_text = field.text.clone();
-                let iid_focus = iid.clone();
-                let iid_key = iid.clone();
-                let focused = focus.is_focused(window);
-                let display = field.display(focused, window);
-                let input = field_box(
-                    format!("ask-free-{iid}"),
-                    &focus,
-                    if custom_text.trim().is_empty() {
-                        t.border
-                    } else {
-                        t.accent
-                    },
-                    cx.listener(
-                        move |store: &mut SessionStore, _, window: &mut Window, cx| {
-                            let focus = store.ask_draft(&iid_focus, 1, cx).focuses[0].clone();
-                            window.focus(&focus, cx);
-                            cx.notify();
-                        },
-                    ),
-                    cx.listener(
-                        move |store: &mut SessionStore, event: &KeyDownEvent, _window, cx| {
-                            store.custom_key(&iid_key, 0, event, cx);
-                        },
-                    ),
-                )
-                .bg(t.panel)
-                .text_sm()
-                .child(if custom_text.is_empty() && !focused {
-                    div().text_sm().text_color(t.dim).child("输入回答…")
-                } else {
-                    div().text_sm().child(display)
-                });
+                let field = self.ask_draft(&iid, 1, window, cx).customs[0].clone();
                 let submit = {
                     let ids = vec!["q1".to_string()];
                     let iid_submit = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
-                        if store.ask_submit(&iid_submit, &ids).is_some() {
+                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
+                        if store.ask_submit(&iid_submit, &ids, cx).is_some() {
                             store.ask_hint = None;
+                            window.close_dialog(cx);
                         } else {
                             store.ask_hint = Some("请填写回答".into());
                         }
@@ -1609,13 +1410,20 @@ impl SessionStore {
                 };
                 let skip = {
                     let iid_skip = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, _, cx| {
+                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
                         store.ask_dismiss(&iid_skip);
                         store.ask_hint = None;
+                        window.close_dialog(cx);
                         cx.notify();
                     })
                 };
                 let mut body: Vec<AnyElement> = Vec::new();
+                body.push(
+                    div()
+                        .text_sm()
+                        .child(SharedString::from(content_text(&interaction.request).to_owned()))
+                        .into_any_element(),
+                );
                 if let Some(hint) = &self.ask_hint {
                     body.push(
                         div()
@@ -1625,26 +1433,63 @@ impl SessionStore {
                             .into_any_element(),
                     );
                 }
-                body.push(InputElement::new(cx.entity(), focus, input).into_any_element());
-                interaction_card(
-                    "提问",
-                    content_text(&interaction.request),
-                    vec![
-                        action_button(format!("ask-submit-{iid}"), "提交回答", t.ok, submit, &t)
-                            .into_any_element(),
-                        action_button(format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)
-                            .into_any_element(),
-                    ],
-                    body,
-                    &t,
-                )
+                body.push(Input::new(&field).small().w_full().into_any_element());
+                dialog
+                    .title("会话提问")
+                    .children(body)
+                    .footer(
+                        div().flex().justify_end().gap_2()
+                            .child(action_button(cx, format!("ask-submit-{iid}"), "提交回答", t.ok, submit, &t))
+                            .child(action_button(cx, format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)),
+                    )
             }
         }
     }
 }
 
+/// 打开 ask 应答 Dialog(模态覆盖层,Root 承载):到达即弹、footer 可重开;
+/// 提问已处理时显示收口态。
+pub(crate) fn open_ask_dialog(
+    store: &Entity<SessionStore>,
+    interaction_id: qaqh_ringing_contract::fact::InteractionId,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    window.open_dialog(cx, {
+        let store = store.clone();
+        move |dialog, window, cx| {
+            store.update(cx, |store, cx| {
+                let t = *cx.colors();
+                match store
+                    .interactions
+                    .iter()
+                    .find(|view| view.interaction_id == interaction_id)
+                {
+                    Some(interaction) if interaction.resolution.is_none() => {
+                        let interaction = interaction.clone();
+                        store.ask_dialog(&interaction, dialog, window, cx)
+                    }
+                    _ => dialog
+                        .title("会话提问")
+                        .child(div().text_sm().text_color(t.dim).child("该提问已处理。"))
+                        .footer(
+                            div().flex().justify_end().child(action_button(
+                                cx,
+                                "ask-dialog-done".into(),
+                                "关闭",
+                                t.dim,
+                                |_, window: &mut Window, cx: &mut gpui::App| window.close_dialog(cx),
+                                &t,
+                            )),
+                        ),
+                }
+            })
+        }
+    });
+}
+
 impl Render for SessionStore {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.colors();
         let title = self.title.clone().unwrap_or_else(|| self.session_id.clone());
 
@@ -1659,61 +1504,43 @@ impl Render for SessionStore {
             .border_color(t.border)
             .bg(t.panel);
         if let Some(draft) = self.renaming.clone() {
-            let focused = self.rename_focus.is_focused(window);
-            let display = draft.display(focused, window);
+            // Enter 提交由 begin_rename 的事件订阅驱动;Escape 关闭重命名
+            // (在祖先层截获,先于输入引擎的 Escape 动作)。
             let rename_input = div()
                 .id("rename-input")
-                .px_2()
-                .py_1()
-                .rounded_md()
                 .min_w(px(200.))
-                .border_1()
-                .border_color(if focused { t.accent } else { t.border })
-                .bg(t.panel)
-                .text_sm()
-                .track_focus(&self.rename_focus)
                 .on_key_down(cx.listener(
-                    |store: &mut SessionStore,
-                     event: &KeyDownEvent,
-                     _window,
-                     cx: &mut Context<SessionStore>| {
-                        match event.keystroke.key.as_str() {
-                            "enter" => store.rename_commit(),
-                            "escape" => store.rename_cancel(),
-                            _ => {
-                                if let Some(draft) = store.renaming.as_mut() {
-                                    basic_field_key(draft, event, cx);
-                                }
-                            }
+                    |store: &mut SessionStore, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            store.rename_cancel();
+                            cx.stop_propagation();
+                            cx.notify();
                         }
-                        cx.notify();
                     },
                 ))
-                .child(if draft.text.is_empty() && !focused {
-                    div().text_color(t.dim).child("新标题…")
-                } else {
-                    div().child(display)
-                });
+                .child(Input::new(&draft).small());
             header = header
-                .child(InputElement::new(cx.entity(), self.rename_focus.clone(), rename_input))
+                .child(rename_input)
                 .child(
-                    action_button(
+                    action_button(cx, 
                         "rename-commit".into(),
                         "✓",
                         t.ok,
-                        cx.listener(|store: &mut SessionStore, _, _, _| {
-                            store.rename_commit();
+                        cx.listener(|store: &mut SessionStore, _, _, cx| {
+                            store.rename_commit(cx);
+                            cx.notify();
                         }),
                         &t,
                     ),
                 )
                 .child(
-                    action_button(
+                    action_button(cx, 
                         "rename-cancel".into(),
                         "✕",
                         t.dim,
-                        cx.listener(|store: &mut SessionStore, _, _, _| {
+                        cx.listener(|store: &mut SessionStore, _, _, cx| {
                             store.rename_cancel();
+                            cx.notify();
                         }),
                         &t,
                     ),
@@ -1808,7 +1635,7 @@ impl Render for SessionStore {
                             .map(|s| s.meta.tool_mode.as_str()).filter(|mode| !mode.is_empty())
                             .unwrap_or(qaqh_types::STANDARD))),
                 )
-                .child(action_button(
+                .child(action_button(cx, 
                     "session-mode".into(),
                     if self.settings.as_ref().is_some_and(|s| s.meta.mode == 1) { "Plan" } else { "Code" },
                     t.dim,
@@ -1837,20 +1664,19 @@ impl Render for SessionStore {
                         .child("脱离"),
                 )
                 .child(
-                    action_button(
+                    action_button(cx, 
                         format!("rename-{}", self.session_id),
                         "重命名",
                         t.dim,
                         cx.listener(|store: &mut SessionStore, _, window, cx| {
-                            store.begin_rename();
-                            window.focus(&store.rename_focus, cx);
+                            store.begin_rename(window, cx);
                             cx.notify();
                         }),
                         &t,
                     ),
                 )
                 .child(
-                    action_button(
+                    action_button(cx, 
                         format!("delete-{}", self.session_id),
                         if self.confirm_delete { "确认删除" } else { "删除" },
                         if self.confirm_delete { t.bad } else { t.dim },
@@ -1868,7 +1694,7 @@ impl Render for SessionStore {
         if self.activity == Some(ActivityState::Running) {
             header = header.child(
                 div().flex_1().child(div()).child(
-                    action_button(
+                    action_button(cx, 
                         format!("cancel-{}", self.session_id),
                         "中断",
                         t.bad,
@@ -1927,7 +1753,7 @@ impl Render for SessionStore {
                             .find(|entry| !hidden_timeline_entry(entry)),
                         Some(TimelineEntry::ToolCall { .. })
                     );
-                return match timeline_entry(store, &entity, entry, index, &t, &ty, tail_max) {
+                return match timeline_entry(cx, store, &entity, entry, index, &t, &ty, tail_max) {
                     Some(content) => row.pb(if adjacent_tools { px(0.) } else { gap })
                         .child(content).into_any_element(),
                     None => row.into_any_element(),
@@ -1968,7 +1794,7 @@ impl Render for SessionStore {
                     if referenced_tools.contains(&tool.call_id) {
                         return None;
                     }
-                    Some(tool_card(store, &entity, tool, &t, tail_max).into_any_element())
+                    Some(tool_card(cx, store, &entity, tool, &t, tail_max).into_any_element())
                 }))
                 .children(store.subagents.iter().map(|subagent| {
                     let status = subagent
@@ -1998,52 +1824,19 @@ impl Render for SessionStore {
         .mx_auto()
         .p_3();
 
-        let focused = self.composer_focus.is_focused(window);
+        // composer:组件库 Textarea(auto_grow,Enter 提交);受阻原因降为
+        // 输入框下方常驻提示行(占位符固定为输入引导)。
         let blocked = self.send_block_reason();
-        let composer_display = self.composer.display(focused, window);
-        let composer = InputElement::new(
-            cx.entity(),
-            self.composer_focus.clone(),
-            div()
-                .id("composer")
-                .mx_3()
-                .mb_2()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .min_h(px(38.))
-                .border_1()
-                .border_color(if focused {
-                    t.accent
-                } else if blocked.is_some() {
-                    t.warn
-                } else {
-                    t.border
-                })
-                .bg(t.panel)
-                .cursor_pointer()
-                .key_context("Composer")
-                .track_focus(&self.composer_focus)
-                .on_click(cx.listener(
-                    |store: &mut SessionStore,
-                     _,
-                     window: &mut Window,
-                     cx: &mut Context<SessionStore>| {
-                        window.focus(&store.composer_focus, cx);
-                    },
-                ))
-                .on_key_down(cx.listener(Self::composer_key))
-                .child(if self.composer.text.is_empty() && !focused {
-                    div()
-                        .text_sm()
-                        .text_color(t.dim)
-                        .child(SharedString::from(
-                            blocked.unwrap_or("输入消息,Enter 发送…"),
-                        ))
-                } else {
-                    div().text_sm().child(composer_display)
-                }),
-        );
+        let composer = div()
+            .mx_3()
+            .mb_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(Textarea::new(&self.composer))
+            .children(blocked.map(|reason| {
+                div().text_xs().text_color(t.warn).child(SharedString::from(reason))
+            }));
 
         let mut footer = div()
             .flex()
@@ -2096,11 +1889,11 @@ impl Render for SessionStore {
                         "工具权限",
                         content_text(&interaction.request),
                         vec![
-                            action_button(format!("{uid}-allow"), "允许一次", t.ok, allow, &t)
+                            action_button(cx, format!("{uid}-allow"), "允许一次", t.ok, allow, &t)
                                 .into_any_element(),
-                            action_button(format!("{uid}-trust"), "始终允许", t.ok, trust, &t)
+                            action_button(cx, format!("{uid}-trust"), "始终允许", t.ok, trust, &t)
                                 .into_any_element(),
-                            action_button(format!("{uid}-deny"), "拒绝", t.bad, deny, &t)
+                            action_button(cx, format!("{uid}-deny"), "拒绝", t.bad, deny, &t)
                                 .into_any_element(),
                         ],
                         Vec::new(),
@@ -2127,9 +1920,9 @@ impl Render for SessionStore {
                         "计划评审",
                         content_text(&interaction.request),
                         vec![
-                            action_button(format!("{uid}-approve"), "批准", t.ok, approve, &t)
+                            action_button(cx, format!("{uid}-approve"), "批准", t.ok, approve, &t)
                                 .into_any_element(),
-                            action_button(format!("{uid}-reject"), "拒绝", t.bad, reject, &t)
+                            action_button(cx, format!("{uid}-reject"), "拒绝", t.bad, reject, &t)
                                 .into_any_element(),
                         ],
                         Vec::new(),
@@ -2137,7 +1930,21 @@ impl Render for SessionStore {
                     ));
                 }
                 InteractionKind::Ask => {
-                    footer = footer.child(self.ask_card(interaction, window, cx));
+                    // 应答内容在模态 Dialog 里;footer 只留重开入口。
+                    let entity = cx.entity();
+                    let iid = interaction.interaction_id.clone();
+                    footer = footer.child(
+                        action_button(cx,
+                            format!("ask-open-{}", iid.0),
+                            "回答提问",
+                            t.warn,
+                            move |_, window: &mut Window, cx: &mut gpui::App| {
+                                open_ask_dialog(&entity, iid.clone(), window, cx);
+                            },
+                            &t,
+                        )
+                        .into_any_element(),
+                    );
                 }
             }
         }
@@ -2148,7 +1955,7 @@ impl Render for SessionStore {
             .flex_col()
             .child(header)
             .child(crate::desktop::session_controls(self, cx, &t))
-            .children(crate::desktop::search(self, window, cx, &t))
+            .children(crate::desktop::search(self, cx))
             .child(timeline)
             .children(crate::code_panel::review_button(self, &t, cx))
             .child(composer)

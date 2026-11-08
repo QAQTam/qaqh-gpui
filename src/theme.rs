@@ -168,7 +168,8 @@ struct ThemeState {
 
 impl Global for ThemeState {}
 
-/// 启动初始化(须在 settings::init 之后):快照系统外观,按设置模式选色板。
+/// 启动初始化(须在 settings::init 与 gpui_component::init 之后):快照系统外观,
+/// 按设置模式选色板,并把品牌色映射进组件库主题。
 pub fn init(cx: &mut App) {
     let appearance = Appearance::from(cx.window_appearance());
     let mode = crate::settings::get(cx).appearance.theme_mode;
@@ -176,6 +177,7 @@ pub fn init(cx: &mut App) {
         appearance,
         palette: mode.resolve(appearance),
     });
+    sync_component_theme(cx);
 }
 
 /// 设置的 theme_mode 变化时重选色板并刷新窗口。
@@ -184,6 +186,7 @@ pub fn apply_mode(mode: ThemeMode, cx: &mut App) {
     let palette = mode.resolve(appearance);
     let state = cx.global_mut::<ThemeState>();
     state.palette = palette;
+    sync_component_theme(cx);
     cx.refresh_windows();
 }
 
@@ -195,7 +198,52 @@ pub fn system_appearance_changed(appearance: WindowAppearance, cx: &mut App) {
     if mode == ThemeMode::System {
         state.palette = Palette::for_appearance(state.appearance);
     }
+    sync_component_theme(cx);
     cx.refresh_windows();
+}
+
+/// 把本仓色板映射进 gpui-component 全局主题:组件(按钮/输入框/菜单/弹出层)
+/// 与手绘界面共用同一套品牌色。先按设置模式切亮/暗(会重载注册主题,
+/// 覆盖定制色),再用 Theme::update 写入色板——顺序不可反。
+pub fn sync_component_theme(cx: &mut App) {
+    match crate::settings::get(cx).appearance.theme_mode {
+        ThemeMode::System => gpui_component::Theme::sync_system_appearance(None, cx),
+        ThemeMode::Light => gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx),
+        ThemeMode::Dark => gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx),
+    }
+    let p = *cx.colors();
+    gpui_component::Theme::update(cx, |theme| {
+        let c = &mut theme.colors;
+        c.background = p.bg;
+        c.foreground = p.text;
+        c.border = p.border;
+        c.input = p.border;
+        c.ring = p.accent;
+        c.popover = p.panel;
+        c.muted = p.hover;
+        c.muted_foreground = p.dim;
+        c.accent = p.hover;
+        c.accent_foreground = p.text;
+        c.primary = p.accent;
+        c.primary_foreground = p.bg;
+        c.secondary = p.btn;
+        c.secondary_foreground = p.text;
+        c.danger = p.bad;
+        c.danger_foreground = p.bg;
+        c.success = p.ok;
+        c.warning = p.warn;
+        c.link = p.accent;
+        c.selection = p.selected;
+        c.title_bar = p.panel;
+        c.sidebar = p.panel;
+        c.sidebar_border = p.border;
+        c.tab_active = p.card;
+        c.button_primary = p.accent;
+        c.button_primary_foreground = p.bg;
+        c.button_secondary = p.btn;
+        c.button_secondary_hover = p.btn_hover;
+        c.button_secondary_foreground = p.text;
+    });
 }
 
 pub trait ActiveTheme {

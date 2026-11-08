@@ -22,7 +22,6 @@ mod reducer;
 mod settings;
 mod settings_ui;
 mod store;
-mod text_input;
 mod theme;
 mod ui;
 
