@@ -13,7 +13,7 @@ bash install.sh                     # 默认 ~/.local，无需管理员权限
 # 或 bash install.sh /absolute/prefix
 ```
 
-安装包包含 GPUI 和 daemon。首次打开时会自动发现或启动 daemon；在「设置 → 服务商与模型」添加服务商、模型和密钥，再新建会话。
+安装包包含 GPUI 和 daemon。首次打开时会自动发现或启动 daemon；在「设置 → 服务商与模型」添加服务商、模型和密钥，再新建会话。「设置 → 账号」经系统浏览器登录 ChatGPT 套餐（SIWC）与 DeepSeek 账号，凭据保存在本机管理器、可查看余额。
 运行需要 Wayland、Vulkan 驱动，以及 fontconfig、freetype、xkbcommon、ALSA、EGL 等系统库。安装器会校验二进制摘要和缺失的动态库。
 卸载使用包内 `bash uninstall.sh`，会话、配置和草稿会保留。
 
@@ -37,7 +37,7 @@ qaqh-gpui --diagnostics > diagnostics.txt
 
 ## 构建
 
-使用 Python 3.11+ 和仓库指定的 Rust 工具链。在一个新的父目录检出本仓，然后准备固定版本的依赖：
+使用 Python 3.11+ 和仓库指定的 Rust 工具链。在一个新的父目录检出本仓，然后准备固定版本的后端依赖：
 
 ```sh
 git clone https://github.com/QAQTam/qaqh-gpui.git
@@ -46,6 +46,7 @@ python3 scripts/prepare-sources.py
 scripts/mem-guard.sh 1600 cargo build --locked -j1
 ```
 
+UI 框架与组件库走 crates.io 精确 pin（`gpui-pre` / `gpui-pre-platform` / `gpui-component`，取舍见 `Cargo.toml` 注释），无需本地 vendor 检出；同级仓库只有 `qaqh-backend` 与 `mutil-ai`，由 `packaging/dependencies.json` 钉版。
 准备脚本不会覆盖已有的同级仓库。已有开发检出时，后端须包含 `packaging/backend-client.patch` 中的原生改动：归档查询参数、共享 Todo 读模型和 daemon 子进程回收。这是后端源码修正，运行时直接使用新契约。
 
 ## 发布与验收

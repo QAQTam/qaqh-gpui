@@ -7,7 +7,7 @@
 
 1. **连接方案已定**:GPUI 前端直接 path 依赖后端仓的 `qaqh-client`(RingingV2 传输权威实现,与 `qaqh-tui` 同路)。前端不自建传输、不写协议转换层(宪法 #9)。
 2. **RingingV2 是 HTTP + SSE**,不是 WS/stdio。命令面为 `POST /ringing/v2/commands` + 类型化 envelope;读模型为 bootstrap 快照 + 单条 SSE 事件流,`epoch:seq` 水位同步。
-3. **gpui 引入方式**:本地检出 `../gpui`(zed 拆平台版,rev `d1520011e6204b95b320ee40a5a6b11879082426`)以 path 依赖引入,`[patch.crates-io]` 五条必须随行复制(跨 workspace 不传播)。
+3. **gpui 引入方式**(2026-11-08 更新):crates.io 精确 pin —— `gpui-pre` / `gpui-pre-platform` `=0.3.11`(zed 拆平台快照经 longbridge/gpui-kit 重发布,`=` 防周更快照漂移)与组件库 `gpui-component` `=0.9.0`;原 `../gpui` path vendor 检出与 `[patch.crates-io]` 五条 fork patch 已整体移除。
 4. **最大工程约束是内存**(可用 ~1.5Gi + swap 几乎满):构建用 `-j1` + `scripts/mem-guard.sh`;依赖树 729 包,`check` 先行,`build` 只在 `check` 绿后做。
 
 ## 1. 环境探查
@@ -18,28 +18,30 @@
 | 内存 | 7.7Gi,可用 ~1.3–1.6Gi | **瓶颈**。两个 ZCode 实例常驻(~340MB×2 + 两个 zcode-cli ~220MB×2) |
 | swap | 3.8Gi,已用 3.5Gi | 系统已深处换页,编译峰值控制必须保守 |
 | 磁盘 | 79Gi 可用 | 充裕;`target/` 预计 +4–6Gi |
-| 工具链 | 1.98.1 已安装(与 `../gpui/rust-toolchain.toml` 对齐) | 零下载 |
-| 前例 | `../gpui/target` 有 debug 产物 → 本机构建过 gpui | 系统级依赖(fontconfig/xkbcommon/wayland dev)已在 |
+| 工具链 | 1.98.1 已安装(与 gpui-pre 快照的工具链要求对齐) | 零下载 |
+| 前例 | 探索期曾以 `../gpui` vendor 检出本机构建过 gpui(该检出 2026-11-08 已删) | 系统级依赖(fontconfig/xkbcommon/wayland dev)已在 |
 
 **资源策略**(用户睡前指令:内存友好,避开两个后台 ZCode 的内存竞争):
 - `scripts/mem-guard.sh [阈值MB] <cmd>`:可用内存 < 阈值时每 60s 复查,回升才放行。
 - 编译一律 `-j1`;先 `check`(无 codegen,峰值低)后 `build`。
 - `[profile.dev] debug = "limited"` 降低产物体积。
 
-## 2. 依赖引入(已落地)
+## 2. 依赖引入(现状,2026-11-08 更新)
 
 ```toml
-gpui           = { path = "../gpui/crates/gpui", default-features = false,
-                   features = ["font-kit", "wayland", "x11"] }
-gpui_platform  = { path = "../gpui/crates/gpui_platform", features = ["wayland", "x11"] }
+gpui           = { package = "gpui-pre", version = "=0.3.11", default-features = false,
+                   features = ["font-kit", "wayland"] }
+gpui_platform  = { package = "gpui-pre-platform", version = "=0.3.11", features = ["wayland"] }
+gpui-component = "=0.9.0"
 qaqh-client    = { path = "../qaqh-backend/crates/qaqh-client" }
 ```
 
-- **(rev) 的处理**:`../gpui` 是无远端本地仓,git rev 钉版不可用;以 path 依赖 + Cargo.toml 注释记录 rev `d1520011e6204b95b320ee40a5a6b11879082426` 达成同等可追溯性。gpui 版本 0.2.2,edition 2024。
-- **拆平台版结构**:`gpui` crate 平台无关;Linux 后端经 `gpui_platform`(feature `wayland`/`x11` → `gpui_linux`)接线;应用入口是 `gpui_platform::application() -> gpui::Application`(hello_world 示例同款)。
-- **[patch.crates-io] 五条逐字复制自 gpui workspace**(windows-capture / khronos-egl / calloop / async-task / async-process,均为 zed fork)。cargo 的 patch 只在定义它的 workspace 生效,外部消费缺了就编上游版本,calloop/async-process 会直接失败。
+- **(rev) 的处理**:gpui-pre 把 zed 拆平台快照重发布到 crates.io,`=` 精确 pin 即版本坐标,可追溯性与 path vendor 等价;升版必须连同 pin 一起动(gpui-kit 仓库的 pin 纪律)。
+- **拆平台版结构**:`gpui-pre`(lib 名仍是 `gpui`)平台无关;Linux 后端经 `gpui-pre-platform`(lib 名 `gpui_platform`,feature `wayland`)接线;应用入口是 `gpui_platform::application()`。
+- **组件库**:`gpui-component` 0.9.0(Apache-2.0,与 gpui-pre 同基座咬合)提供 Button/Input/Textarea/Dialog/Notification/Switch 等,窗口 AssetSource 注册 `gpui_kit_assets::Assets`;高亮继续用本仓 highlight.rs,组件库的 tree-sitter/syntect feature 不启用。
+- **[patch.crates-io] 已删除**:zed fork 的五条 patch(khronos-egl / calloop / async-task / async-process / windows-capture)已随快照规整回 crates.io 上游,外部消费不再需要随行复制。
 - **跨仓 path 依赖先例**:`qaqh-tui-app` 已用完全相同的姿势依赖 `qaqh-client`,其 Cargo.toml 注释记录了取舍:跨 workspace 继承(`workspace = true`)正常解析,代价是后端仓必须与相对路径共存。
-- 依赖树规模:**729 包**(cargo metadata 实测),含 wgpu(git rev)、resvg、image、icu_segmenter 等重物。
+- 依赖树规模:快照 + 组件库引入后较探索期的 729 包进一步扩大,准确数字见 Cargo.lock;含 wgpu、resvg、image、icu_segmenter 等重物。
 
 ## 3. 后端协议面(RingingV2 权威事实)
 

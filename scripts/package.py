@@ -21,7 +21,7 @@ version = subprocess.check_output([str(target / "qaqh-gpui"), "--version"], text
 if "acceptance" in version:
     raise SystemExit("Build the client without the acceptance feature before packaging")
 manifest = {"version": tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"], "client_build": version, "profile": args.profile, "platform": "linux-x86_64-wayland", "sources": {}, "sha256": {}}
-for name, source in [("qaqh-gpui", root), ("qaqh-backend", root.parent / "qaqh-backend"), ("gpui", root.parent / "gpui"), ("mutil-ai", root.parent / "mutil-ai")]:
+for name, source in [("qaqh-gpui", root), ("qaqh-backend", root.parent / "qaqh-backend"), ("mutil-ai", root.parent / "mutil-ai")]:
     revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     patch = subprocess.check_output(["git", "-C", str(source), "diff", "--binary", "HEAD"])
     patch_name = f"{name}.patch"

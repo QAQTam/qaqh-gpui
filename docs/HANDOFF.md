@@ -114,7 +114,7 @@
 QAQ-Harness 的 GPUI 桌面前端,宪法:**RingingV2 协议与命令面最高准则**,前端零自建
 协议、零转换层(`qaqh-client`/`qaqh-ringing-contract` 跨仓 path 依赖)。
 
-- gpui 依赖:`../gpui`(fork,HEAD **d1520011**,自 zed 上游 **e21ff1b** vendor,Apache-2.0)
+- gpui 依赖:crates.io `gpui-pre` / `gpui-pre-platform` `=0.3.11` + 组件库 `gpui-component` `=0.9.0`(Apache-2.0;2026-11-08 起弃用 `../gpui` path vendor,该检出已删除)
 - `../zed` = 上游克隆;**GPL crates 只借鉴设计,不可抄代码**
 - `../qaqh-electron` = 另一前端(electron 壳 + webui/SolidJS)
 - 资源:8 核老 U / 7.7G 内存(可用 ~3.4G)→ **永远 `-j1`**
@@ -159,7 +159,7 @@ QAQ-Harness 的 GPUI 桌面前端,宪法:**RingingV2 协议与命令面最高准
 
 ## 许可证红线
 
-- 可抄:`../gpui` 全部(Apache-2.0)、zed assets/themes 色值(MIT)
+- 可抄:gpui-pre / gpui-pre-platform / gpui-component 全部(Apache-2.0)、zed assets/themes 色值(MIT)
 - 只可借鉴:`../zed` GPL crates(含 settings_ui)
 - 本仓:queries 为 Apache-2.0(assets/queries/README.md)
 
