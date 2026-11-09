@@ -5072,9 +5072,10 @@ dependencies = [
 
 [[package]]
 name = "qaqh-gpui"
-version = "0.1.0"
+version = "3.0.20261109"
 dependencies = [
  "base64 0.22.1",
+ "embed-resource",
  "futures",
  "gpui-component",
  "gpui-kit-assets",

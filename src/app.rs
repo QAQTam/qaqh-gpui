@@ -103,7 +103,10 @@ pub fn launch() {
 
         // 系统通知点击 → 定位会话:select 要建会话实体,经窗口上下文路由。
         let notifications = daemon.clone();
-        let notify_window = window_handle;
+        // 必须 Deref 出 AnyWindowHandle:WindowHandle::update 会整段闭包独占 lease
+        // 窗口根(gpui_base::Root),闭包内组件库 Root API(open_dialog /
+        // push_notification)read 根必炸;AnyWindowHandle::update 只进窗口上下文。
+        let notify_window = *window_handle;
         cx.on_system_notification_response(move |response, cx| {
             if let Some(seed) = response.tag.strip_prefix("qaqh-") {
                 let seed = seed.to_string();
@@ -118,7 +121,7 @@ pub fn launch() {
         });
 
         let saving = daemon.clone();
-        let save_window = window_handle;
+        let save_window = *window_handle;
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
@@ -152,7 +155,7 @@ pub fn launch() {
             .expect("spawn bridge thread");
 
         let pumping = daemon.clone();
-        let pump_window = window_handle;
+        let pump_window = *window_handle;
         cx.spawn(async move |cx| {
             while let Some(message) = from_bridge.next().await {
                 // Yield to input and paint even while the bridge queue stays ready.
