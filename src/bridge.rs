@@ -431,9 +431,9 @@ async fn establish(
     {
         Ok(value) => {
             let count = value.len();
-            send_line(to_ui, &format!("session.list:{count} 个会话"));
             trace(&format!("session.list {count} 条"));
             // 原始数组直传:前端投影需要 status/workspace_id(sanitize 会丢)。
+            // 例行结果不再 send_line 进 UI——那曾是侧栏底部日志泄漏的源头。
             let _ = to_ui.unbounded_send(BridgeMsg::Sessions(value));
         }
         Err(error) => send_line(to_ui, &format!("session.list 失败:{error}")),

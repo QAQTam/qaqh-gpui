@@ -5,7 +5,7 @@ use crate::{
     theme::Palette,
     ui::action_button,
 };
-use gpui::{App, Context, Div, KeyDownEvent, PathPromptOptions, div, prelude::*, px};
+use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, div, prelude::*, px};
 use gpui_component::input::Input;
 use gpui_component::Sizable;
 use qaqh_client::{CommandTarget, RingingCommand, SessionListEntry};
@@ -40,24 +40,34 @@ pub fn roster_notifications(old: &[SessionRow], entries: &[SessionListEntry], cx
     }
 }
 
+/// 连接状态:收敛为侧栏底部一张紧凑卡(全应用唯一入口),
+/// 状态点文案 + 重连/诊断两个幽灵动作;操作反馈经 last_operation 呈现。
 pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
-    let label = match &daemon.connection {
-        ConnectionState::Connecting => "正在连接 daemon…".to_string(),
-        ConnectionState::Ready { .. } => "已连接".to_string(),
-        ConnectionState::Failed { detail } => format!("连接失败：{detail}"),
+    let (label, color, detail) = match &daemon.connection {
+        ConnectionState::Connecting => ("正在连接 daemon…", t.warn, None),
+        ConnectionState::Ready { .. } => ("已连接", t.ok, None),
+        ConnectionState::Failed { detail } => ("连接失败", t.bad, Some(detail.clone())),
     };
     div()
+        .mx_2()
+        .mb_2()
+        .p_2()
+        .rounded(px(crate::kit::RADIUS_CARD))
+        .bg(t.card)
+        .border_1()
+        .border_color(t.border)
         .flex()
         .flex_col()
-        .gap_1()
-        .p_2()
-        .text_xs()
-        .child(label)
+        .gap_1p5()
+        .child(crate::kit::pill(label, color, t))
+        .children(detail.map(|detail| {
+            div().text_xs().text_color(t.bad).child(detail)
+        }))
         .child(
             div()
                 .flex()
-                .gap_2()
-                .child(action_button(cx, 
+                .gap_1()
+                .child(action_button(cx,
                     "reconnect".into(),
                     "重新连接",
                     t.accent,
@@ -68,7 +78,7 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                     }),
                     t,
                 ))
-                .child(action_button(cx, 
+                .child(action_button(cx,
                     "diagnostics".into(),
                     "复制诊断",
                     t.dim,
@@ -84,17 +94,20 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
             daemon
                 .last_operation
                 .clone()
-                .map(|text| div().text_color(t.warn).child(text)),
+                .map(|text| div().text_xs().text_color(t.warn).child(text)),
         )
 }
 
+/// 侧栏工具区:搜索 + 过滤/入口 chips。窄/宽微调按钮已砍——布局微调
+/// 不属于一级界面,宽度走默认值持久化。
 pub fn sidebar_tools(
     daemon: &DaemonStore,
     cx: &mut Context<DaemonStore>,
     t: &Palette,
 ) -> Div {
     div()
-        .p_2()
+        .px_2()
+        .pb_1()
         .flex()
         .flex_col()
         .gap_2()
@@ -103,8 +116,8 @@ pub fn sidebar_tools(
             div()
                 .flex()
                 .flex_wrap()
-                .gap_2()
-                .child(action_button(cx, 
+                .gap_1()
+                .child(action_button(cx,
                     "archive-filter".into(),
                     if daemon.show_archived {
                         "返回活动会话"
@@ -118,7 +131,7 @@ pub fn sidebar_tools(
                     }),
                     t,
                 ))
-                .child(action_button(cx, 
+                .child(action_button(cx,
                     "workspace-settings".into(),
                     "工作区",
                     t.dim,
@@ -130,78 +143,134 @@ pub fn sidebar_tools(
                         cx.notify();
                     }),
                     t,
-                ))
-                .child(action_button(cx, 
-                    "sidebar-narrow".into(),
-                    "窄",
-                    t.dim,
-                    cx.listener(|daemon, _, _, cx| {
-                        daemon.workbench.sidebar_width =
-                            Some((daemon.workbench.sidebar_width.unwrap_or(260.) - 20.).max(180.));
-                        cx.notify();
-                    }),
-                    t,
-                ))
-                .child(action_button(cx, 
-                    "sidebar-wide".into(),
-                    "宽",
-                    t.dim,
-                    cx.listener(|daemon, _, _, cx| {
-                        daemon.workbench.sidebar_width =
-                            Some((daemon.workbench.sidebar_width.unwrap_or(260.) + 20.).min(420.));
-                        cx.notify();
-                    }),
-                    t,
                 )),
         )
 }
 
+/// 欢迎页:居中 hero 卡片(glyph + 标题 + 描述 + 连接 pill + 主/次 CTA),
+/// 快捷键键帽与版本号退到卡片下方;连接状态只在侧栏渲染,此处不再重复。
 pub fn welcome(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
+    let (status_label, status_color) = match &daemon.connection {
+        ConnectionState::Connecting => ("正在连接 daemon…", t.warn),
+        ConnectionState::Ready { .. } => ("daemon 已连接", t.ok),
+        ConnectionState::Failed { .. } => ("daemon 未连接", t.bad),
+    };
     div()
         .flex_1()
-        .p_6()
         .flex()
         .flex_col()
+        .items_center()
+        .justify_center()
         .gap_4()
-        .child("欢迎使用 QAQHarness")
-        .child("先在设置中添加服务商和模型，再选择工作目录并新建会话。")
-        .child(connection(daemon, cx, t))
-        .child(action_button(cx, 
-            "setup-model".into(),
-            "配置服务商与模型",
-            t.accent,
-            cx.listener(|daemon, _, _, cx| {
-                daemon.settings_open = true;
-                daemon.settings_editor = crate::store::SettingsEditor::Catalog;
-                let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
-                let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
-                cx.notify();
-            }),
-            t,
-        ))
-        .child(format!(
-            "版本 {} · Ctrl+N 新建 · Ctrl+K 搜索会话 · Ctrl+F 搜索消息 · Ctrl+, 设置",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .bg(t.bg)
+        .child(
+            crate::kit::hero(t)
+                .child(
+                    div()
+                        .text_2xl()
+                        .text_color(t.accent)
+                        .child("◈"),
+                )
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.text)
+                        .child("欢迎使用 QAQHarness"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(t.dim)
+                        .text_center()
+                        .child("先在设置中添加服务商和模型，再选择工作目录并新建会话。"),
+                )
+                .child(crate::kit::pill(status_label, status_color, t))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mt_2()
+                        .child(gpui::AnyElement::from(crate::kit::button(
+                            cx,
+                            crate::kit::BtnKind::Primary,
+                            "setup-model",
+                            "配置服务商与模型",
+                            t,
+                            cx.listener(|daemon, _, _, cx| {
+                                daemon.settings_open = true;
+                                daemon.settings_editor = crate::store::SettingsEditor::Catalog;
+                                let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
+                                let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                                cx.notify();
+                            }),
+                        )))
+                        .child(gpui::AnyElement::from(crate::kit::button(
+                            cx,
+                            crate::kit::BtnKind::Ghost,
+                            "welcome-new-session",
+                            "新建会话",
+                            t,
+                            cx.listener(|daemon, _, _, cx| {
+                                daemon.new_session_open = true;
+                                daemon.settings_open = false;
+                                daemon.settings_form = None;
+                                let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                                cx.notify();
+                            }),
+                        ))),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .text_color(t.faint)
+                .child(crate::kit::kbd("Ctrl+N", t))
+                .child("新建")
+                .child(div().mx_1().child("·"))
+                .child(crate::kit::kbd("Ctrl+K", t))
+                .child("搜索会话")
+                .child(div().mx_1().child("·"))
+                .child(crate::kit::kbd("Ctrl+F", t))
+                .child("搜索消息")
+                .child(div().mx_1().child("·"))
+                .child(crate::kit::kbd("Ctrl+,", t))
+                .child("设置"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(t.faint)
+                .child(SharedString::from(format!("版本 {}", env!("QAQH_VERSION")))),
+        )
 }
 
+/// 会话控制条:状态 pill + 分组幽灵动作(控制权 | 检索/导出 | 会话管理 | 危险区),
+/// 分隔线收口;停止会话是破坏性动作,放最右并落 Danger 色。
 pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t: &Palette) -> Div {
     let holder = store.driver.as_ref().and_then(|d| d.holder.clone());
     let own = holder.is_some() && holder == store.client_session_id;
     let archived = store.settings.as_ref().is_some_and(|s| s.meta.archived);
     let stale_holder = holder.clone();
+    let (control_label, control_color) = match holder {
+        None => ("控制权 · 空闲", t.dim),
+        Some(_) if own => ("控制权 · 本客户端", t.ok),
+        Some(_) => ("控制权 · 其他客户端", t.warn),
+    };
     div()
+        .px_3()
+        .py_1()
         .flex()
         .flex_wrap()
-        .gap_2()
-        .p_2()
+        .items_center()
+        .gap_1()
         .text_xs()
-        .child(match holder {
-            None => "控制权：空闲",
-            Some(_) if own => "控制权：本客户端",
-            _ => "控制权：其他客户端",
-        })
-        .child(action_button(cx, 
+        .child(crate::kit::pill(control_label, control_color, t))
+        .child(action_button(cx,
             "driver-control".into(),
             if own {
                 "释放控制权"
@@ -220,7 +289,45 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(cx, 
+        .child(v_divider(t))
+        .child(action_button(cx,
+            "message-search".into(),
+            "搜索消息",
+            t.dim,
+            cx.listener(|store, _, window, cx| {
+                store.search_open = !store.search_open;
+                store.search.update(cx, |field, cx| field.focus(window, cx));
+                cx.notify();
+            }),
+            t,
+        ))
+        .child(action_button(cx,
+            "load-references".into(),
+            "加载引用内容",
+            t.dim,
+            cx.listener(|store, _, _, _| {
+                for reference in crate::content::references(store) {
+                    let _ = store
+                        .requests()
+                        .unbounded_send(BridgeRequest::ResolveContent {
+                            seed: store.session_id.clone(),
+                            reference,
+                        });
+                }
+            }),
+            t,
+        ))
+        .child(action_button(cx,
+            "copy-conversation".into(),
+            "复制对话",
+            t.dim,
+            cx.listener(|store, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(conversation_text(store)));
+            }),
+            t,
+        ))
+        .child(v_divider(t))
+        .child(action_button(cx,
             "archive-session".into(),
             if archived { "取消归档" } else { "归档" },
             t.dim,
@@ -238,7 +345,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(cx, 
+        .child(action_button(cx,
             "reload-agent".into(),
             "重载配置",
             t.dim,
@@ -252,10 +359,11 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(cx, 
+        .child(div().flex_1())
+        .child(action_button(cx,
             "shutdown-agent".into(),
             "停止会话",
-            t.dim,
+            t.bad,
             cx.listener(|store, _, _, _| {
                 let _ = store.requests().unbounded_send(BridgeRequest::Command {
                     target: CommandTarget::Session {
@@ -266,42 +374,11 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
             }),
             t,
         ))
-        .child(action_button(cx, 
-            "message-search".into(),
-            "搜索消息",
-            t.dim,
-            cx.listener(|store, _, window, cx| {
-                store.search_open = !store.search_open;
-                store.search.update(cx, |field, cx| field.focus(window, cx));
-                cx.notify();
-            }),
-            t,
-        ))
-        .child(action_button(cx, 
-            "load-references".into(),
-            "加载引用内容",
-            t.dim,
-            cx.listener(|store, _, _, _| {
-                for reference in crate::content::references(store) {
-                    let _ = store
-                        .requests()
-                        .unbounded_send(BridgeRequest::ResolveContent {
-                            seed: store.session_id.clone(),
-                            reference,
-                        });
-                }
-            }),
-            t,
-        ))
-        .child(action_button(cx, 
-            "copy-conversation".into(),
-            "复制对话",
-            t.dim,
-            cx.listener(|store, _, _, cx| {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(conversation_text(store)));
-            }),
-            t,
-        ))
+}
+
+/// 控制条竖向 hairline 分隔。
+fn v_divider(t: &Palette) -> Div {
+    div().w(px(1.)).h(px(14.)).mx_1().bg(t.border)
 }
 
 pub fn conversation_text(store: &SessionStore) -> String {

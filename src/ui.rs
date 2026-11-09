@@ -149,9 +149,9 @@ fn stream_badge(state: &StreamState, t: &Palette) -> Div {
     div()
         .px_2()
         .py_0p5()
-        .rounded_md()
+        .rounded_full()
         .text_xs()
-        .bg(t.btn)
+        .bg(crate::kit::soft(color, 0.12))
         .text_color(color)
         .child(label)
 }
@@ -189,12 +189,12 @@ pub(crate) fn sidebar_row(
                 .items_center()
                 .gap_2()
                 .child(status_dot(&row.status, t))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(if selected { t.accent } else { t.text })
-                        .child(title),
-                ),
+        .child(
+            div()
+                .text_sm()
+                .text_color(t.text)
+                .child(title),
+        ),
         )
         .child(div().text_xs().text_color(t.dim).child(row.updated_at.clone()))
 }
@@ -537,78 +537,101 @@ pub(crate) fn settings_page(
                     settings::config_path().display()
                 ))),
         )
-        .child(action_button(cx, 
-            "reset-settings".into(),
+        .child(gpui::AnyElement::from(crate::kit::button(
+            cx,
+            crate::kit::BtnKind::Danger,
+            "reset-settings",
             "恢复默认",
-            t.bad,
+            &t,
             cx.listener(|_, _, _, cx| {
                 settings::update(cx, |content| {
                     *content = settings::SettingsContent::default();
                 });
             }),
-            &t,
-        ));
+        )));
 
     let local = div()
         .flex()
         .flex_col()
-        .child(section_header("外观", &t))
-        .child(setting_row(
-            "主题模式",
-            "跟随系统外观,或固定亮/暗色",
-            div().flex().gap_1().children(theme_buttons).into_any_element(),
-            &t,
-        ))
-        .child(setting_row(
-            "密度",
-            "时间线留白节奏",
-            div().flex().gap_1().children(density_buttons).into_any_element(),
-            &t,
-        ))
-        .child(section_header("排版", &t))
-        .child(setting_row(
-            "界面字号",
-            "全局缩放基准(rem),影响全部界面文字",
-            font_size_stepper.into_any_element(),
-            &t,
-        ))
-        .child(setting_row(
-            "界面字体",
-            "字体族名称,留空用平台默认;Enter 应用",
-            font_input.into_any_element(),
-            &t,
-        ))
-        .child(setting_row(
-            "代码字号",
-            "代码块文字大小(px)",
-            code_size_stepper.into_any_element(),
-            &t,
-        ))
-        .child(setting_row(
-            "正文行高",
-            "消息段落行高倍数",
-            line_height_stepper.into_any_element(),
-            &t,
-        ))
-        .child(setting_row(
-            "内容列宽",
-            "时间线正文列最大宽度",
-            width_cycle.into_any_element(),
-            &t,
-        ))
-        .child(section_header("行为", &t))
-        .child(setting_row(
-            "流式跟随",
-            "新内容自动滚到底部;滚轮上滚暂停,下滚恢复",
-            div().flex().gap_1().children(follow_buttons).into_any_element(),
-            &t,
-        ))
-        .child(setting_row(
-            "输出尾窗上限",
-            "工具输出超过上限时仅显示尾部",
-            tail_cycle.into_any_element(),
-            &t,
-        ));
+        .gap_4()
+        .child(
+            section_card(
+                "外观",
+                vec![
+                    setting_row(
+                        "主题模式",
+                        "跟随系统外观,或固定亮/暗色",
+                        div().flex().gap_1().children(theme_buttons).into_any_element(),
+                        &t,
+                    ),
+                    setting_row(
+                        "密度",
+                        "时间线留白节奏",
+                        div().flex().gap_1().children(density_buttons).into_any_element(),
+                        &t,
+                    ),
+                ],
+                &t,
+            ),
+        )
+        .child(
+            section_card(
+                "排版",
+                vec![
+                    setting_row(
+                        "界面字号",
+                        "全局缩放基准(rem),影响全部界面文字",
+                        font_size_stepper.into_any_element(),
+                        &t,
+                    ),
+                    setting_row(
+                        "界面字体",
+                        "字体族名称,留空用平台默认;Enter 应用",
+                        font_input.into_any_element(),
+                        &t,
+                    ),
+                    setting_row(
+                        "代码字号",
+                        "代码块文字大小(px)",
+                        code_size_stepper.into_any_element(),
+                        &t,
+                    ),
+                    setting_row(
+                        "正文行高",
+                        "消息段落行高倍数",
+                        line_height_stepper.into_any_element(),
+                        &t,
+                    ),
+                    setting_row(
+                        "内容列宽",
+                        "时间线正文列最大宽度",
+                        width_cycle.into_any_element(),
+                        &t,
+                    ),
+                ],
+                &t,
+            ),
+        )
+        .child(
+            section_card(
+                "行为",
+                vec![
+                    setting_row(
+                        "流式跟随",
+                        "新内容自动滚到底部;滚轮上滚暂停,下滚恢复",
+                        div().flex().gap_1().children(follow_buttons).into_any_element(),
+                        &t,
+                    ),
+                    setting_row(
+                        "输出尾窗上限",
+                        "工具输出超过上限时仅显示尾部",
+                        tail_cycle.into_any_element(),
+                        &t,
+                    ),
+                ],
+                &t,
+            ),
+        );
     let is_local = daemon.settings_editor == SettingsEditor::Local;
 
     div()
@@ -626,7 +649,7 @@ pub(crate) fn settings_page(
                 .min_h_0()
                 .overflow_y_scroll()
                 .px(px(24.))
-                .py_3()
+                .py_4()
                 .child(
                     div().max_w(px(840.)).mx_auto().child(if is_local {
                         local
@@ -636,6 +659,23 @@ pub(crate) fn settings_page(
                 ),
         )
         .when(is_local, |page| page.child(footer))
+}
+
+/// 设置分区卡:小节标题 + 卡片容器,行间 hairline 由 setting_row 自带。
+pub(crate) fn section_card(title: &str, rows: Vec<Div>, t: &Palette) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(crate::kit::section_label(title, t).px_1())
+        .child(
+            crate::kit::card(t)
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_1()
+                .children(rows),
+        )
 }
 
 fn next_option<'a, T: PartialEq>(options: &'a [T], current: Option<&T>) -> Option<&'a T> {
@@ -745,77 +785,103 @@ pub(crate) fn new_session_panel(
                 .p(px(24.))
                 .child(
                     div()
-                        .w(px(480.))
+                        .w(px(520.))
                         .mt(px(48.))
                         .flex()
                         .flex_col()
-                        .child(setting_row(
-                            "工作区",
-                            "会话的工作目录(cwd)",
-                            div()
+                        .gap_3()
+                        .child(
+                            crate::kit::card(&t)
                                 .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
+                                .flex_col()
+                                .px_3()
+                                .py_1()
+                                .child(setting_row(
+                                    "工作区",
+                                    "会话的工作目录(cwd)",
                                     div()
-                                        .min_w(px(120.))
-                                        .text_xs()
-                                        .text_color(t.text)
-                                        .child(SharedString::from(workspace_label)),
-                                )
-                                .child(step_button(
-                                    "ns-workspace",
-                                    "切换",
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .min_w(px(120.))
+                                                .text_xs()
+                                                .text_color(t.text)
+                                                .child(SharedString::from(workspace_label)),
+                                        )
+                                        .child(step_button(
+                                            "ns-workspace",
+                                            "切换",
+                                            &t,
+                                            cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                                                if !daemon.workspaces.is_empty() {
+                                                    daemon.new_workspace =
+                                                        (daemon.new_workspace + 1) % daemon.workspaces.len();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .into_any_element(),
                                     &t,
-                                    cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        if !daemon.workspaces.is_empty() {
-                                            daemon.new_workspace =
-                                                (daemon.new_workspace + 1) % daemon.workspaces.len();
-                                        }
-                                        cx.notify();
-                                    }),
                                 ))
-                                .into_any_element(),
-                            &t,
-                        ))
-                        .child(setting_row(
-                            "服务商 / 模型",
-                            "创建会话需要有效的模型选择",
-                            div().flex().gap_2().items_center()
-                                .child(daemon.new_model.as_ref().map(|model| {
-                                    format!("{} / {}", model.provider_id, model.model_id)
-                                }).unwrap_or_else(|| "没有可用模型".into()))
-                                .child(step_button("ns-model", "选择", &t,
-                                    cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        crate::settings_ui::choose_new_model(daemon, cx);
-                                        cx.notify();
-                                    }),
-                                )).into_any_element(),
-                            &t,
-                        ))
-                        .child(setting_row(
-                            "推理强度",
-                            "使用模型声明的推理档位",
-                            div().flex().gap_1().children(effort_buttons).into_any_element(),
-                            &t,
-                        ))
+                                .child(setting_row(
+                                    "服务商 / 模型",
+                                    "创建会话需要有效的模型选择",
+                                    div().flex().gap_2().items_center()
+                                        .child(daemon.new_model.as_ref().map(|model| {
+                                            format!("{} / {}", model.provider_id, model.model_id)
+                                        }).unwrap_or_else(|| "没有可用模型".into()))
+                                        .child(step_button("ns-model", "选择", &t,
+                                            cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                                                crate::settings_ui::choose_new_model(daemon, cx);
+                                                cx.notify();
+                                            }),
+                                        )).into_any_element(),
+                                    &t,
+                                ))
+                                .child(setting_row(
+                                    "推理强度",
+                                    "使用模型声明的推理档位",
+                                    div().flex().gap_1().children(effort_buttons).into_any_element(),
+                                    &t,
+                                )),
+                        )
                         .child(
                             div()
                                 .flex()
-                                .justify_end()
-                                .pt_2()
-                                .child(action_button(cx, 
-                                    "create-session".into(),
-                                    if daemon.creating_session { "创建中…" }
-                                    else if daemon.new_model.is_some() { "创建" }
-                                    else { "缺少模型" },
-                                    if daemon.new_model.is_some() && !daemon.creating_session { t.ok } else { t.dim },
-                                    cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        daemon.create_session();
-                                        cx.notify();
-                                    }),
-                                    &t,
-                                )),
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(t.warn)
+                                        .when(daemon.new_model.is_some(), |hint| hint.invisible())
+                                        .child("缺少可用模型:先在「设置 → 服务商与模型」添加并启用"),
+                                )
+                                .child(if daemon.new_model.is_some() || daemon.creating_session {
+                                    gpui::AnyElement::from(crate::kit::button(
+                                        cx,
+                                        crate::kit::BtnKind::Primary,
+                                        "create-session",
+                                        if daemon.creating_session { "创建中…" } else { "创建会话" },
+                                        &t,
+                                        cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                                            daemon.create_session();
+                                            cx.notify();
+                                        }),
+                                    ))
+                                } else {
+                                    // 无模型可用:禁用态用 Ghost 弱化,而不是误导性的实底主按钮。
+                                    gpui::AnyElement::from(crate::kit::button(
+                                        cx,
+                                        crate::kit::BtnKind::Ghost,
+                                        "create-session",
+                                        "缺少模型",
+                                        &t,
+                                        cx.listener(|_: &mut DaemonStore, _, _, _| {}),
+                                    ))
+                                }),
                         ),
                 ),
         )
@@ -852,9 +918,7 @@ pub(crate) fn section_header(title: &str, t: &Palette) -> Div {
     div()
         .pt_4()
         .pb_1()
-        .text_xs()
-        .text_color(t.dim)
-        .child(SharedString::from(title))
+        .child(crate::kit::section_label(title, t))
 }
 
 /// 设置行(zed settings_ui 行布局):左标题+描述,右控件,行间分隔线。
@@ -890,12 +954,15 @@ pub(crate) fn segmented_button(
         .id(SharedString::from(id))
         .px_2()
         .py_1()
-        .rounded_sm()
+        .rounded(px(crate::kit::RADIUS_CONTROL))
         .text_xs()
         .cursor_pointer()
-        .bg(if active { t.accent_bg } else { t.btn })
-        .text_color(if active { t.accent } else { t.dim })
-        .hover(|style| style.bg(t.btn_hover))
+        .when(active, |style| {
+            style.bg(t.accent_bg).text_color(t.accent)
+        })
+        .when(!active, |style| {
+            style.text_color(t.dim).hover(|style| style.bg(t.hover).text_color(t.text))
+        })
         .on_click(listener)
         .child(label.into())
 }
@@ -910,16 +977,15 @@ fn step_button(
         .id(id)
         .px_2()
         .py_1()
-        .rounded_sm()
+        .rounded(px(crate::kit::RADIUS_CONTROL))
         .text_xs()
         .cursor_pointer()
         .min_w(px(28.))
         .flex()
         .items_center()
         .justify_center()
-        .bg(t.btn)
-        .text_color(t.text)
-        .hover(|style| style.bg(t.btn_hover))
+        .text_color(t.dim)
+        .hover(|style| style.bg(t.hover).text_color(t.text))
         .on_click(listener)
         .child(glyph)
 }
@@ -930,7 +996,7 @@ fn user_bubble(text: &str, t: &Palette) -> Div {
         .max_w(px(640.))
         .px_3()
         .py_2()
-        .rounded_lg()
+        .rounded(px(crate::kit::RADIUS_BUBBLE))
         .bg(t.bubble)
         .text_sm()
         .child(text.to_string())
@@ -1051,17 +1117,10 @@ fn tool_card(
     if !expanded {
         return div().child(header);
     }
-    let mut card = div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .max_w_full()
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .border_1()
-        .border_color(t.border)
-        .bg(if is_exec { t.card } else { t.panel })
+    // 展开卡:圆角卡面 + 左侧状态色条,命令行用 code 面层收进"终端"质感。
+    // card 持续累积子元素(参数/输出/控制),外层横排只放色条+内容列,
+    // 内容列在末尾组装(见 assemble)。
+    let content = div().flex().flex_col().gap_1p5().py_2().pr_3().min_w_0()
         .child(header)
         .child(
             div()
@@ -1076,17 +1135,32 @@ fn tool_card(
                         .child(SharedString::from(format!("⚙ {name}"))),
                 )
                 .children(command.map(|command| {
-                    div().min_w_0().text_sm().text_color(t.text)
+                    div()
+                        .min_w_0()
+                        .text_sm()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(4.))
+                        .bg(t.code_bg)
+                        .text_color(t.text)
+                        .truncate()
                         .child(SharedString::from(format!("$ {command}")))
                 }))
-                .child(
-                    div()
-                        .text_xs()
-                        .flex_shrink_0()
-                        .text_color(status_color)
-                        .child(status),
-                ),
+                .child(crate::kit::pill(status, status_color, t)),
         );
+    let mut card = content;
+    let assemble = |content: Div, status_color: Hsla, t: &Palette| {
+        div()
+            .flex()
+            .max_w_full()
+            .rounded(px(crate::kit::RADIUS_CONTROL))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.card)
+            .overflow_hidden()
+            .child(div().w(px(3.)).flex_shrink_0().bg(status_color))
+            .child(content)
+    };
     if !is_exec && let Some(args) = &tool.args {
         card = card.child(
             div()
@@ -1122,7 +1196,12 @@ fn tool_card(
         card = card.child(
             div()
                 .text_xs()
+                .px_2()
+                .py_1p5()
+                .rounded(px(5.))
+                .bg(t.code_bg)
                 .text_color(t.dim)
+                .min_w_0()
                 .child(SharedString::from(if truncated {
                     format!("…{output}")
                 } else {
@@ -1150,7 +1229,7 @@ fn tool_card(
                 .child(action_button(cx, format!("exec-term-{id}"), "终止", t.bad, control(true), t)),
         );
     }
-    card
+    assemble(card, status_color, t)
 }
 
 fn has_assistant_text(kind: AssistantBlockKind, text: &str) -> bool {
@@ -1190,7 +1269,13 @@ fn assistant_section(
         .flex_col()
         .gap_1()
         .max_w_full()
-        .child(div().text_xs().text_color(t.dim).child(label))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.faint)
+                .child(label),
+        )
         .children(crate::markdown::render_blocks(&blocks, section, t, ty, entity))
         .children(live.then(|| div().text_xs().text_color(t.dim).child("▍")))
 }
@@ -1236,16 +1321,16 @@ pub(crate) fn action_button(
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
     t: &Palette,
 ) -> impl IntoElement {
-    // gpui-component Button:保留"中性底 + 彩色字"的既有视觉语义,
-    // 换取统一的焦点环/按压态/禁用态;签名新增 cx,调用面已 rg 验证同步。
+    // Ghost 分级:透明底 + 彩色文字,hover 浮现面层;焦点/按压态交给组件库。
+    // 主操作/破坏性动作不使用本函数,走 kit::button(Primary/Danger)。
     Button::new(SharedString::from(id))
         .with_size(Size::XSmall)
         .custom(
             ButtonCustomVariant::new(cx)
-                .color(t.btn)
+                .color(transparent_black())
                 .foreground(color)
-                .hover(t.btn_hover)
-                .active(t.btn_hover),
+                .hover(t.hover)
+                .active(t.hover),
         )
         .label(label)
         .on_click(listener)
@@ -1258,30 +1343,39 @@ fn interaction_card(
     body: Vec<AnyElement>,
     t: &Palette,
 ) -> Div {
-    let mut card = div()
+    // 待交互卡:warn 色条 + 软底,和工具卡同一"色条卡"语言。
+    div()
         .flex()
-        .flex_col()
-        .gap_2()
-        .px_3()
-        .py_2()
-        .rounded_md()
+        .rounded(px(crate::kit::RADIUS_CARD))
         .border_1()
-        .border_color(t.warn)
-        .bg(t.warn_bg);
-    card = card.child(
-        div()
-            .text_sm()
-            .text_color(t.warn)
-            .child(SharedString::from(format!("待交互 · {kind_label}"))),
-    );
-    card = card.child(div().text_sm().child(SharedString::from(request.to_string())));
-    if !body.is_empty() {
-        card = card.child(div().flex().flex_col().gap_1().children(body));
-    }
-    if !buttons.is_empty() {
-        card = card.child(div().flex().gap_2().children(buttons));
-    }
-    card
+        .border_color(t.border)
+        .bg(t.warn_bg)
+        .overflow_hidden()
+        .child(div().w(px(3.)).flex_shrink_0().bg(t.warn))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .py_2p5()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.warn)
+                        .child(SharedString::from(format!("需要确认 · {kind_label}"))),
+                )
+                .child(div().text_sm().child(SharedString::from(request.to_string())))
+                .when(!body.is_empty(), |card| {
+                    card.child(div().flex().flex_col().gap_1().children(body))
+                })
+                .when(!buttons.is_empty(), |card| {
+                    card.child(div().flex().gap_2().children(buttons))
+                }),
+        )
 }
 
 impl SessionStore {
@@ -1388,8 +1482,22 @@ impl SessionStore {
                     .children(body)
                     .footer(
                         div().flex().justify_end().gap_2()
-                            .child(action_button(cx, format!("ask-submit-{iid}"), "提交回答", t.ok, submit, &t))
-                            .child(action_button(cx, format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)),
+                            .child(gpui::AnyElement::from(crate::kit::button(
+                                cx,
+                                crate::kit::BtnKind::Soft,
+                                format!("ask-submit-{iid}"),
+                                "提交回答",
+                                &t,
+                                submit,
+                            )))
+                            .child(gpui::AnyElement::from(crate::kit::button(
+                                cx,
+                                crate::kit::BtnKind::Ghost,
+                                format!("ask-skip-{iid}"),
+                                "跳过",
+                                &t,
+                                skip,
+                            ))),
                     )
             }
             _ => {
@@ -1439,8 +1547,22 @@ impl SessionStore {
                     .children(body)
                     .footer(
                         div().flex().justify_end().gap_2()
-                            .child(action_button(cx, format!("ask-submit-{iid}"), "提交回答", t.ok, submit, &t))
-                            .child(action_button(cx, format!("ask-skip-{iid}"), "跳过", t.dim, skip, &t)),
+                            .child(gpui::AnyElement::from(crate::kit::button(
+                                cx,
+                                crate::kit::BtnKind::Soft,
+                                format!("ask-submit-{iid}"),
+                                "提交回答",
+                                &t,
+                                submit,
+                            )))
+                            .child(gpui::AnyElement::from(crate::kit::button(
+                                cx,
+                                crate::kit::BtnKind::Ghost,
+                                format!("ask-skip-{iid}"),
+                                "跳过",
+                                &t,
+                                skip,
+                            ))),
                     )
             }
         }
@@ -1562,9 +1684,9 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .bg(t.btn)
+                        .rounded(px(crate::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
-                        .hover(|style| style.bg(t.btn_hover))
+                        .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
                             let current = store.settings.as_ref().and_then(|s| s.meta.model_selection.as_ref());
                             if let Some(catalog) = &store.catalog {
@@ -1590,9 +1712,9 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .bg(t.btn)
+                        .rounded(px(crate::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
-                        .hover(|style| style.bg(t.btn_hover))
+                        .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
                             let model = store.settings.as_ref().and_then(|settings| settings.meta.model_selection.as_ref());
                             if let Some((catalog, model)) = store.catalog.as_deref().zip(model) {
@@ -1620,9 +1742,9 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .bg(t.btn)
+                        .rounded(px(crate::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
-                        .hover(|style| style.bg(t.btn_hover))
+                        .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
                             let current = store.settings.as_ref().map(|s| s.meta.tool_mode.as_str());
                             let presets = [qaqh_types::STANDARD, qaqh_types::MINIMAL, qaqh_types::MINIMAL_B, qaqh_types::MINIMAL_C];
@@ -1654,9 +1776,9 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .bg(t.btn)
+                        .rounded(px(crate::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
-                        .hover(|style| style.bg(t.btn_hover))
+                        .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
                             store.detach_from_workspace();
                             cx.notify();
@@ -1676,10 +1798,12 @@ impl Render for SessionStore {
                     ),
                 )
                 .child(
-                    action_button(cx, 
+                    gpui::AnyElement::from(crate::kit::button(
+                        cx,
+                        crate::kit::BtnKind::Danger,
                         format!("delete-{}", self.session_id),
                         if self.confirm_delete { "确认删除" } else { "删除" },
-                        if self.confirm_delete { t.bad } else { t.dim },
+                        &t,
                         cx.listener(|store: &mut SessionStore, _, _, cx| {
                             if store.confirm_delete {
                                 store.delete_self();
@@ -1687,8 +1811,7 @@ impl Render for SessionStore {
                             store.confirm_delete = !store.confirm_delete;
                             cx.notify();
                         }),
-                        &t,
-                    ),
+                    )),
                 );
         }
         if self.activity == Some(ActivityState::Running) {

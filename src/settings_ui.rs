@@ -428,6 +428,7 @@ fn report(daemon: &mut DaemonStore, result: Result<(), String>) {
     }
 }
 
+/// 设置页签:真分段控件(容器面层 + 选中项浮起),不再用一堆盒子按钮模拟。
 pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
     let tabs = [
         (SettingsEditor::Local, "本机偏好", "local"),
@@ -439,7 +440,7 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
     ]
     .into_iter()
     .map(|(mode, label, id)| {
-        segmented_button(
+        crate::kit::segmented_item(
             format!("daemon-tab-{id}"),
             label,
             active == mode,
@@ -459,14 +460,11 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
     })
     .collect::<Vec<_>>();
     div()
-        .flex()
-        .flex_wrap()
-        .gap_2()
         .px(px(24.))
         .py_2()
         .border_b_1()
         .border_color(t.border)
-        .children(tabs)
+        .child(crate::kit::segmented_strip(tabs, t))
 }
 
 pub fn render(
@@ -477,14 +475,17 @@ pub fn render(
     if let Some(form) = &daemon.settings_form {
         return render_form(form, cx, t);
     }
-    match daemon.settings_editor {
+    // daemon 侧页面与本机偏好同一语言:整页收进一张卡,行间 hairline 由
+    // setting_row 自带,小节标题(section_header)留在卡内做分组。
+    let page = match daemon.settings_editor {
         SettingsEditor::Local => div(),
         SettingsEditor::Config => global(daemon, cx, t),
         SettingsEditor::Catalog => catalog(daemon, cx, t),
         SettingsEditor::Accounts => accounts(daemon, cx, t),
         SettingsEditor::Session => session(daemon, cx, t),
         SettingsEditor::Workspaces => workspaces(daemon, cx, t),
-    }
+    };
+    crate::kit::card_padded(t).child(page)
 }
 
 pub(crate) fn render_form(
@@ -496,11 +497,12 @@ pub(crate) fn render_form(
         .flex()
         .flex_col()
         .gap_1()
-        .p_3()
-        .rounded_md()
-        .border_1()
-        .border_color(t.border)
-        .child(div().text_sm().child(form.title.clone()));
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(form.title.clone()),
+        );
     for (index, field) in form.fields.iter().enumerate() {
         let control = match &field.control {
             FieldControl::Input(state) => {
@@ -554,33 +556,45 @@ pub(crate) fn render_form(
         };
         body = body.child(setting_row(field.label, "", control, t));
     }
-    body.child(
+    let body = body.child(
         div()
             .flex()
             .justify_end()
             .gap_2()
-            .child(button(cx, t, "settings-cancel", "取消", move |daemon, _, _| {
-                daemon.settings_form = None
-            }))
-            .child(button(
-                cx,
+            .pt_2()
+            .child(crate::kit::button(
+                &*cx,
+                crate::kit::BtnKind::Ghost,
+                "settings-cancel",
+                "取消",
                 t,
+                cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
+                    daemon.settings_form = None;
+                    cx.notify();
+                }),
+            ))
+            .child(crate::kit::button(
+                &*cx,
+                crate::kit::BtnKind::Primary,
                 "settings-save",
                 if form.fields.is_empty() {
                     "确认"
                 } else {
                     "保存"
                 },
-                |daemon, _, cx| {
+                t,
+                cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
                     if let Some(form) = daemon.settings_form.take()
                         && let Err(error) = (form.submit)(&form.fields, daemon, cx)
                     {
                         daemon.settings_form = Some(form);
                         daemon.lines.push(error);
                     }
-                },
+                    cx.notify();
+                }),
             )),
-    )
+    );
+    crate::kit::card_padded(t).child(body)
 }
 
 fn edit_config(

@@ -62,6 +62,8 @@ impl ThemeMode {
 }
 
 /// 语义色槽:UI 一律经此取色,不再写裸 rgb 常量。
+/// 面层梯 bg → panel → card → hover 逐级提亮;边框只做 hairline 收口,
+/// 层级感来自面层对比(参照 zed 的 surface 层次,不靠边框网)。
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub bg: Hsla,
@@ -79,6 +81,7 @@ pub struct Palette {
     pub bad: Hsla,
     pub bubble: Hsla,
     pub card: Hsla,
+    pub card_hover: Hsla,
     pub warn_bg: Hsla,
     pub btn: Hsla,
     pub btn_hover: Hsla,
@@ -102,24 +105,25 @@ impl Palette {
 
     fn dark() -> Self {
         Self {
-            bg: rgb(0x111419).into(),
-            panel: rgb(0x171b22).into(),
-            border: rgb(0x242a34).into(),
-            text: rgb(0xd8dee9).into(),
-            dim: rgb(0x8a93a2).into(),
-            faint: rgb(0x5c6675).into(),
-            accent: rgb(0x4f9cf9).into(),
-            accent_bg: rgb(0x1f3350).into(),
-            hover: rgb(0x1e242e).into(),
-            selected: rgb(0x232c3a).into(),
-            ok: rgb(0x4fbf7a).into(),
-            warn: rgb(0xd9a03f).into(),
-            bad: rgb(0xe06c75).into(),
-            bubble: rgb(0x1e2a3d).into(),
-            card: rgb(0x131720).into(),
-            warn_bg: rgb(0x241f14).into(),
-            btn: rgb(0x1f2630).into(),
-            btn_hover: rgb(0x27303d).into(),
+            bg: rgb(0x0f1115).into(),
+            panel: rgb(0x14171d).into(),
+            border: rgb(0x232933).into(),
+            text: rgb(0xd6dce5).into(),
+            dim: rgb(0x8a92a0).into(),
+            faint: rgb(0x5b6370).into(),
+            accent: rgb(0x529bf7).into(),
+            accent_bg: rgb(0x1c3255).into(),
+            hover: rgb(0x1d232d).into(),
+            selected: rgb(0x233046).into(),
+            ok: rgb(0x45b081).into(),
+            warn: rgb(0xd99d43).into(),
+            bad: rgb(0xe2697a).into(),
+            bubble: rgb(0x1e2c44).into(),
+            card: rgb(0x191e26).into(),
+            card_hover: rgb(0x212835).into(),
+            warn_bg: rgb(0x2a2214).into(),
+            btn: rgb(0x1d242e).into(),
+            btn_hover: rgb(0x273040).into(),
             code_bg: rgb(0x161b23).into(),
             syn_keyword: rgb(0xc678dd).into(),
             syn_string: rgb(0x98c379).into(),
@@ -132,25 +136,26 @@ impl Palette {
 
     fn light() -> Self {
         Self {
-            bg: rgb(0xfafafa).into(),
-            panel: rgb(0xf0f0f0).into(),
-            border: rgb(0xd5d5d5).into(),
-            text: rgb(0x383a42).into(),
-            dim: rgb(0x696c77).into(),
-            faint: rgb(0xa0a1a7).into(),
-            accent: rgb(0x4078f2).into(),
-            accent_bg: rgb(0xdde7fa).into(),
-            hover: rgb(0xe9e9e9).into(),
-            selected: rgb(0xdde7fa).into(),
-            ok: rgb(0x50a14f).into(),
-            warn: rgb(0xc18401).into(),
-            bad: rgb(0xe45649).into(),
-            bubble: rgb(0xdde7fa).into(),
+            bg: rgb(0xf6f6f7).into(),
+            panel: rgb(0xeeeff1).into(),
+            border: rgb(0xd9dade).into(),
+            text: rgb(0x2b2e34).into(),
+            dim: rgb(0x6d727c).into(),
+            faint: rgb(0x9ea3ac).into(),
+            accent: rgb(0x3b78d8).into(),
+            accent_bg: rgb(0xe0eafc).into(),
+            hover: rgb(0xe9eaee).into(),
+            selected: rgb(0xdfeafc).into(),
+            ok: rgb(0x2f9e5c).into(),
+            warn: rgb(0xb07c12).into(),
+            bad: rgb(0xd25049).into(),
+            bubble: rgb(0xe4eefc).into(),
             card: rgb(0xffffff).into(),
-            warn_bg: rgb(0xfbf3db).into(),
-            btn: rgb(0xe9e9e9).into(),
-            btn_hover: rgb(0xdedede).into(),
-            code_bg: rgb(0xf4f4f4).into(),
+            card_hover: rgb(0xf3f4f6).into(),
+            warn_bg: rgb(0xfcf3dd).into(),
+            btn: rgb(0xececf0).into(),
+            btn_hover: rgb(0xe1e2e7).into(),
+            code_bg: rgb(0xf3f4f6).into(),
             syn_keyword: rgb(0xa626a4).into(),
             syn_string: rgb(0x50a14f).into(),
             syn_number: rgb(0x986801).into(),
@@ -212,6 +217,10 @@ pub fn sync_component_theme(cx: &mut App) {
         ThemeMode::Dark => gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx),
     }
     let p = *cx.colors();
+    // 悬停/按压派生:亮色面层压暗、暗色面层提亮(与画布明度同向判定)。
+    let shift = |c: Hsla, delta: f32| Hsla { l: (c.l + delta).clamp(0., 1.), ..c };
+    let accent_step = if p.bg.l > 0.5 { -0.07 } else { 0.07 };
+    let danger_step = if p.bg.l > 0.5 { -0.06 } else { 0.06 };
     gpui_component::Theme::update(cx, |theme| {
         let c = &mut theme.colors;
         c.background = p.bg;
@@ -240,9 +249,15 @@ pub fn sync_component_theme(cx: &mut App) {
         c.tab_active = p.card;
         c.button_primary = p.accent;
         c.button_primary_foreground = p.bg;
+        c.button_primary_hover = shift(p.accent, accent_step);
+        c.button_primary_active = shift(p.accent, accent_step * 1.5);
         c.button_secondary = p.btn;
         c.button_secondary_hover = p.btn_hover;
         c.button_secondary_foreground = p.text;
+        c.button_danger = p.bad;
+        c.button_danger_foreground = p.bg;
+        c.button_danger_hover = shift(p.bad, danger_step);
+        c.button_danger_active = shift(p.bad, danger_step * 1.5);
     });
 }
 

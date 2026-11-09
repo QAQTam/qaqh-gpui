@@ -117,6 +117,8 @@ impl Render for DaemonStore {
             }
         }
 
+        // 侧栏头部:标题 + 计数 pill,右侧主题/设置幽灵 chip;新建是唯一
+        // 主操作,占满一行的 accent 按钮承担视觉锚点。
         let sidebar = div()
             .w(px(self.workbench.sidebar_width.unwrap_or(260.)))
             .h_full()
@@ -127,110 +129,103 @@ impl Render for DaemonStore {
             .border_color(t.border)
             .child(
                 div()
+                    .px_3()
+                    .pt_3()
+                    .pb_1()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .px_3()
-                    .py_2()
+                    .gap_2()
                     .child(
                         div()
                             .text_xs()
-                            .text_color(t.dim)
-                            .child(format!("会话({})", visible.len())),
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(t.text)
+                            .child("会话"),
                     )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .id("new-session")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(t.btn)
-                                    .text_color(t.dim)
-                                    .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                        daemon.new_session_open = !daemon.new_session_open;
+                            .px_1p5()
+                            .rounded_full()
+                            .text_xs()
+                            .bg(crate::kit::soft(t.faint, 0.14))
+                            .text_color(t.dim)
+                            .child(format!("{}", visible.len())),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        crate::kit::ghost_chip(
+                            "theme-toggle",
+                            mode.label(),
+                            false,
+                            t.dim,
+                            &t,
+                            cx.listener(|_, _, _, cx| {
+                                let next = settings::get(cx).appearance.theme_mode.next();
+                                settings::update(cx, |content| {
+                                    content.appearance.theme_mode = next;
+                                });
+                            }),
+                        ),
+                    )
+                    .child(
+                        crate::kit::ghost_chip(
+                            "open-settings",
+                            "设置",
+                            self.settings_open,
+                            t.dim,
+                            &t,
+                            cx.listener(
+                                |daemon: &mut DaemonStore, _, window: &mut Window, cx| {
+                                    daemon.settings_open = !daemon.settings_open;
+                                    if daemon.settings_open {
+                                        daemon.new_session_open = false;
                                         daemon.settings_form = None;
-                                        if daemon.new_session_open {
-                                            daemon.settings_open = false;
-                                            let _ = daemon
-                                                .requests
-                                                .unbounded_send(BridgeRequest::ListProviders);
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child("新建"),
-                            )
-                            .child(
-                                div()
-                                    .id("theme-toggle")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(t.btn)
-                                    .text_color(t.dim)
-                                    .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        let next = settings::get(cx).appearance.theme_mode.next();
-                                        settings::update(cx, |content| {
-                                            content.appearance.theme_mode = next;
+                                        // 打开时把当前值种进输入框,避免显示漂移;
+                                        // 同时拉取 daemon 侧配置与服务商列表。
+                                        let family = settings::get(cx)
+                                            .typography
+                                            .ui_font_family
+                                            .clone();
+                                        daemon.font_field.update(cx, |field, cx| {
+                                            field.set_value(&family, window, cx)
                                         });
-                                    }))
-                                    .child(mode.label()),
-                            )
-                            .child(
-                                div()
-                                    .id("open-settings")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(if self.settings_open {
-                                        t.accent_bg
+                                        let _ = daemon
+                                            .requests
+                                            .unbounded_send(BridgeRequest::QueryConfig);
+                                        let _ = daemon
+                                            .requests
+                                            .unbounded_send(BridgeRequest::ListProviders);
                                     } else {
-                                        t.btn
-                                    })
-                                    .text_color(if self.settings_open { t.accent } else { t.dim })
-                                    .hover(|style| style.bg(t.btn_hover))
-                                    .on_click(cx.listener(
-                                        |daemon: &mut DaemonStore, _, window: &mut Window, cx| {
-                                            daemon.settings_open = !daemon.settings_open;
-                                            if daemon.settings_open {
-                                                daemon.new_session_open = false;
-                                                daemon.settings_form = None;
-                                                // 打开时把当前值种进输入框,避免显示漂移;
-                                                // 同时拉取 daemon 侧配置与服务商列表。
-                                                let family = settings::get(cx)
-                                                    .typography
-                                                    .ui_font_family
-                                                    .clone();
-                                                daemon.font_field.update(cx, |field, cx| {
-                                                    field.set_value(&family, window, cx)
-                                                });
-                                                let _ = daemon
-                                                    .requests
-                                                    .unbounded_send(BridgeRequest::QueryConfig);
-                                                let _ = daemon
-                                                    .requests
-                                                    .unbounded_send(BridgeRequest::ListProviders);
-                                            } else {
-                                                daemon.settings_form = None;
-                                            }
-                                            cx.notify();
-                                        },
-                                    ))
-                                    .child("设置"),
+                                        daemon.settings_form = None;
+                                    }
+                                    cx.notify();
+                                },
                             ),
+                        ),
                     ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .child(gpui::AnyElement::from(crate::kit::button(
+                        cx,
+                        crate::kit::BtnKind::Primary,
+                        "new-session",
+                        "新建会话",
+                        &t,
+                        cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                            daemon.new_session_open = !daemon.new_session_open;
+                            daemon.settings_form = None;
+                            if daemon.new_session_open {
+                                daemon.settings_open = false;
+                                let _ = daemon
+                                    .requests
+                                    .unbounded_send(BridgeRequest::ListProviders);
+                            }
+                            cx.notify();
+                        }),
+                    ))),
             )
             .child(crate::desktop::sidebar_tools(self, cx, &t))
             .child(
@@ -243,17 +238,7 @@ impl Render for DaemonStore {
                     .flex_col()
                     .children(rows),
             )
-            .child(crate::desktop::connection(self, cx, &t))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(t.border)
-                    .text_xs()
-                    .text_color(t.dim)
-                    .child(self.lines.last().cloned().unwrap_or_default()),
-            );
+            .child(crate::desktop::connection(self, cx, &t));
 
         let main = if self.new_session_open {
             new_session_panel(self, cx)

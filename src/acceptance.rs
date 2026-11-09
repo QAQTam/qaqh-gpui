@@ -47,6 +47,14 @@ enum Action {
     Settings,
     Workspaces,
     Welcome,
+    /// 视觉验收专用:打开设置的服务商与模型页签。
+    Catalog,
+    /// 视觉验收专用:打开新建会话面板。
+    NewSession,
+    /// 视觉验收专用:打开本机偏好页签。
+    LocalSettings,
+    /// 视觉验收专用:按 settings 的 theme_mode 顺序切换(跟随系统→亮→暗)。
+    ToggleTheme,
 }
 
 pub fn poll(
@@ -79,8 +87,34 @@ pub fn poll(
                         daemon.settings_open = true;
                         daemon.new_session_open = false;
                     }
+                    Action::Catalog => {
+                        daemon.settings_open = true;
+                        daemon.new_session_open = false;
+                        daemon.settings_editor = crate::store::SettingsEditor::Catalog;
+                        daemon.settings_form = None;
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                    }
+                    Action::NewSession => {
+                        daemon.new_session_open = true;
+                        daemon.settings_open = false;
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                    }
+                    Action::LocalSettings => {
+                        daemon.settings_open = true;
+                        daemon.new_session_open = false;
+                        daemon.settings_editor = crate::store::SettingsEditor::Local;
+                        daemon.settings_form = None;
+                    }
+                    Action::ToggleTheme => {
+                        let next = crate::settings::get(cx).appearance.theme_mode.next();
+                        crate::settings::update(cx, |content| {
+                            content.appearance.theme_mode = next;
+                        });
+                    }
                     Action::Workspaces => {
                         daemon.settings_open = true;
+                        daemon.new_session_open = false;
                         daemon.settings_editor = crate::store::SettingsEditor::Workspaces;
                     }
                     Action::Welcome => {

@@ -16,6 +16,7 @@ mod sidebar;
 mod diagnostics;
 mod workbench;
 mod highlight;
+mod kit;
 mod markdown;
 mod media;
 mod reducer;
@@ -29,7 +30,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => app::launch(),
-        [flag] if flag == "--version" => println!("qaqh-gpui {} ({}){}", env!("CARGO_PKG_VERSION"), env!("QAQH_BUILD_REVISION"), if cfg!(feature = "acceptance") { " [acceptance]" } else { "" }),
+        [flag] if flag == "--version" => println!("qaqh-gpui {} ({}){}", env!("QAQH_VERSION"), env!("QAQH_BUILD_REVISION"), if cfg!(feature = "acceptance") { " [acceptance]" } else { "" }),
         [flag] if flag == "--diagnostics" => println!("{}", diagnostics::report()),
         [flag] if flag == "--probe" => bridge::probe(),
         [flag] if flag == "--help" => println!("QAQHarness native desktop client\n\nqaqh-gpui                Open the desktop window\nqaqh-gpui --probe        Check daemon connectivity\nqaqh-gpui --diagnostics  Export redacted diagnostics\nqaqh-gpui --version      Show build information"),
