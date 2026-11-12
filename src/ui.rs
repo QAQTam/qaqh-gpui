@@ -33,6 +33,8 @@ use gpui_component::input::{Input, Textarea};
 use gpui_component::{Sizable, Size, WindowExt};
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
+use qaqh_ringing_contract::fact::ActorKind;
+use qaqh_ringing_contract::fact::InputPurpose;
 use qaqh_ringing_contract::fact::ContentValue;
 use qaqh_ringing_contract::fact::InteractionKind;
 use qaqh_ringing_contract::fact::ToolCallId;
@@ -41,7 +43,6 @@ use qaqh_ringing_contract::state::TimelineEntry;
 use qaqh_ringing_contract::state::ToolCallState;
 use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_types::ToolCallOutcome;
-use qaqh_client::SessionSettingsPatch;
 use qaqh_config_api::ConfigPatch;
 
 use crate::ask;
@@ -50,7 +51,7 @@ use crate::settings;
 use crate::settings::Density;
 use crate::store::DaemonStore;
 use crate::store::SessionRow;
-use crate::store::{SessionStore, SettingsEditor};
+use crate::store::{ArgStream, SessionStore, SettingsEditor};
 use crate::store::StreamState;
 use crate::theme::ActiveTheme;
 use crate::theme::Palette;
@@ -158,9 +159,12 @@ fn stream_badge(state: &StreamState, t: &Palette) -> Div {
 
 /// 侧栏条目:选中 = accent 左边条 + selected 底色(借鉴 zed project_panel
 /// 的「背景 + 侧边状态边」模式,不搞圆角高亮)。
+/// `tone` = 当前加载会话最近回合的权威终态:Some(成功?)覆盖 run-status 点
+/// (electron 六态点的「终态绿/红」维度);未加载会话 None。
 pub(crate) fn sidebar_row(
     row: &SessionRow,
     selected: bool,
+    tone: Option<bool>,
     t: &Palette,
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
@@ -188,7 +192,11 @@ pub(crate) fn sidebar_row(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(status_dot(&row.status, t))
+                .child(match tone {
+                    Some(true) => status_dot_colored("完成", t.ok, t),
+                    Some(false) => status_dot_colored("失败", t.bad, t),
+                    None => status_dot(&row.status, t),
+                })
         .child(
             div()
                 .text_sm()
@@ -199,8 +207,19 @@ pub(crate) fn sidebar_row(
         .child(div().text_xs().text_color(t.dim).child(row.updated_at.clone()))
 }
 
+/// 定色状态点(终态绿/红维度专用)。
+fn status_dot_colored(label: &str, color: Hsla, _t: &Palette) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(div().size_1p5().rounded_full().bg(color))
+        .child(div().text_xs().text_color(color).child(SharedString::from(label.to_owned())))
+}
 
-/// 右栏任务 dock:当前会话的 todo 快照。无数据/无任务时不渲染,不占正文宽度。
+
+/// 右栏任务 dock:站台发车看板(Codex portalLayout 口径)——hero「正在服务」
+/// 带完成计数,单行条目 + 状态 LED 词 + 路线色带。无数据/无任务时不渲染。
 pub(crate) fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) -> Option<Div> {
     let t = *cx.colors();
     let seed = daemon
@@ -217,7 +236,105 @@ pub(crate) fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>)
     if items.is_empty() {
         return None;
     }
-    let mut dock = div()
+    let done = items.iter().filter(|item| item.status == "completed").count();
+    let serving = items.iter().filter(|item| item.status == "in_progress").count();
+    let dock = div()
+        .w(px(260.))
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(t.panel)
+        .border_l_1()
+        .border_color(t.border)
+        // hero:现在开行的任务(进行中计数),发车看板的站牌位。
+        .child(
+            div()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(t.border)
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.accent)
+                        .child(if serving > 0 { "正在服务" } else { "任务" }),
+                )
+                .child(
+                    div()
+                        .px_1p5()
+                        .rounded_full()
+                        .text_xs()
+                        .bg(crate::kit::soft(t.faint, 0.14))
+                        .text_color(t.dim)
+                        .child(SharedString::from(format!("{done}/{}", items.len()))),
+                ),
+        );
+    let mut list = div()
+        .id("todo-list")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col();
+    for item in items {
+        let (led, color) = match item.status.as_str() {
+            "in_progress" => ("进行中", t.accent),
+            "completed" => ("已完成", t.ok),
+            "cancelled" => ("已取消", t.bad),
+            _ => ("待处理", t.dim),
+        };
+        let settled = item.status == "completed" || item.status == "cancelled";
+        list = list.child(
+            // 单行条目:左侧路线色带 + 标题截断 + 右侧 LED 词。
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2p5()
+                .py_1p5()
+                .border_l_2()
+                .border_color(color)
+                .child(
+                    div()
+                        .text_sm()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if settled { t.dim } else { t.text })
+                        .child(item.title.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .flex_shrink_0()
+                        .text_color(color)
+                        .child(SharedString::from(led)),
+                ),
+        );
+    }
+    Some(dock.child(list))
+}
+
+/// 右栏团队 dock(ADR-0014):当前会话任务板的单行 LED 条目。
+/// 花名册不渲染(粗投影,精确状态在 session.list);任务板为空/快照不属于
+/// 当前会话时不渲染。依赖数与认领代纪按施工单 §一·1 口径展示。
+pub(crate) fn team_dock(daemon: &DaemonStore, cx: &Context<DaemonStore>) -> Option<Div> {
+    let t = *cx.colors();
+    let current_seed = daemon
+        .current
+        .as_ref()
+        .map(|current| current.read(cx).session_id.clone());
+    let (seed, response) = daemon.team.as_ref()?;
+    if current_seed.as_deref() != Some(seed.as_str()) || response.tasks.tasks.is_empty() {
+        return None;
+    }
+    let tasks = &response.tasks.tasks;
+    let done = tasks.iter().filter(|task| matches!(task.state, qaqh_ringing_contract::team::task_types::TaskState::Completed | qaqh_ringing_contract::team::task_types::TaskState::Closed)).count();
+    let dock = div()
         .w(px(260.))
         .h_full()
         .flex()
@@ -229,54 +346,90 @@ pub(crate) fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>)
             div()
                 .px_3()
                 .py_2()
-                .text_xs()
-                .text_color(t.dim)
                 .border_b_1()
                 .border_color(t.border)
-                .child("任务"),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.accent)
+                        .child("任务板"),
+                )
+                .child(
+                    div()
+                        .px_1p5()
+                        .rounded_full()
+                        .text_xs()
+                        .bg(crate::kit::soft(t.faint, 0.14))
+                        .text_color(t.dim)
+                        .child(SharedString::from(format!("{done}/{}", tasks.len()))),
+                ),
         );
-    let done = items
-        .iter()
-        .filter(|item| item.status == "completed")
-        .count();
-    dock = dock.child(
-        div()
-            .px_3()
-            .py_1()
-            .text_xs()
-            .text_color(t.ok)
-            .child(SharedString::from(format!("{done}/{} 完成", items.len()))),
-    );
     let mut list = div()
-        .id("todo-list")
+        .id("team-list")
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
         .flex()
         .flex_col();
-    for item in items {
-        let (mark, color) = match item.status.as_str() {
-            "in_progress" => ("◐", t.accent),
-            "completed" => ("●", t.ok),
-            "cancelled" => ("✕", t.bad),
-            _ => ("○", t.dim),
+    for task in tasks {
+        use qaqh_ringing_contract::team::task_types::TaskState;
+        let (led, color) = match task.state {
+            TaskState::Open => ("待认领", t.dim),
+            TaskState::Claimed => ("进行中", t.accent),
+            TaskState::Completed | TaskState::Closed => ("已完结", t.ok),
+            TaskState::Cancelled => ("已取消", t.bad),
         };
+        let owner = task
+            .owner
+            .as_ref()
+            .map(|actor| actor.agent_path.as_str().split('/').next_back().unwrap_or("root").to_owned())
+            .unwrap_or_else(|| "未认领".into());
+        let mut meta = format!("{owner} · epoch {}", task.claim_epoch);
+        if !task.depends_on.is_empty() {
+            meta.push_str(&format!(" · 依赖 {}", task.depends_on.len()));
+        }
         list = list.child(
+            // 条目 = 两行列:标题 + LED,下面 owner/epoch/依赖注记;路线色带挂左缘。
             div()
-                .px_3()
-                .py_1p5()
                 .flex()
-                .gap_2()
-                .child(div().text_sm().text_color(color).child(mark))
+                .flex_col()
+                .border_l_2()
+                .border_color(color)
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(if item.status == "completed" || item.status == "cancelled" {
-                            t.dim
-                        } else {
-                            t.text
-                        })
-                        .child(item.title.clone()),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2p5()
+                        .py_1p5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(t.text)
+                                .child(task.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .flex_shrink_0()
+                                .text_color(color)
+                                .child(SharedString::from(led)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .px_2p5()
+                        .pb_1()
+                        .text_color(t.faint)
+                        .child(SharedString::from(meta)),
                 ),
         );
     }
@@ -831,7 +984,7 @@ pub(crate) fn new_session_panel(
                                     div().flex().gap_2().items_center()
                                         .child(daemon.new_model.as_ref().map(|model| {
                                             format!("{} / {}", model.provider_id, model.model_id)
-                                        }).unwrap_or_else(|| "没有可用模型".into()))
+                                        }).unwrap_or_else(|| "跟随全局默认".into()))
                                         .child(step_button("ns-model", "选择", &t,
                                             cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
                                                 crate::settings_ui::choose_new_model(daemon, cx);
@@ -855,33 +1008,20 @@ pub(crate) fn new_session_panel(
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(t.warn)
-                                        .when(daemon.new_model.is_some(), |hint| hint.invisible())
-                                        .child("缺少可用模型:先在「设置 → 服务商与模型」添加并启用"),
+                                        .text_color(t.faint)
+                                        .child("不选模型 = 跟随全局默认;可在设置页修改默认模型"),
                                 )
-                                .child(if daemon.new_model.is_some() || daemon.creating_session {
-                                    gpui::AnyElement::from(crate::kit::button(
-                                        cx,
-                                        crate::kit::BtnKind::Primary,
-                                        "create-session",
-                                        if daemon.creating_session { "创建中…" } else { "创建会话" },
-                                        &t,
-                                        cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                                            daemon.create_session();
-                                            cx.notify();
-                                        }),
-                                    ))
-                                } else {
-                                    // 无模型可用:禁用态用 Ghost 弱化,而不是误导性的实底主按钮。
-                                    gpui::AnyElement::from(crate::kit::button(
-                                        cx,
-                                        crate::kit::BtnKind::Ghost,
-                                        "create-session",
-                                        "缺少模型",
-                                        &t,
-                                        cx.listener(|_: &mut DaemonStore, _, _, _| {}),
-                                    ))
-                                }),
+                                .child(gpui::AnyElement::from(crate::kit::button(
+                                    cx,
+                                    crate::kit::BtnKind::Primary,
+                                    "create-session",
+                                    if daemon.creating_session { "创建中…" } else { "创建会话" },
+                                    &t,
+                                    cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                                        daemon.create_session();
+                                        cx.notify();
+                                    }),
+                                ))),
                         ),
                 ),
         )
@@ -1026,6 +1166,28 @@ fn tool_summary(name: &str, state: &ToolCallState) -> Option<&'static str> {
         "delete" => ("正在删除文件", "已删除文件"),
         "search" => ("正在搜索网页", "已搜索网页"),
         "web_fetch" => ("正在读取网页", "已读取网页"),
+        // 子代理/团队协作面(ADR-0014)。
+        "spawn_subagent" => ("正在派生子代理", "已派生子代理"),
+        "send_message" => ("正在发送代理消息", "已发送代理消息"),
+        "wait_agent" => ("正在等待子代理", "子代理已返回"),
+        "list_agents" => ("正在查看代理列表", "已查看代理列表"),
+        "interrupt_agent" => ("正在打断子代理", "已打断子代理"),
+        // 任务板(electron v3.1a 施工单 §二)。
+        "task_create" => ("正在创建任务", "已创建任务"),
+        "task_claim" => ("正在认领任务", "已更新认领"),
+        "task_update" => ("正在更新任务", "已更新任务"),
+        "task_close" => ("正在关闭任务", "已关闭任务"),
+        "task_list" => ("正在列出任务", "已列出任务"),
+        // 留言板。
+        "board_channel_create" => ("正在创建频道", "已创建频道"),
+        "board_thread_create" => ("正在创建话题", "已创建话题"),
+        "board_post" => ("正在留言", "已留言"),
+        "board_subscribe" => ("正在更新订阅", "已更新订阅"),
+        "board_list" => ("正在查看留言板", "已查看留言板"),
+        // Goal(ADR-0015)。
+        "create_goal" => ("正在设定目标", "已设定目标"),
+        "update_goal" => ("正在更新目标", "已更新目标"),
+        "get_goal" => ("正在读取目标", "已读取目标"),
         _ => return None,
     };
     match state {
@@ -1037,7 +1199,7 @@ fn tool_summary(name: &str, state: &ToolCallState) -> Option<&'static str> {
 }
 
 fn tool_status_only(name: &str) -> bool {
-    matches!(name, "ask" | "todo_write" | "todo_update" | "todo_list")
+    matches!(name, "ask" | "todo_write" | "todo_update" | "todo_list" | "task_list" | "board_list" | "list_agents" | "get_goal")
 }
 
 fn tool_status_line(title: String, t: &Palette) -> Div {
@@ -1078,6 +1240,17 @@ fn tool_toggle(
         })
 }
 
+/// spawn_subagent 的 fork 徽标后缀:mode:"fork" = 上下文继承,标注「继承历史」。
+/// 只认声明后的完整 args;参数未定形时不猜。
+fn fork_suffix(name: &str, args: Option<&serde_json::Value>) -> &'static str {
+    let is_fork = name == "spawn_subagent"
+        && args
+            .and_then(|args| args.get("mode"))
+            .and_then(|mode| mode.as_str())
+            == Some("fork");
+    if is_fork { " · 继承历史" } else { "" }
+}
+
 fn tool_card(
     cx: &gpui::App,
     store: &SessionStore,
@@ -1101,13 +1274,14 @@ fn tool_card(
     } else {
         (state_label(&tool.state), state_color(&tool.state, t))
     };
+    let fork_suffix = fork_suffix(name, tool.args.as_ref());
     let title = if let Some(command) = command {
         let command = command.replace(['\r', '\n'], " ");
         format!("{name}  $ {command}  ·  {status}")
     } else if let Some(summary) = tool_summary(name, &tool.state) {
-        summary.to_owned()
+        format!("{summary}{fork_suffix}")
     } else {
-        format!("{name}  ·  {status}")
+        format!("{name}  ·  {status}{fork_suffix}")
     };
     if tool_status_only(name) {
         return tool_status_line(title, t);
@@ -1229,7 +1403,47 @@ fn tool_card(
                 .child(action_button(cx, format!("exec-term-{id}"), "终止", t.bad, control(true), t)),
         );
     }
+    if let Some((summary, doc)) = handoff_fork_payload(tool) {
+        // 封箱成功 → 回合尾部入口(electron HandoffCard 同位):新会话继续交接。
+        let entity = entity.downgrade();
+        card = card.child(
+            div().flex().gap_2().child(action_button(
+                cx,
+                "handoff-fork".into(),
+                "继续这条交接 →",
+                t.accent,
+                move |_, _, cx: &mut gpui::App| {
+                    let _ = entity.update(cx, |store, _| store.fork_handoff(summary.clone(), doc.clone()));
+                },
+                t,
+            )),
+        );
+    }
     assemble(card, status_color, t)
+}
+
+/// handoff 工具的 fork 事实:(work_summary, handoff_doc)。
+/// 判据同 electron:tool_name == "handoff" 且封箱成功;文档取 args(模型亲手写的那份)。
+/// args 缺文档时不给按钮——不猜 output 里的自由文本。
+fn handoff_fork_payload(tool: &ToolCallView) -> Option<(Option<String>, String)> {
+    if tool.tool_name.as_deref() != Some("handoff") {
+        return None;
+    }
+    let success = matches!(&tool.state, ToolCallState::Finished { outcome } if outcome.is_success());
+    if !success {
+        return None;
+    }
+    let args = tool.args.as_ref()?;
+    let doc = args.get("handoff_doc")?.as_str()?.to_string();
+    if doc.trim().is_empty() {
+        return None;
+    }
+    let summary = args
+        .get("work_summary")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty());
+    Some((summary, doc))
 }
 
 fn has_assistant_text(kind: AssistantBlockKind, text: &str) -> bool {
@@ -1280,6 +1494,72 @@ fn assistant_section(
         .children(live.then(|| div().text_xs().text_color(t.dim).child("▍")))
 }
 
+/// 通知行:左侧色点 + 标签 + 正文(系统陈述/排队/插话共用,非聊天气泡)。
+fn notice_line(label: &str, text: &str, color: Hsla, t: &Palette) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_1p5()
+        .rounded(px(crate::kit::RADIUS_CARD))
+        .bg(t.card)
+        .border_1()
+        .border_color(t.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .text_color(color)
+                .child(div().size_1p5().rounded_full().bg(color))
+                .child(SharedString::from(label.to_owned())),
+        )
+        .child(div().text_sm().text_color(t.text).child(SharedString::from(text.to_owned())))
+}
+
+/// 子代理终态通知卡:按 terminal 着色的系统卡,正文是 runtime 摘要。
+fn terminal_notice(
+    terminal: &qaqh_ringing_contract::commands::SubagentTerminalNotification,
+    text: &str,
+    t: &Palette,
+) -> Div {
+    use qaqh_ringing_contract::commands::SubagentTerminalKind;
+    let (label, color) = match terminal.terminal {
+        SubagentTerminalKind::Completed => ("子代理已完成", t.ok),
+        SubagentTerminalKind::Failed => ("子代理失败", t.bad),
+        SubagentTerminalKind::Cancelled => ("子代理已取消", t.dim),
+        SubagentTerminalKind::TimedOut => ("子代理超时", t.warn),
+    };
+    let mut title = format!("{label} · {}", terminal.child_session_id);
+    if !terminal.parent_call_id.is_empty() {
+        title.push_str(&format!("(调用 {})", terminal.parent_call_id));
+    }
+    notice_line(&title, text, color, t)
+}
+
+/// 封口块的用量注记:tok 数 + 权威产出速率(completion_tokens / generated_ms,
+/// 内核实测区间为分母;缺 generated_ms 时不给速率,不用到货时间编造)。
+fn usage_note(
+    usage: Option<&qaqh_types::UsageInfo>,
+    generated_ms: Option<u64>,
+    t: &Palette,
+) -> Option<Div> {
+    let usage = usage?;
+    let mut note = format!("{} tok", usage.completion_tokens);
+    if let Some(ms) = generated_ms.filter(|ms| *ms >= 500) {
+        let rate = usage.completion_tokens as f64 / (ms as f64 / 1000.0);
+        note.push_str(&format!(" · {rate:.1} tok/s"));
+    }
+    Some(
+        div()
+            .text_xs()
+            .text_color(t.faint)
+            .child(SharedString::from(note)),
+    )
+}
+
 fn timeline_entry(
     cx: &gpui::App,
     store: &SessionStore,
@@ -1291,13 +1571,57 @@ fn timeline_entry(
     tail_max: usize,
 ) -> Option<AnyElement> {
     Some(match entry {
-        TimelineEntry::Input { content, images, attachments, .. } => div()
-            .child(user_bubble(content_text(content), t))
-            .child(div().flex().flex_wrap().gap_2().children(images.iter().map(crate::media::preview)))
-            .children((!attachments.is_empty()).then(|| div().text_xs().child(format!("{} 个文本附件", attachments.len()))))
-            .into_any_element(),
-        TimelineEntry::AssistantBlock { block_kind, content, .. } => {
-            assistant_section(block_kind, content_text(content), false, index * 2, store, entity, t, ty)
+        TimelineEntry::Input {
+            content,
+            images,
+            attachments,
+            inter_agent,
+            subagent_terminal,
+            actor,
+            purpose,
+            ..
+        } => {
+            let text = content_text(content);
+            if let Some(terminal) = subagent_terminal {
+                // 终态通知是运行时陈述,不是子代理说的话:系统卡,不渲染成气泡。
+                terminal_notice(terminal, &text, t).into_any_element()
+            } else if actor.kind == ActorKind::System && text.starts_with("<qaqh_goal_continuation") {
+                notice_line("目标续跑", &text, t.warn, t).into_any_element()
+            } else if let Some(envelope) = inter_agent {
+                notice_line(
+                    &format!("跨代理消息 · 来自 {}", envelope.author),
+                    &text,
+                    t.accent,
+                    t,
+                )
+                .into_any_element()
+            } else if actor.kind != ActorKind::User {
+                let label = match actor.kind {
+                    ActorKind::System => "系统插话",
+                    ActorKind::Api => "API 插话",
+                    ActorKind::Agent => "代理消息",
+                    ActorKind::Subagent => "子代理消息",
+                    ActorKind::User => unreachable!("handled above"),
+                };
+                notice_line(label, &text, t.dim, t).into_any_element()
+            } else {
+                let mut row = match purpose {
+                    InputPurpose::TriggerTurn => div().child(user_bubble(&text, t)),
+                    InputPurpose::QueueOnly => notice_line("排队消息", &text, t.dim, t),
+                    InputPurpose::Steer => notice_line("运行中转向", &text, t.warn, t),
+                    InputPurpose::Interject => notice_line("运行中插话", &text, t.warn, t),
+                };
+                row = row
+                    .child(div().flex().flex_wrap().gap_2().children(images.iter().map(crate::media::preview)))
+                    .children((!attachments.is_empty()).then(|| div().text_xs().child(format!("{} 个文本附件", attachments.len()))));
+                row.into_any_element()
+            }
+        }
+        TimelineEntry::AssistantBlock { block_kind, content, usage, generated_ms, .. } => {
+            let section = assistant_section(block_kind, content_text(content), false, index * 2, store, entity, t, ty);
+            div()
+                .child(section)
+                .children(usage_note(usage.as_ref(), *generated_ms, t))
                 .into_any_element()
         }
         TimelineEntry::ToolCall { call_id, .. } => {
@@ -1676,6 +2000,16 @@ impl Render for SessionStore {
                         .child(title),
                 )
                 .child(stream_badge(&self.stream, &t))
+                .children(self.goal.clone().map(|goal| {
+                    crate::goal::goal_badge(&goal, cx, &t).into_any_element()
+                }))
+                .children((self.activity == Some(ActivityState::Running))
+                    .then(|| self.tok_rate())
+                    .flatten()
+                    .map(|rate| {
+                        crate::kit::pill(&format!("≈ {:.0} tok/s", rate.max(1.)), t.accent, &t)
+                            .into_any_element()
+                    }))
                 .child(
                     div()
                         .id("model-chip")
@@ -1757,17 +2091,6 @@ impl Render for SessionStore {
                             .map(|s| s.meta.tool_mode.as_str()).filter(|mode| !mode.is_empty())
                             .unwrap_or(qaqh_types::STANDARD))),
                 )
-                .child(action_button(cx, 
-                    "session-mode".into(),
-                    if self.settings.as_ref().is_some_and(|s| s.meta.mode == 1) { "Plan" } else { "Code" },
-                    t.dim,
-                    cx.listener(|store: &mut SessionStore, _, _, cx| {
-                        let mode = if store.settings.as_ref().is_some_and(|s| s.meta.mode == 1) { "code" } else { "plan" };
-                        store.patch_settings(SessionSettingsPatch { mode: Some(mode.into()), ..Default::default() });
-                        cx.notify();
-                    }),
-                    &t,
-                ))
                 .child(
                     div()
                         .id("detach-chip")
@@ -1898,15 +2221,28 @@ impl Render for SessionStore {
                                 .into_any_element()
                         }),
                 )
-                .children(store.arg_stream.iter().map(|(call_id, name, text)| {
-                    if tool_status_only(name) {
-                        let title = tool_summary(name, &ToolCallState::Declared)
-                            .map_or_else(|| format!("正在准备 {name}"), str::to_owned);
+                .children(store.arg_stream.iter().map(|stream| {
+                    let ArgStream { call_id, tool_name, text, lines, target_files, args_complete } = stream;
+                    if tool_status_only(tool_name) {
+                        let title = tool_summary(tool_name, &ToolCallState::Declared)
+                            .map_or_else(|| format!("正在准备 {tool_name}"), str::to_owned);
                         return tool_status_line(title, &t).into_any_element();
+                    }
+                    // 流式参数行:标题带进度注记(行数估算/目标文件/参数完整),
+                    // 与 electron 的 ToolArgumentsDelta 注记同口径。
+                    let mut title = format!("正在准备 {tool_name}");
+                    if let Some((added, removed)) = lines {
+                        title.push_str(&format!("  +{added} −{removed}"));
+                    }
+                    if !target_files.is_empty() {
+                        title.push_str(&format!("  · {}", target_files.join(", ")));
+                    }
+                    if *args_complete {
+                        title.push_str("  · 参数已完整");
                     }
                     let expanded = store.expanded_tools.contains(call_id);
                     div()
-                        .child(tool_toggle(&entity, call_id, expanded, format!("正在准备 {name}"), &t))
+                        .child(tool_toggle(&entity, call_id, expanded, title, &t))
                         .children(expanded.then(|| {
                             div().px_2().text_xs().text_color(t.dim)
                                 .child(SharedString::from(text.clone()))
@@ -1946,6 +2282,19 @@ impl Render for SessionStore {
         .max_w(px(ty.content_width + 24.))
         .mx_auto()
         .p_3();
+
+        // 消息浮面(Codex MainContentSurface 口径):圆角 16 的浮层托住时间线,
+        // 与四周留 8px 呼吸边;面板色比 bg 提一级,不再通铺到底。
+        let timeline = div()
+            .flex_1()
+            .min_h_0()
+            .mx_2()
+            .mt_2()
+            .rounded(px(16.))
+            .bg(t.panel)
+            .border_1()
+            .border_color(t.border)
+            .child(timeline);
 
         // composer:组件库 Textarea(auto_grow,Enter 提交);受阻原因降为
         // 输入框下方常驻提示行(占位符固定为输入引导)。
@@ -2017,35 +2366,6 @@ impl Render for SessionStore {
                             action_button(cx, format!("{uid}-trust"), "始终允许", t.ok, trust, &t)
                                 .into_any_element(),
                             action_button(cx, format!("{uid}-deny"), "拒绝", t.bad, deny, &t)
-                                .into_any_element(),
-                        ],
-                        Vec::new(),
-                        &t,
-                    ));
-                }
-                InteractionKind::Plan => {
-                    let iid = interaction.interaction_id.0.clone();
-                    let approve = cx.listener(
-                        move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                            store.respond_plan(iid.clone(), true);
-                            cx.notify();
-                        },
-                    );
-                    let iid = interaction.interaction_id.0.clone();
-                    let reject = cx.listener(
-                        move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                            store.respond_plan(iid.clone(), false);
-                            cx.notify();
-                        },
-                    );
-                    let uid = interaction.interaction_id.0.clone();
-                    footer = footer.child(interaction_card(
-                        "计划评审",
-                        content_text(&interaction.request),
-                        vec![
-                            action_button(cx, format!("{uid}-approve"), "批准", t.ok, approve, &t)
-                                .into_any_element(),
-                            action_button(cx, format!("{uid}-reject"), "拒绝", t.bad, reject, &t)
                                 .into_any_element(),
                         ],
                         Vec::new(),

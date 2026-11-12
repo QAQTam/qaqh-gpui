@@ -68,6 +68,8 @@ gpui-component = "=0.9.0"
 gpui-kit-assets = "0.9.0"
 # RingingV2 传输权威实现(与 qaqh-tui 同路:跨仓 path 依赖,后端仓必须与该相对路径共存)。
 # 协议类型经它转出,前端零自建、零转换层。
+# 【复线 2026-11-13】后端 main f1b5fc78 已含 ADR-0014 A–G,工作区叠加 ADR-0015 goal
+# 面与 widget_context;协议重新对齐,退役 ../qaqh-backend-snap 快照(目录已不存在)。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
 # 契约类型直用(store 字段直接持有 TimelineEntry/ToolCallView 等),非转换层。
 qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }

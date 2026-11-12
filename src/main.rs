@@ -12,6 +12,7 @@ mod code_panel;
 mod delivery;
 mod desktop;
 mod content;
+mod goal;
 mod sidebar;
 mod diagnostics;
 mod workbench;

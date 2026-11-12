@@ -124,7 +124,9 @@ impl Palette {
             warn_bg: rgb(0x2a2214).into(),
             btn: rgb(0x1d242e).into(),
             btn_hover: rgb(0x273040).into(),
-            code_bg: rgb(0x161b23).into(),
+            // code veil(Codex --codex-row-hover 口径):前景色低透明叠层,
+            // 色调随环境继承,不再是一块打穿面板的灰色板子。
+            code_bg: Hsla { a: 0.07, ..rgb(0xd6dce5).into() },
             syn_keyword: rgb(0xc678dd).into(),
             syn_string: rgb(0x98c379).into(),
             syn_number: rgb(0xd19a66).into(),
@@ -155,7 +157,8 @@ impl Palette {
             warn_bg: rgb(0xfcf3dd).into(),
             btn: rgb(0xececf0).into(),
             btn_hover: rgb(0xe1e2e7).into(),
-            code_bg: rgb(0xf3f4f6).into(),
+            // code veil:同暗色口径,前景低透明,亮色下取更高 alpha 保对比。
+            code_bg: Hsla { a: 0.09, ..rgb(0x2b2e34).into() },
             syn_keyword: rgb(0xa626a4).into(),
             syn_string: rgb(0x50a14f).into(),
             syn_number: rgb(0x986801).into(),

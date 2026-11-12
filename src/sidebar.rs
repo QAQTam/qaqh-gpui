@@ -1,4 +1,4 @@
-use crate::ui::{new_session_panel, settings_page, sidebar_row, todo_dock};
+use crate::ui::{new_session_panel, settings_page, sidebar_row, team_dock, todo_dock};
 use crate::{
     bridge::BridgeRequest,
     settings,
@@ -57,6 +57,31 @@ impl Render for DaemonStore {
                     }))
                     .child("移入")
             });
+            // hover 显现「新建」:per-workspace 新建入口,面板预选该工作区
+            // (electron eb3f31c 同语义)。
+            let new_in = group_id.as_ref().map(|workspace_id| {
+                let workspace_id = workspace_id.clone();
+                div()
+                    .id(SharedString::from(format!("new-in-{key}")))
+                    .px_1()
+                    .text_xs()
+                    .text_color(t.accent)
+                    .cursor_pointer()
+                    .opacity(0.0)
+                    .group_hover("grp", |style| style.opacity(1.0))
+                    .on_click(cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(index) = daemon.workspaces.iter().position(|entry| entry.id == workspace_id) {
+                            daemon.new_workspace = index;
+                        }
+                        daemon.new_session_open = true;
+                        daemon.settings_open = false;
+                        daemon.settings_form = None;
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                        cx.notify();
+                    }))
+                    .child("新建")
+            });
             // 分组头:可折叠 disclosure(借鉴 zed Disclosure chevron 模式)+
             // hover 显现「移入」(把当前会话移进该分组,electron move_session 同语义)。
             rows.push(
@@ -99,6 +124,7 @@ impl Render for DaemonStore {
                             ))),
                     )
                     .children(move_in)
+                    .children(new_in)
                     .into_any_element(),
             );
             if collapsed {
@@ -113,7 +139,14 @@ impl Render for DaemonStore {
                 let listener = cx.listener(move |daemon: &mut DaemonStore, _event, window, cx| {
                     daemon.select(id.clone(), window, cx);
                 });
-                rows.push(sidebar_row(row, selected, &t, listener).into_any_element());
+                // 终态绿/红点只对当前加载会话可用(权威回合结果就在它手里);
+                // 其余会话保持 run-status 点,不猜。
+                let tone = if selected {
+                    self.current.as_ref().and_then(|current| current.read(cx).last_turn_tone())
+                } else {
+                    None
+                };
+                rows.push(sidebar_row(row, selected, tone, &t, listener).into_any_element());
             }
         }
 
@@ -251,7 +284,8 @@ impl Render for DaemonStore {
                     .min_w_0()
                     .flex()
                     .child(session)
-                    .children(todo_dock(self, cx)),
+                    .children(todo_dock(self, cx))
+                    .children(team_dock(self, cx)),
                 None => crate::desktop::welcome(self, cx, &t),
             }
         };

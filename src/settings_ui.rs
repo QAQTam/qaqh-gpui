@@ -6,7 +6,7 @@ use gpui_component::Sizable;
 use qaqh_client::{
     ProviderUpsertDto, RingingCommand, SecretWrite, SessionSettingsPatch, ToolsSettingPatch,
 };
-use qaqh_config_api::{ConfigPatch, ExecPatch, SandboxPatch, SubagentPatch};
+use qaqh_config_api::{ConfigPatch, ExecPatch, GoalsPatch, SandboxPatch, SubagentPatch};
 use qaqh_profile::{ModelDef, ProfilesDocument, ProviderDef};
 use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
@@ -691,16 +691,6 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
         .child(toggle_config(
             cx,
             t,
-            "内容过滤",
-            config.compliance_enabled,
-            |enabled| ConfigPatch {
-                compliance_enabled: Some(enabled),
-                ..Default::default()
-            },
-        ))
-        .child(toggle_config(
-            cx,
-            t,
             "全局工具白名单",
             config.tool_allowlist_enabled,
             |enabled| ConfigPatch {
@@ -767,24 +757,6 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
     }
     body = body
         .child(subagent!(
-            "默认模型",
-            model,
-            &config.subagent.model,
-            |f: &Field, cx| Ok::<_, String>(f.value(cx))
-        ))
-        .child(subagent!(
-            "端点 URL",
-            base_url,
-            &config.subagent.base_url,
-            |f: &Field, cx| Ok::<_, String>(f.value(cx))
-        ))
-        .child(subagent!(
-            "输出 Token 上限",
-            max_tokens,
-            config.subagent.max_tokens,
-            Field::number
-        ))
-        .child(subagent!(
             "超时（秒）",
             timeout_secs,
             config.subagent.timeout_secs,
@@ -814,34 +786,48 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
             config.subagent.default_tools.join(", "),
             |f: &Field, cx| Ok::<_, String>(list(&f.value(cx)))
         ))
-        .child(setting_row(
-            "子代理 API 密钥",
-            if config.subagent.api_key_set {
-                "已配置"
-            } else {
-                "未配置"
-            },
-            button(cx, t, "subagent-key", "更换", |daemon, window, cx| {
-                let fields = vec![Field::secret("api_key", "新 API 密钥", window, cx)];
-                begin(
-                    daemon,
-                    "更换子代理 API 密钥",
-                    fields,
-                    |fields, daemon, cx| {
-                        save(
-                            daemon,
-                            ConfigPatch {
-                                subagent: Some(SubagentPatch {
-                                    api_key: Some(fields[0].required(cx)?),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                        )
-                    },
-                );
-            }),
+        .child(section_header("目标模式", t))
+        .child(toggle_config(
+            cx,
             t,
+            "启用 Goal 模式",
+            config.goals.enabled,
+            |enabled| ConfigPatch {
+                goals: Some(GoalsPatch {
+                    enabled: Some(enabled),
+                    max_token_budget: None,
+                }),
+                ..Default::default()
+            },
+        ))
+        .child(edit_config(
+            cx,
+            t,
+            "默认预算(留空 = 清除上限,0 拒收)",
+            config
+                .goals
+                .max_token_budget
+                .map(|budget| budget.to_string())
+                .unwrap_or_default(),
+            |field, cx| {
+                let text = field.value(cx).trim().to_string();
+                let budget = if text.is_empty() {
+                    None // 显式清除(K3 有意例外:null = 清除)
+                } else {
+                    let value: u64 = text.parse().map_err(|_| "预算必须是正整数")?;
+                    if value == 0 {
+                        return Err("预算必须 > 0(留空 = 清除)".into());
+                    }
+                    Some(value)
+                };
+                Ok(ConfigPatch {
+                    goals: Some(GoalsPatch {
+                        enabled: None,
+                        max_token_budget: Some(budget),
+                    }),
+                    ..Default::default()
+                })
+            },
         ))
         .child(section_header("工具集成 · 只读", t));
     for (name, enabled, servers) in [
@@ -1159,7 +1145,7 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             body = body.child(model_row(catalog, id, model_id, model, cx, t));
         }
     }
-    body.child(profiles(daemon, revision, cx, t))
+    body
 }
 
 fn model_row(
@@ -1230,45 +1216,6 @@ fn model_row(
             },
         ));
     }
-    let provider = provider_id.to_owned();
-    let model_id = model_id.to_owned();
-    actions = actions.child(button(
-        cx,
-        t,
-        format!("model-profile-{id}"),
-        "创建预设",
-        move |daemon, window, cx| {
-            let fields = vec![
-                Field::text("name", "预设名称", "", window, cx),
-                Field::secret("api_key", "API 密钥（可选）", window, cx),
-            ];
-            let provider = provider.clone();
-            let model = model_id.clone();
-            begin(
-                daemon,
-                "从模型创建预设",
-                fields,
-                move |fields, daemon, cx| {
-                    catalog_command(
-                        daemon,
-                        revision,
-                        RingingCommand::ProfileCreate {
-                            name: fields[0].required(cx)?,
-                            model: model.clone(),
-                            id: None,
-                            provider: Some(provider.clone()),
-                            base_url: None,
-                            wire: None,
-                            reasoning_effort: None,
-                            context_length: None,
-                            max_tokens: None,
-                            api_key: optional(&fields[1].value(cx)),
-                        },
-                    )
-                },
-            );
-        },
-    ));
     setting_row(
         model.display_name.as_deref().unwrap_or(&id),
         if is_default {
@@ -1281,87 +1228,6 @@ fn model_row(
         actions.child(edit).child(remove).into_any_element(),
         t,
     )
-}
-
-fn profiles(
-    daemon: &DaemonStore,
-    revision: u64,
-    cx: &mut Context<DaemonStore>,
-    t: &Palette,
-) -> Div {
-    let mut body = div().flex().flex_col().child(section_header("运行预设", t));
-    let Some(config) = &daemon.config else {
-        return body;
-    };
-    body = body.child(setting_row(
-        "保存当前配置",
-        "保存当前 daemon 配置为命名预设",
-        button(
-            cx,
-            t,
-            "profile-save-current",
-            "另存为",
-            move |daemon, window, cx| {
-                let fields = vec![Field::text("name", "预设名称", "", window, cx)];
-                begin(
-                    daemon,
-                    "保存当前配置",
-                    fields,
-                    move |fields, daemon, cx| {
-                        catalog_command(
-                            daemon,
-                            revision,
-                            RingingCommand::ProfileSaveCurrent {
-                                name: fields[0].required(cx)?,
-                            },
-                        )
-                    },
-                );
-            },
-        ),
-        t,
-    ));
-    for name in &config.profiles {
-        let id = name.clone();
-        let apply = button(
-            cx,
-            t,
-            format!("profile-apply-{name}"),
-            "设为当前",
-            move |daemon, _, _| {
-                let result = catalog_command(
-                    daemon,
-                    revision,
-                    RingingCommand::ProfileApply { name: id.clone() },
-                );
-                report(daemon, result);
-            },
-        );
-        let remove = confirm_command(
-            cx,
-            t,
-            format!("profile-delete-{name}"),
-            format!("删除预设「{name}」？"),
-            revision,
-            RingingCommand::ProfileDelete { name: name.clone() },
-        );
-        body = body.child(setting_row(
-            name,
-            if config.active_profile == *name {
-                "当前全局预设"
-            } else {
-                ""
-            },
-            div()
-                .flex()
-                .gap_1()
-                .child(apply)
-                .child(remove)
-                .into_any_element(),
-            t,
-        ));
-    }
-    body
 }
 
 fn patch_session(
@@ -1480,35 +1346,6 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             ));
         }
     }
-    let modes = [("code", "Code", 0), ("plan", "Plan", 1)].map(|(mode, label, id)| {
-        let target = meta.session_id.clone();
-        let active = (meta.mode == 1) == (id == 1);
-        segmented_button(
-            format!("session-mode-{mode}"),
-            label,
-            active,
-            t,
-            cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
-                let result = patch_session(
-                    daemon,
-                    cx,
-                    &target,
-                    SessionSettingsPatch {
-                        mode: Some(mode.into()),
-                        ..Default::default()
-                    },
-                );
-                report(daemon, result);
-                cx.notify();
-            }),
-        )
-    });
-    body = body.child(setting_row(
-        "会话模式",
-        "",
-        div().flex().gap_1().children(modes).into_any_element(),
-        t,
-    ));
     let tools = [
         (qaqh_types::STANDARD, "标准"),
         (qaqh_types::MINIMAL, "精简"),
@@ -1553,49 +1390,6 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             .flex_wrap()
             .gap_1()
             .children(tools)
-            .into_any_element(),
-        t,
-    ));
-    let Some(config) = &daemon.config else {
-        return body;
-    };
-    let profiles = std::iter::once("")
-        .chain(config.profiles.iter().map(String::as_str))
-        .map(|profile| {
-            let target = meta.session_id.clone();
-            let value = profile.to_owned();
-            segmented_button(
-                format!("session-profile-{profile}"),
-                if profile.is_empty() {
-                    "跟随全局".to_owned()
-                } else {
-                    profile.to_owned()
-                },
-                meta.profile.as_deref().unwrap_or_default() == profile,
-                t,
-                cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
-                    let result = patch_session(
-                        daemon,
-                        cx,
-                        &target,
-                        SessionSettingsPatch {
-                            profile: Some(value.clone()),
-                            ..Default::default()
-                        },
-                    );
-                    report(daemon, result);
-                    cx.notify();
-                }),
-            )
-        });
-    body = body.child(setting_row(
-        "会话预设",
-        "",
-        div()
-            .flex()
-            .flex_wrap()
-            .gap_1()
-            .children(profiles)
             .into_any_element(),
         t,
     ));

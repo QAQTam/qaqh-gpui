@@ -69,6 +69,8 @@ pub enum BridgeMsg {
     Workspaces(Vec<WorkspaceEntry>),
     /// 当前会话的 `todo.list` 快照。
     Todos(String, qaqh_ringing_contract::todo::TodoListSnapshot),
+    /// `GET /ringing/v2/sessions/{seed}/team` 快照(团队花名册/任务板/留言板)。
+    Team(String, Box<qaqh_client::v2::TeamResponse>),
     /// SDK 托管流的业务事件帧。
     Event(String, SessionEventFrame),
     /// resync:前端清该会话暂态,再请求 Refill 重灌快照(D6)。
@@ -134,12 +136,6 @@ pub enum BridgeRequest {
         /// "始终允许" = 信任当前工作区目录。
         trust_folder: bool,
     },
-    /// plan.review.respond。
-    RespondPlan {
-        seed: String,
-        interaction_id: String,
-        approved: bool,
-    },
     /// interaction.ask.respond(answers 已按题 id 组装)。
     RespondAsk {
         seed: String,
@@ -154,15 +150,22 @@ pub enum BridgeRequest {
     RenameSession { seed: String, title: String },
     /// todo.list 查询(当前会话)。
     QueryTodo { seed: String },
+    /// team 快照查询(当前会话;无推送,选中/轮询触发)。
+    QueryTeam { seed: String },
     /// conversation.cancel。
     Cancel {
         seed: String,
         turn_id: Option<String>,
     },
     /// session.create(cwd = 目标工作区路径)。
+    /// `first_message` 给 handoff fork:创建成功后立即投递交接文档(trigger_turn)。
     CreateSession {
         cwd: Option<String>,
-        model_selection: ModelSelection,
+        model_selection: Option<ModelSelection>,
+        title: Option<String>,
+        first_message: Option<String>,
+        /// handoff 工作链接缝(ADR-0015 切片F):来源会话 id;普通新建缺席。
+        handoff_from: Option<String>,
     },
     PatchSessionSettings {
         seed: String,
@@ -516,6 +519,7 @@ async fn handle_request(
             client.activate_stream(&seed).await;
             refill(client, to_ui, &seed).await;
             query_todos(client, to_ui, &seed).await;
+            query_team(client, to_ui, &seed).await;
         }
         BridgeRequest::Refill(seed) => refill(client, to_ui, &seed).await,
         BridgeRequest::SendMessage { seed, outbox } => {
@@ -548,24 +552,6 @@ async fn handle_request(
                     tool_call_id,
                     approved,
                     trust_folder,
-                },
-            )
-            .await;
-        }
-        BridgeRequest::RespondPlan {
-            seed,
-            interaction_id,
-            approved,
-        } => {
-            send_command(
-                client,
-                to_ui,
-                CommandTarget::Session { session_id: seed },
-                RingingCommand::PlanReviewRespond {
-                    interaction_id,
-                    approved,
-                    message: None,
-                    autonomous: false,
                 },
             )
             .await;
@@ -624,6 +610,7 @@ async fn handle_request(
             .await;
         }
         BridgeRequest::QueryTodo { seed } => query_todos(client, to_ui, &seed).await,
+        BridgeRequest::QueryTeam { seed } => query_team(client, to_ui, &seed).await,
         BridgeRequest::Cancel { seed, turn_id } => {
             send_command(
                 client,
@@ -633,15 +620,14 @@ async fn handle_request(
             )
             .await;
         }
-        BridgeRequest::CreateSession { cwd, model_selection } => {
+        BridgeRequest::CreateSession { cwd, model_selection, title, first_message, handoff_from } => {
             let command = RingingCommand::SessionCreate {
                 cwd: cwd.clone(),
-                title: None,
-                profile: None,
-                effort: None,
-                model_selection: Some(model_selection),
+                title,
+                model_selection,
                 tool_mode: None,
                 custom_tools: None,
+                handoff_from,
             };
             let result = send_command(client, to_ui, CommandTarget::Global, command)
                 .await
@@ -650,6 +636,21 @@ async fn handle_request(
                     Ok(result) => Some(result.session_id),
                     Err(error) => { send_line(to_ui, &format!("创建结果不符合契约：{error}")); None }
                 });
+            if let (Some(seed), Some(message)) = (result.clone(), first_message) {
+                // handoff fork:文档投给 child(input_purpose 缺省 trigger_turn)。
+                let command = RingingCommand::ConversationSendMessage(qaqh_client::ConversationSendMessage {
+                    text: message,
+                    images: Vec::new(),
+                    attachments: None,
+                    message_id: None,
+                    input_purpose: Default::default(),
+                    as_system: false,
+                    inter_agent: None,
+                    subagent_terminal: None,
+                    widget_context: None,
+                });
+                send_command(client, to_ui, CommandTarget::Session { session_id: seed }, command).await;
+            }
             let message = match result {
                 Some(session_id) => BridgeMsg::Created(session_id, cwd),
                 None => BridgeMsg::CreateFailed,
@@ -842,6 +843,17 @@ async fn query_todos(client: &Client, to_ui: &UnboundedSender<BridgeMsg>, seed: 
             let _ = to_ui.unbounded_send(BridgeMsg::Todos(seed.to_string(), value));
         }
         Err(error) => trace(&format!("todo.list {seed} 失败:{error}")),
+    }
+}
+
+/// team 快照查询;失败只 trace(无 TeamDelta 推送,靠选中/轮询刷新)。
+async fn query_team(client: &Client, to_ui: &UnboundedSender<BridgeMsg>, seed: &str) {
+    match client.team_v2(seed).await {
+        Ok(value) => {
+            trace(&format!("team {seed} tasks={}", value.tasks.tasks.len()));
+            let _ = to_ui.unbounded_send(BridgeMsg::Team(seed.to_string(), Box::new(value)));
+        }
+        Err(error) => trace(&format!("team {seed} 失败:{error}")),
     }
 }
 

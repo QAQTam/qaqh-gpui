@@ -24,6 +24,8 @@ use qaqh_ringing_contract::fact::ToolCallId;
 use qaqh_ringing_contract::fact::TurnId;
 use qaqh_ringing_contract::state::DriverState;
 use qaqh_ringing_contract::state::ExecSessionView;
+use qaqh_ringing_contract::state::GoalStatus;
+use qaqh_ringing_contract::state::GoalView;
 use qaqh_ringing_contract::state::InteractionView;
 use qaqh_ringing_contract::state::SubagentView;
 use qaqh_ringing_contract::state::TimelineEntry;
@@ -35,7 +37,9 @@ use crate::bridge::BridgeMsg;
 use crate::bridge::BridgeRequest;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
 use gpui_component::WindowExt;
-use qaqh_client::{SessionSettingsPatch, ToolsSettingPatch};
+use qaqh_client::{
+    CommandTarget, RingingCommand, SessionSettingsPatch, ToolsSettingPatch,
+};
 use qaqh_config_api::ConfigDto;
 use qaqh_profile::ProfilesDocument;
 use qaqh_types::{ModelSelection, SessionListEntry, SettingValue};
@@ -54,6 +58,20 @@ pub struct AskDraft {
     pub answers: Vec<Option<String>>,
     /// 每题自定义输入框(非空时优先于 answers)。
     pub customs: Vec<Entity<InputState>>,
+}
+
+/// 参数生成中的流式摘要(ToolArgumentsDelta 的投影;声明后由 ToolDeclared 收口)。
+/// 行数是内核从参数文本数的**估算**,终态以 ToolFinished.code_delta 为准。
+pub struct ArgStream {
+    pub call_id: ToolCallId,
+    pub tool_name: String,
+    pub text: String,
+    /// (估算新增行, 估算删除行);None = 该工具没有行数概念。
+    pub lines: Option<(u32, u32)>,
+    /// 内核认出的目标文件(仅 apply_patch 会填;缺席 = 没认出来)。
+    pub target_files: Vec<String>,
+    /// 参数文本已吐完且形状合法(不代表已声明/已执行)。
+    pub args_complete: bool,
 }
 
 pub struct SessionStore {
@@ -82,12 +100,14 @@ pub struct SessionStore {
     /// 工具调用业务状态(单一权威,与 timeline 的 ToolCall 条目按 call_id 关联)。
     pub tools: Vec<ToolCallView>,
     pub expanded_tools: HashSet<ToolCallId>,
-    /// 未 declare 的参数生成流:call_id → (tool_name, 累计替换文本)。
-    pub arg_stream: Vec<(ToolCallId, String, String)>,
+    /// 未 declare 的参数生成流:call_id → 流式摘要。
+    pub arg_stream: Vec<ArgStream>,
     /// 运行中工具的输出尾窗:call_id → 累计文本。
     pub output_tail: Vec<(ToolCallId, String)>,
     pub interactions: Vec<InteractionView>,
     pub subagents: Vec<SubagentView>,
+    /// 会话目标(ADR-0015):bootstrap + goal_updated 事件维护。
+    pub goal: Option<GoalView>,
     pub exec_sessions: Vec<ExecSessionView>,
     /// 执行会话输出:exec_session_id → (已收 offset 上界, 累计文本)。
     pub exec_output_tail: Vec<(ExecSessionId, u64, String)>,
@@ -95,6 +115,9 @@ pub struct SessionStore {
     pub stream: StreamState,
     /// markdown 解析缓存(M4):section key → (源哈希, 解析结果)。
     pub md_cache: crate::markdown::ParseCache,
+    /// 流式吐字速率采样:3s 滑窗,元素 = (到达时刻, 本次净增字符数)。
+    /// 速率为估算(字符/4≈token);封口块由 usage/generated_ms 给权威值。
+    pub tok_samples: std::collections::VecDeque<(std::time::Instant, i64)>,
     pub timeline_list: ListState,
     pub timeline_follow_setting: Option<bool>,
     pub settings: Option<SessionListEntry>,
@@ -110,6 +133,8 @@ pub struct SessionStore {
     pub ask_drafts: Vec<(InteractionId, AskDraft)>,
     /// ask 卡未答提示(上次提交被拒时显示,成功提交/跳过/解决后清除)。
     pub ask_hint: Option<String>,
+    /// goal Dialog 草稿(objective, 预算);Some = 对话框打开中。
+    pub goal_draft: Option<(Entity<InputState>, Entity<InputState>)>,
     requests: UnboundedSender<BridgeRequest>,
 }
 
@@ -179,11 +204,13 @@ impl SessionStore {
             output_tail: Vec::new(),
             interactions: Vec::new(),
             subagents: Vec::new(),
+            goal: None,
             exec_sessions: Vec::new(),
             exec_output_tail: Vec::new(),
             driver: None,
             stream: StreamState::Connecting,
             md_cache: crate::markdown::ParseCache::default(),
+            tok_samples: std::collections::VecDeque::new(),
             timeline_list: ListState::new(1, ListAlignment::Top, px(200.)),
             timeline_follow_setting: None,
             settings: None,
@@ -194,6 +221,7 @@ impl SessionStore {
             renaming: None,
             ask_drafts: Vec::new(),
             ask_hint: None,
+            goal_draft: None,
             requests,
         }
     }
@@ -249,7 +277,7 @@ impl SessionStore {
             message: qaqh_client::ConversationSendMessage {
                 text, images: self.images.clone(), attachments: Some(self.attachments.clone()),
                 message_id: None, input_purpose: Default::default(), as_system: false,
-                inter_agent: None, subagent_terminal: None,
+                inter_agent: None, subagent_terminal: None, widget_context: None,
             },
             state: crate::delivery::DeliveryState::Sending, detail: String::new(),
         };
@@ -301,16 +329,21 @@ impl SessionStore {
             });
     }
 
-    pub fn respond_plan(&mut self, interaction_id: String, approved: bool) {
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::RespondPlan {
-                seed: self.session_id.clone(),
-                interaction_id,
-                approved,
-            });
+    /// goal 控制(ADR-0015):objective=创建/改目标;status=状态迁移;
+    /// token_budget 双层语义由命令面表达(这里 None = 不动)。
+    pub fn goal_set(&mut self, objective: Option<String>, status: Option<GoalStatus>, token_budget: Option<Option<u64>>) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Command {
+            target: CommandTarget::Session { session_id: self.session_id.clone() },
+            command: RingingCommand::GoalSet { objective, status, token_budget },
+        });
     }
 
+    pub fn goal_clear(&mut self) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Command {
+            target: CommandTarget::Session { session_id: self.session_id.clone() },
+            command: RingingCommand::GoalClear {},
+        });
+    }
     /// 取(或建)ask 卡草稿;输入框实体需窗口上下文创建。
     /// 请求被引用内容解析替换后题数可能变化,题数不匹配时重建,防越界。
     pub fn ask_draft(
@@ -440,6 +473,20 @@ impl SessionStore {
         self.renaming = None;
     }
 
+    /// handoff fork(v3.1a):从本会话的 handoff 工具事实创建交接会话。
+    /// 载荷抄本会话 meta 的 cwd/model_selection(electron forkHandoffSession 同口径),
+    /// title = work_summary,首消息 = 交接文档,handoff_from = 本会话(goal 工作链接缝)。
+    pub fn fork_handoff(&mut self, summary: Option<String>, doc: String) {
+        let meta = self.settings.as_ref().map(|settings| &settings.meta);
+        let _ = self.requests.unbounded_send(BridgeRequest::CreateSession {
+            cwd: meta.and_then(|meta| meta.cwd.clone()),
+            model_selection: meta.and_then(|meta| meta.model_selection.clone()),
+            title: summary,
+            first_message: Some(doc),
+            handoff_from: Some(self.session_id.clone()),
+        });
+    }
+
     pub fn cancel_turn(&mut self) {
         let _ = self.requests.unbounded_send(BridgeRequest::Cancel {
             seed: self.session_id.clone(),
@@ -453,6 +500,48 @@ impl SessionStore {
             seed: self.session_id.clone(),
             after_ms,
         });
+    }
+
+    /// 记录一次流式净增字符(替换语义下 delta 可为负,负数不入样本)。
+    pub fn note_stream_chars(&mut self, delta: i64) {
+        if delta <= 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.tok_samples.push_back((now, delta));
+        // 3s 滑窗:过期样本出队(electron trackOutputDelta 同口径)。
+        while let Some(&(instant, _)) = self.tok_samples.front() {
+            if now.duration_since(instant).as_secs_f64() <= 3.0 {
+                break;
+            }
+            self.tok_samples.pop_front();
+        }
+    }
+
+    /// 当前估算吐字速率 tok/s(字符/4);样本不足(窗口内 < 0.5s)时返回 None。
+    pub fn tok_rate(&self) -> Option<f64> {
+        let (mut chars, mut first, mut last) = (0i64, None, None);
+        for &(instant, delta) in &self.tok_samples {
+            chars += delta;
+            first = Some(first.unwrap_or(instant));
+            last = Some(instant);
+        }
+        let (first, last) = (first?, last?);
+        let span = last.duration_since(first).as_secs_f64();
+        if span < 0.5 || chars <= 0 {
+            return None;
+        }
+        Some(chars as f64 / 4.0 / span)
+    }
+
+    /// 侧栏终态着色:本会话最近一回合的权威结果。Finished 无错 = ok(true),
+    /// Interrupted 或带错 = bad(false);无终态回合 = None(保持 run-status 点)。
+    pub fn last_turn_tone(&self) -> Option<bool> {
+        let outcome = &self.turns.iter().rev().find(|turn| turn.outcome.is_some())?.outcome;
+        outcome.as_ref().map(|outcome| match outcome {
+            qaqh_ringing_contract::state::TurnOutcome::Finished { error: None, .. } => true,
+            _ => false,
+        })
     }
 
     pub fn patch_settings(&mut self, patch: SessionSettingsPatch) {
@@ -706,6 +795,8 @@ pub struct DaemonStore {
     pub current: Option<Entity<SessionStore>>,
     /// 当前会话的 todo 快照(seed, items)。
     pub todos: Option<(String, Vec<TodoRow>)>,
+    /// 当前会话的 team 快照(ADR-0014):Some((seed, response));无推送,选中/轮询刷新。
+    pub team: Option<(String, qaqh_client::v2::TeamResponse)>,
     pub requests: UnboundedSender<BridgeRequest>,
 }
 
@@ -757,6 +848,7 @@ impl DaemonStore {
             stores: Vec::new(),
             current: None,
             todos: None,
+            team: None,
             requests,
         }
     }
@@ -903,6 +995,17 @@ impl DaemonStore {
                     cx.notify();
                 }
             }
+            BridgeMsg::Team(seed, value) => {
+                // 只对当前选中会话生效;花名册是粗投影,精确状态看 session.list。
+                let current_seed = self
+                    .current
+                    .as_ref()
+                    .map(|current| current.read(cx).session_id.clone());
+                if current_seed.as_deref() == Some(seed.as_str()) {
+                    self.team = Some((seed, *value));
+                    cx.notify();
+                }
+            }
             BridgeMsg::Event(seed, frame) => {
                 // ask 请求在 frame 被消费前先摘出 id(apply_frame 会 move frame)。
                 let ask_arrival = match &frame.event {
@@ -934,6 +1037,9 @@ impl DaemonStore {
                     frame.event,
                     SessionEvent::ToolFinished { .. } | SessionEvent::TurnEnded { .. }
                 );
+                // 任务板/留言板工具开工即刷新 team 快照(无 delta 推送,施工单 §一·3 主触发)。
+                let refresh_team = matches!(&frame.event, SessionEvent::ToolDeclared { tool_name, .. }
+                    if tool_name.starts_with("task_") || tool_name.starts_with("board_"));
                 let store = self
                     .stores
                     .iter()
@@ -972,7 +1078,12 @@ impl DaemonStore {
                 if refresh_todos {
                     let _ = self
                         .requests
-                        .unbounded_send(BridgeRequest::QueryTodo { seed });
+                        .unbounded_send(BridgeRequest::QueryTodo { seed: seed.clone() });
+                }
+                if refresh_team {
+                    let _ = self
+                        .requests
+                        .unbounded_send(BridgeRequest::QueryTeam { seed });
                 }
             }
             BridgeMsg::Reset(seed, _reset) => {
@@ -1304,18 +1415,21 @@ impl DaemonStore {
     }
 
     /// 新建会话:cwd 取所选工作区路径;创建成功经 BridgeMsg::Created 自动选中。
+    /// 模型未选 = None(继承全局默认,eb3f31c 的 model_selection Inherit 口径)。
     pub fn create_session(&mut self) {
         if self.creating_session {
             return;
         }
-        let Some(model_selection) = self.new_model.clone() else { return; };
         let cwd = self
             .workspaces
             .get(self.new_workspace)
             .map(|workspace| workspace.path.clone());
         self.creating_session = self.requests.unbounded_send(BridgeRequest::CreateSession {
             cwd,
-            model_selection,
+            model_selection: self.new_model.clone(),
+            title: None,
+            first_message: None,
+            handoff_from: None,
         }).is_ok();
     }
 

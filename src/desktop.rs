@@ -5,7 +5,7 @@ use crate::{
     theme::Palette,
     ui::action_button,
 };
-use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, div, prelude::*, px};
+use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, Window, div, prelude::*, px};
 use gpui_component::input::Input;
 use gpui_component::Sizable;
 use qaqh_client::{CommandTarget, RingingCommand, SessionListEntry};
@@ -356,6 +356,16 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
                     },
                     command: RingingCommand::AgentReloadConfig,
                 });
+            }),
+            t,
+        ))
+        .child(action_button(cx,
+            "goal-dialog".into(),
+            "目标",
+            t.dim,
+            cx.listener(|store, _, window: &mut Window, cx| {
+                crate::goal::open_dialog(store, window, cx);
+                cx.notify();
             }),
             t,
         ))

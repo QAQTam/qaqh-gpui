@@ -5044,7 +5044,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qaqh-client"
-version = "3.0.20261104-1"
+version = "3.0.20261110-g1842986"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5060,12 +5060,12 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uuid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "qaqh-config-api"
-version = "3.0.20261104-1"
+version = "3.0.20261110-g1842986"
 dependencies = [
  "serde",
 ]
@@ -5102,7 +5102,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-profile"
-version = "3.0.20261104-1"
+version = "3.0.20261110-g1842986"
 dependencies = [
  "log",
  "qaqh-types",
@@ -5114,7 +5114,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing"
-version = "3.0.20261104-1"
+version = "3.0.20261110-g1842986"
 dependencies = [
  "qaqh-profile",
  "qaqh-ringing-contract",
@@ -5125,7 +5125,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing-contract"
-version = "3.0.20261104-1"
+version = "3.0.20261110-g1842986"
 dependencies = [
  "qaqh-types",
  "serde",
@@ -5137,7 +5137,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-types"
-version = "3.0.20261104-1"
+version = "3.0.20261110-g1842986"
 dependencies = [
  "serde",
  "serde_json",
@@ -8288,15 +8288,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]

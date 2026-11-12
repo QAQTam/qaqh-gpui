@@ -4,6 +4,8 @@
 //! 残余重叠,按 id 幂等吸收;resync 只丢暂态(streaming/arg_stream/尾窗),
 //! 已提交状态由快照重灌。
 
+use std::collections::HashSet;
+
 use gpui::Context;
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::events::SessionEventFrame;
@@ -15,7 +17,7 @@ use qaqh_ringing_contract::state::ToolCallState;
 use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_ringing_contract::state::TurnView;
 
-use crate::store::SessionStore;
+use crate::store::{ArgStream, SessionStore};
 
 pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.seq = state.seq;
@@ -34,6 +36,7 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.ask_hint = None;
     store.subagents = state.subagents;
     store.exec_sessions = state.exec_sessions;
+    store.goal = state.goal;
     store.driver = state.driver;
     clear_transient(store);
 }
@@ -73,14 +76,9 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             store.activity = Some(activity);
             store.current_turn_id = current_turn_id;
         }
-        SessionEvent::TurnStarted {
-            turn_id,
-            input_id,
-            mode,
-        } => upsert_turn(store, turn_id, |turn| {
-            turn.input_id = input_id;
-            turn.mode = mode;
-        }),
+        SessionEvent::TurnStarted { turn_id, input_id } => {
+            upsert_turn(store, turn_id, |turn| turn.input_id = input_id)
+        }
         SessionEvent::TurnPhaseChanged { turn_id, phase } => {
             upsert_turn(store, turn_id, |turn| turn.phase = Some(phase));
         }
@@ -95,21 +93,45 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             block_id,
             block_kind,
             text,
-        } => match store.streaming.iter_mut().find(|slot| slot.0 == block_id) {
-            Some(slot) => slot.2 = text,
-            None => store.streaming.push((block_id, block_kind, text)),
-        },
+        } => {
+            // tok/s 采样:Answer 流的净增字符入 3s 滑窗(替换语义取差值)。
+            if block_kind == qaqh_ringing_contract::fact::AssistantBlockKind::Answer {
+                let delta = match store.streaming.iter().find(|slot| slot.0 == block_id) {
+                    Some(slot) => text.len() as i64 - slot.2.len() as i64,
+                    None => text.len() as i64,
+                };
+                store.note_stream_chars(delta);
+            }
+            match store.streaming.iter_mut().find(|slot| slot.0 == block_id) {
+                Some(slot) => slot.2 = text,
+                None => store.streaming.push((block_id, block_kind, text)),
+            }
+        }
         SessionEvent::ToolArgumentsDelta {
             call_id,
             turn_id: _,
             tool_name,
             text,
-        } => match store.arg_stream.iter_mut().find(|slot| slot.0 == call_id) {
+            lines_added,
+            lines_removed,
+            target_files,
+            args_complete,
+        } => match store.arg_stream.iter_mut().find(|slot| slot.call_id == call_id) {
             Some(slot) => {
-                slot.1 = tool_name;
-                slot.2 = text;
+                slot.tool_name = tool_name;
+                slot.text = text;
+                slot.lines = lines_added.zip(lines_removed);
+                slot.target_files = target_files;
+                slot.args_complete = args_complete;
             }
-            None => store.arg_stream.push((call_id, tool_name, text)),
+            None => store.arg_stream.push(ArgStream {
+                call_id,
+                tool_name,
+                text,
+                lines: lines_added.zip(lines_removed),
+                target_files,
+                args_complete,
+            }),
         },
         SessionEvent::ToolDeclared {
             call_id,
@@ -117,7 +139,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             tool_name,
             args,
         } => {
-            store.arg_stream.retain(|slot| slot.0 != call_id);
+            store.arg_stream.retain(|slot| slot.call_id != call_id);
             let updated = upsert_tool(store, &call_id, |existing| {
                 existing.turn_id = Some(turn_id.clone());
                 existing.tool_name = Some(tool_name.clone());
@@ -184,7 +206,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             effects,
         } => {
             store.output_tail.retain(|slot| slot.0 != call_id);
-            store.arg_stream.retain(|slot| slot.0 != call_id);
+            store.arg_stream.retain(|slot| slot.call_id != call_id);
             let updated = upsert_tool(store, &call_id, |existing| {
                 existing.exec_session_id = exec_session_id.clone();
                 existing.output = output.clone();
@@ -243,6 +265,42 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             }
             upsert_entry(store, entry);
         }
+        SessionEvent::TimelineTruncated {
+            from_turn_id: _,
+            removed_turn_ids,
+        } => {
+            // 权威集合整枝:回合(输入/正文/工具卡/交互)一并消失;副作用
+            // (journal/exec/子代理)不动。无 turn 归属的条目无法判定,保守保留。
+            let removed: std::collections::HashSet<TurnId> = removed_turn_ids.into_iter().collect();
+            let removed_calls: HashSet<ToolCallId> = store
+                .tools
+                .iter()
+                .filter(|tool| tool.turn_id.as_ref().is_some_and(|turn_id| removed.contains(turn_id)))
+                .map(|tool| tool.call_id.clone())
+                .collect();
+            store.turns.retain(|turn| !removed.contains(&turn.turn_id));
+            store
+                .tools
+                .retain(|tool| !tool.turn_id.as_ref().is_some_and(|turn_id| removed.contains(turn_id)));
+            store.interactions.retain(|interaction| {
+                !interaction
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|turn_id| removed.contains(turn_id))
+            });
+            store.arg_stream.retain(|slot| !removed_calls.contains(&slot.call_id));
+            store.output_tail.retain(|(call_id, _)| !removed_calls.contains(call_id));
+            store.entries.retain(|entry| match entry {
+                TimelineEntry::Input { turn_id, .. }
+                | TimelineEntry::ToolCall { turn_id, .. }
+                | TimelineEntry::ToolResult { turn_id, .. } => {
+                    turn_id.as_ref().is_none_or(|turn_id| !removed.contains(turn_id))
+                }
+                TimelineEntry::AssistantBlock { turn_id, .. } => !removed.contains(turn_id),
+                TimelineEntry::Compaction { .. } => true,
+            });
+            store.timeline_list.reset(store.entries.len() + 1);
+        }
         SessionEvent::InteractionRequested { interaction } => {
             match store
                 .interactions
@@ -280,6 +338,10 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
         SessionEvent::DriverChanged { driver } => {
             store.driver = driver;
         }
+        SessionEvent::GoalUpdated { goal } => {
+            // 整字段替换;None = 已清除。链根与当前会话双流可能都发,幂等。
+            store.goal = goal;
+        }
     }
 }
 
@@ -305,7 +367,6 @@ fn upsert_turn(store: &mut SessionStore, turn_id: TurnId, update: impl FnOnce(&m
         store.turns.push(TurnView {
             turn_id,
             input_id: None,
-            mode: None,
             phase: None,
             outcome: None,
         });
