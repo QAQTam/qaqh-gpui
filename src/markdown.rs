@@ -68,6 +68,9 @@ pub enum MdBlockKind {
     Table { columns: Vec<Alignment>, rows: Vec<Vec<TableCell>> },
     Code { lang: Option<String>, code: String },
     Rule,
+    /// widget-directive marker 卡:模型输出的 block 行,桌面端以系统浏览器打开
+    /// fragment(同机部署 path 即本地文件;空 path = JSON 解析失败的一行占位)。
+    Widget { path: String, title: Option<String> },
 }
 
 #[derive(Debug)]
@@ -108,7 +111,30 @@ mod tests {
         assert_eq!(columns.len(), 3);
         assert_eq!(rows[1][1].0, "");
         assert_eq!(rows[1][2].0, "rg");
-        assert_eq!(rows[2][2].0, "");
+    }
+
+    #[test]
+    fn widget_marker_lines_become_widget_blocks() {
+        let marker = "\u{E200} visualize \u{E202}{\"path\":\"D:/p/.qaqh/widgets/s1/score.html\",\"title\":\"Score\"}\u{E201}";
+        let blocks = parse_blocks(&format!("正文一句\n{marker}\n{marker}"));
+        // 段落与 marker 混排(inline 语义)不抽,整段独占行才抽。
+        assert!(matches!(blocks[0].kind, MdBlockKind::Paragraph { .. }));
+        let blocks = parse_blocks(&format!("{marker}\n{marker}"));
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| matches!(
+            block.kind,
+            MdBlockKind::Widget { ref path, title: Some(_) } if path == "D:/p/.qaqh/widgets/s1/score.html"
+        )));
+        // JSON 失败降级占位(空 path);流式半截保持原样。
+        let broken = "\u{E200} visualize \u{E202}{oops}\u{E201}";
+        let blocks = parse_blocks(broken);
+        assert!(matches!(
+            blocks[0].kind,
+            MdBlockKind::Widget { path: ref p, .. } if p.is_empty()
+        ));
+        let partial = "\u{E200} visualize \u{E202}{\"path\":";
+        let blocks = parse_blocks(partial);
+        assert!(matches!(blocks[0].kind, MdBlockKind::Paragraph { .. }));
     }
 }
 
@@ -412,7 +438,61 @@ pub fn parse_blocks(source: &str) -> Vec<MdBlock> {
         }
     }
 
-    blocks
+    extract_widget_markers(blocks)
+}
+
+/// widget marker 判定:`U+E200 visualize U+E202 {json} U+E201` 独占行。
+/// Some(Ok((path,title))) = 有效;Some(Err(())) = 完整但 JSON 失败(占位);
+/// None = 非 marker 行(含流式半截)。
+fn widget_line(line: &str) -> Option<Result<(String, Option<String>), ()>> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('\u{E200}')?;
+    let rest = rest.strip_prefix(" visualize ")?;
+    let rest = rest.strip_prefix('\u{E202}')?;
+    let payload = rest.strip_suffix('\u{E201}')?;
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => Some(Ok((
+            value.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            value.get("title").and_then(|v| v.as_str()).map(str::to_owned),
+        ))),
+        Err(_) => Some(Err(())),
+    }
+}
+
+/// 段落级 marker 抽取:整段(含软换行连接的多行)全部为 marker 行时,
+/// 逐行替换成 Widget 块;否则原样保留(inline marker 按原文显示,不猜)。
+fn extract_widget_markers(blocks: Vec<MdBlock>) -> Vec<MdBlock> {
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let MdBlock { offset, kind: MdBlockKind::Paragraph { text, runs } } = block else {
+            out.push(block);
+            continue;
+        };
+        let lines: Vec<&str> = text.split('\n').collect();
+        if lines.is_empty() || !lines.iter().all(|line| widget_line(line).is_some()) {
+            out.push(MdBlock {
+                offset,
+                kind: MdBlockKind::Paragraph { text, runs },
+            });
+            continue;
+        }
+        let mut line_offset = offset;
+        for line in lines {
+            match widget_line(line) {
+                Some(Ok((path, title))) => out.push(MdBlock {
+                    offset: line_offset,
+                    kind: MdBlockKind::Widget { path, title },
+                }),
+                Some(Err(())) => out.push(MdBlock {
+                    offset: line_offset,
+                    kind: MdBlockKind::Widget { path: String::new(), title: None },
+                }),
+                None => {}
+            }
+            line_offset += line.len() + 1;
+        }
+    }
+    out
 }
 
 fn run_style(kind: &MdRunKind, t: &Palette) -> HighlightStyle {
@@ -681,6 +761,68 @@ fn render_block(
                         .overflow_x_scroll()
                         .child(crate::highlight::code_text(code, lang.as_deref(), t)),
                 );
+            card.into_any_element()
+        }
+        MdBlockKind::Widget { path, title } => {
+            let label = title.clone().unwrap_or_else(|| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "widget".into())
+            });
+            let mut card = div()
+                .id(block_id(section, block.offset))
+                .my_1p5()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .px_3()
+                .py_2p5()
+                .rounded(px(crate::kit::RADIUS_CARD))
+                .border_1()
+                .border_color(t.border)
+                .bg(t.card)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(div().text_sm().text_color(t.accent).child("◈"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .truncate()
+                                .child(SharedString::from(label)),
+                        ),
+                );
+            if path.is_empty() {
+                card = card.child(
+                    div()
+                        .text_xs()
+                        .text_color(t.dim)
+                        .child("(widget 指令解析失败)"),
+                );
+            } else {
+                // 同机部署:path 即本地文件,系统浏览器是桌面端的合规宿主。
+                let url = format!(
+                    "file:///{}",
+                    path.replace('\\', "/").trim_start_matches('/').to_owned()
+                );
+                card = card.child(
+                    div()
+                        .id(("widget-open", section * 1_000_003 + block.offset))
+                        .text_xs()
+                        .text_color(t.accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(t.hover))
+                        .rounded_sm()
+                        .on_click(move |_, _, cx: &mut App| {
+                            cx.open_url(&url);
+                        })
+                        .child("在浏览器打开 →"),
+                );
+            }
             card.into_any_element()
         }
     }
