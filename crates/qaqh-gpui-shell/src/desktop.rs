@@ -1,10 +1,9 @@
 //! Desktop lifecycle and controls, independent of timeline rendering.
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
 use qaqh_gpui_kit::theme::Palette;
-use crate::{
-    store::{DaemonStore, SessionRow, SessionStore},
-    ui::action_button,
-};
+use crate::daemon::DaemonStore;
+use qaqh_gpui_session::store::{SessionRow, SessionStore};
+use qaqh_gpui_kit::primitives::action_button;
 use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, Window, div, prelude::*, px};
 use gpui_component::input::Input;
 use gpui_component::Sizable;

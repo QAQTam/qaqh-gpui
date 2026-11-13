@@ -145,7 +145,7 @@ pub struct SessionStore {
     pub ask_hint: Option<String>,
     /// goal Dialog 草稿(objective, 预算);Some = 对话框打开中。
     pub goal_draft: Option<(Entity<InputState>, Entity<InputState>)>,
-    requests: UnboundedSender<BridgeRequest>,
+    pub requests: UnboundedSender<BridgeRequest>,
 }
 
 impl SessionStore {
@@ -756,7 +756,7 @@ pub struct AccountSignIn {
 }
 
 impl AccountSignIn {
-    fn poll_request(&self) -> BridgeRequest {
+    pub fn poll_request(&self) -> BridgeRequest {
         let (method, key) = match self.service {
             AccountService::Siwc => ("siwc.sign_in.status", "flow_id"),
             AccountService::Dsaccount => ("dsaccount.sign_in.status", "attempt_id"),
