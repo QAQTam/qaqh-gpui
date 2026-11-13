@@ -1,0 +1,63 @@
+[package]
+name = "qaqh-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QAQ-Harness GPUI 桌面前端(RingingV2 客户端)"
+
+[[bin]]
+name = "qaqh-gpui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Local native acceptance driver; deliberately absent from release builds.
+acceptance = []
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# 嵌入 resources/windows/app.rc(应用图标);Linux 构建不拉这个包。
+embed-resource = "3.0"
+
+# Windows NSIS 安装包配置(经 cargo-packager 装配,与 Linux packaging/install.sh tar.gz 口径并存)。
+# 装配不含构建:两个 release exe 由 scripts/build-release-windows.ps1 预先产出。
+# icons/resources 相对本 manifest 目录(crates/qaqh-gpui),仓库级资产在根,故 ../../;
+# binaries 相对路径从 out_dir(= workspace target/<profile>)解析,故只写裸名,须以 --release 装配。
+[package.metadata.packager]
+product-name = "QAQHarness"
+identifier = "io.github.QAQTam.QAQHarness"
+binaries = [
+    { path = "qaqh-gpui", main = true },
+    { path = "qaqh-daemon" },
+]
+icons = ["../../packaging/app.ico"]
+resources = ["../../LICENSE-MIT", "../../LICENSE-APACHE"]
+
+[package.metadata.packager.nsis]
+installer-icon = "../../packaging/app.ico"
+
+[dependencies]
+futures = { workspace = true }
+base64 = { workspace = true }
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+gpui-component = { workspace = true }
+gpui-kit-assets = { workspace = true }
+qaqh-client = { workspace = true }
+qaqh-ringing-contract = { workspace = true }
+qaqh-types = { workspace = true }
+qaqh-config-api = { workspace = true }
+qaqh-profile = { workspace = true }
+pulldown-cmark = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-bash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

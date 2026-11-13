@@ -4,14 +4,15 @@ fn main() {
     #[cfg(target_os = "windows")]
     embed_resource::compile(
         "resources/windows/app.rc",
-        embed_resource::ParamsIncludeDirs(["."]),
+        // app.rc 引用仓库根的 packaging/app.ico;include dirs 指向 workspace 根。
+        embed_resource::ParamsIncludeDirs(["../.."]),
     )
     .manifest_optional()
     .expect("app.rc icon compilation failed");
 
     println!("cargo:rerun-if-env-changed=QAQH_BUILD_REVISION");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/index");
     let revision = match std::env::var("QAQH_BUILD_REVISION") {
         Ok(revision) => revision,
         Err(_) => {

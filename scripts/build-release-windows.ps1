@@ -14,5 +14,5 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 cargo build --release --locked --manifest-path ../qaqh-backend/Cargo.toml --target-dir "$PWD/target" -p qaqh-daemon -j3
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-cargo packager --release --formats nsis
+cargo packager --release --formats nsis -p qaqh-gpui
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

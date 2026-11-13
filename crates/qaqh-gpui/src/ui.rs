@@ -2007,6 +2007,17 @@ impl Render for SessionStore {
                 .children(self.goal.clone().map(|goal| {
                     crate::goal::goal_badge(&goal, cx, &t).into_any_element()
                 }))
+                .children(self.handoff_seal.as_ref().map(|seal| {
+                    // ADR-0016 投影:标记旧线已封箱;点击经 Select 跳后继会话。
+                    crate::kit::pill(&format!("已封箱 → {}", seal.work_summary), t.dim, &t)
+                        .id("handoff-seal")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
+                            store.open_handoff_successor();
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }))
                 .children((self.activity == Some(ActivityState::Running))
                     .then(|| self.tok_rate())
                     .flatten()

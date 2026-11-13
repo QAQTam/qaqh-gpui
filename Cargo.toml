@@ -1,73 +1,48 @@
-[package]
-name = "qaqh-gpui"
+# QAQHarness GPUI 前端 workspace。成员划分与后端仓 crates/qaqh-* 惯例对齐;
+# 前端 crate 一律 qaqh-gpui-* 前缀:后端仓已有 qaqh-session/qaqh-workspace 等同名包,
+# 同一 cargo 图内重名是硬错误。
+[workspace]
+resolver = "3"
+members = ["crates/qaqh-gpui"]
+# 默认产物 = 桌面应用:裸 cargo build/check/test 与 --features acceptance 的口径不变。
+default-members = ["crates/qaqh-gpui"]
+
+[workspace.package]
 # 3.0 线基线:日期占 patch 位(与 qaqh-backend 各 crate 的 3.0.YYYYMMDD 口径一致);
-# 展示版本 = 本基线 + "-g{12 位哈希}",由 build.rs 构建期现算(QAQH_VERSION),
+# 展示版本 = 本基线 + "-g{12 位哈希}",由 bin crate 的 build.rs 构建期现算(QAQH_VERSION),
 # 哈希随提交走,不在 Cargo.toml 里写死。
 version = "3.0.20261109"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "QAQ-Harness GPUI 桌面前端(RingingV2 客户端)"
 
-[[bin]]
-name = "qaqh-gpui"
-path = "src/main.rs"
-
-[lints.clippy]
+[workspace.lints.clippy]
 string_slice = "deny"
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
-# 嵌入 resources/windows/app.rc(应用图标);Linux 构建不拉这个包。
-embed-resource = "3.0"
-
-[features]
-# Local native acceptance driver; deliberately absent from release builds.
-acceptance = []
-
-# Windows NSIS 安装包配置(经 cargo-packager 装配,与 Linux packaging/install.sh tar.gz 口径并存)。
-# 装配不含构建:两个 release exe 由 scripts/build-release-windows.sh 预先产出。
-# binaries 相对路径从 out_dir(= target/<profile>)解析,故只写裸名,须以 --release 装配。
-[package.metadata.packager]
-product-name = "QAQHarness"
-identifier = "io.github.QAQTam.QAQHarness"
-binaries = [
-    { path = "qaqh-gpui", main = true },
-    { path = "qaqh-daemon" },
-]
-icons = ["packaging/app.ico"]
-resources = ["LICENSE-MIT", "LICENSE-APACHE"]
-
-[package.metadata.packager.nsis]
-installer-icon = "packaging/app.ico"
-
-[dependencies]
-futures = "0.3"
-base64 = "0.22"
-# gpui 基座:longbridge/gpui-kit 对 zed gpui 的 crates.io 快照重发布(gpui-pre-*),
+[workspace.dependencies]
+# ---- gpui 基座 ----
+# longbridge/gpui-kit 对 zed gpui 的 crates.io 快照重发布(gpui-pre-*),
 # 精确 pin——caret 会随周更快照漂移破坏编译(gpui-kit #3156 的教训)。
 #   gpui-pre 0.3.11 @ 2026-11-02,zed main 快照,与原 vendor(e21ff1b @ 2026-11-04)同源;
 #   包内 lib 名与原版一致(gpui/gpui_platform),业务代码零改动。
-#   弃用 ../gpui path vendor:快照已把依赖规整回 crates.io,原 5 条 zed fork patch 一并删除。
 # 拆平台版结构:gpui 是平台无关核心,Linux 后端经 gpui_platform(wayland/x11)接线;
 # Windows 后端由 gpui_platform 的 cfg(target_os="windows") 自动接 gpui-pre-windows,无需特征。
-# 本机为 Wayland 会话且无 libxkbcommon-x11-dev(无 sudo),x11 后端无法链接——
-# wayland-only 是本机的正确配置;要 x11:apt install libxkbcommon-x11-dev 后加回。
-# wayland/x11 在 gpui-pre 本体上是空标记特征;windows-manifest 在 Windows 嵌 DPI manifest
-# (gpui-pre build.rs 只在 target_os=windows 时生效,Linux 构建零影响)。
+# wayland/x11 在 gpui-pre 本体上是空标记特征;windows-manifest 在 Windows 嵌 DPI manifest。
 gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = [
     "font-kit",
     "wayland",
     "windows-manifest",
 ] }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["wayland"] }
-# 组件库(Apache-2.0,与本项目许可兼容):Button/Modal/Popover/Table/Dock 等 60+ 件。
-# 精确 pin 与 gpui-pre 快照咬合;升版必须连同 gpui-pre pin 一起动(见 gpui-kit 的 pin 纪律)。
-# tree-sitter-languages/decimal/inspector/syntect features 全不启用:高亮继续用本仓 highlight.rs。
+# 组件库(Apache-2.0):Button/Modal/Popover/Table/Dock 等 60+ 件。
+# 精确 pin 与 gpui-pre 快照咬合;升版必须连同 gpui-pre pin 一起动(pin 纪律)。
+# tree-sitter-languages/decimal/inspector/syntect features 全不启用:高亮用本仓 highlight.rs。
 gpui-component = "=0.9.0"
 # 组件库图标包(Lucide,rust-embed 内嵌):窗口 AssetSource 注册 gpui_kit_assets::Assets,
 # 不注册则组件的菜单/图标一律空白。
 gpui-kit-assets = "0.9.0"
-# RingingV2 传输权威实现(与 qaqh-tui 同路:跨仓 path 依赖,后端仓必须与该相对路径共存)。
-# 协议类型经它转出,前端零自建、零转换层。
+
+# ---- 后端 path 依赖(相对 workspace 根,与 qaqh-tui 同路;后端仓必须与该相对路径共存) ----
+# RingingV2 传输权威实现。协议类型经它转出,前端零自建、零转换层。
 # 【复线 2026-11-13】后端 main f1b5fc78 已含 ADR-0014 A–G,工作区叠加 ADR-0015 goal
 # 面与 widget_context;协议重新对齐,退役 ../qaqh-backend-snap 快照(目录已不存在)。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
@@ -77,6 +52,10 @@ qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" 
 qaqh-types = { path = "../qaqh-backend/crates/qaqh-types" }
 qaqh-config-api = { path = "../qaqh-backend/crates/qaqh-config-api" }
 qaqh-profile = { path = "../qaqh-backend/crates/qaqh-profile" }
+
+# ---- 第三方 ----
+futures = "0.3"
+base64 = "0.22"
 # Markdown 流式渲染(M4):pulldown-cmark 事件流,MIT/Apache。
 pulldown-cmark = { version = "0.13", default-features = false }
 # AST 代码高亮(M5):官方 highlighter + 各语言 grammar(MIT 系)。
@@ -93,8 +72,9 @@ serde_json = "1"
 # 仅用 tokio::time::sleep(桥线程等待重试);runtime 复用 qaqh-client 的全局运行时。
 tokio = { version = "1", default-features = false, features = ["time"] }
 
-# 内存受限环境(可用 ~1.5Gi):dev profile 压低编译峰值——
+# 内存受限环境:dev profile 压低编译峰值——
 # 16 个 codegen 单元压低单 crate 编译峰值,limited 调试信息压低产物与链接期峰值。
+# workspace 级 profile 对全部成员生效;拆 crate 后单 crate 峰值只减不增。
 [profile.dev]
 incremental = true
 codegen-units = 16

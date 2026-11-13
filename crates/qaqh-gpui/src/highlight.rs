@@ -112,35 +112,36 @@ impl Engine {
                 }
             };
         }
+        // query 路径相对本源文件:crates/<crate>/src → 仓库根 assets(三层上溯)。
         load!(
             "rust",
-            "../assets/queries/rust.scm",
+            "../../../assets/queries/rust.scm",
             tree_sitter_rust::LANGUAGE
         );
         load!(
             "python",
-            "../assets/queries/python.scm",
+            "../../../assets/queries/python.scm",
             tree_sitter_python::LANGUAGE
         );
         load!(
             "javascript",
-            "../assets/queries/javascript.scm",
+            "../../../assets/queries/javascript.scm",
             tree_sitter_javascript::LANGUAGE
         );
         load!(
             "typescript",
-            "../assets/queries/typescript.scm",
+            "../../../assets/queries/typescript.scm",
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT
         );
-        load!("go", "../assets/queries/go.scm", tree_sitter_go::LANGUAGE);
+        load!("go", "../../../assets/queries/go.scm", tree_sitter_go::LANGUAGE);
         load!(
             "json",
-            "../assets/queries/json.scm",
+            "../../../assets/queries/json.scm",
             tree_sitter_json::LANGUAGE
         );
         load!(
             "bash",
-            "../assets/queries/bash.scm",
+            "../../../assets/queries/bash.scm",
             tree_sitter_bash::LANGUAGE
         );
         Self {

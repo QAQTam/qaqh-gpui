@@ -74,6 +74,14 @@ pub struct ArgStream {
     pub args_complete: bool,
 }
 
+/// ADR-0016 封箱投影:标记旧线已封箱所需的后继入口与工作简述。
+/// HandoffSealed 双发(封箱线/后继线),仅封箱线本线落库;整字段替换幂等。
+/// bootstrap 快照不携带本字段;封箱是不可逆历史事实,resync 后保留。
+pub struct HandoffSeal {
+    pub successor_session_id: String,
+    pub work_summary: String,
+}
+
 pub struct SessionStore {
     pub snapshot_pending: bool,
     pub buffered_frames: Vec<qaqh_ringing_contract::events::SessionEventFrame>,
@@ -108,6 +116,8 @@ pub struct SessionStore {
     pub subagents: Vec<SubagentView>,
     /// 会话目标(ADR-0015):bootstrap + goal_updated 事件维护。
     pub goal: Option<GoalView>,
+    /// 封箱事实(ADR-0016):HandoffSealed 事件维护;UI 投影(封箱标记/后继入口)读此。
+    pub handoff_seal: Option<HandoffSeal>,
     pub exec_sessions: Vec<ExecSessionView>,
     /// 执行会话输出:exec_session_id → (已收 offset 上界, 累计文本)。
     pub exec_output_tail: Vec<(ExecSessionId, u64, String)>,
@@ -215,6 +225,7 @@ impl SessionStore {
             interactions: Vec::new(),
             subagents: Vec::new(),
             goal: None,
+            handoff_seal: None,
             exec_sessions: Vec::new(),
             exec_output_tail: Vec::new(),
             driver: None,
@@ -495,6 +506,13 @@ impl SessionStore {
             first_message: Some(doc),
             handoff_from: Some(self.session_id.clone()),
         });
+    }
+
+    /// ADR-0016 投影切换:跳后继会话(Select = attach + activate_stream + bootstrap)。
+    pub fn open_handoff_successor(&mut self) {
+        if let Some(seal) = &self.handoff_seal {
+            let _ = self.requests.unbounded_send(BridgeRequest::Select(seal.successor_session_id.clone()));
+        }
     }
 
     pub fn cancel_turn(&mut self) {

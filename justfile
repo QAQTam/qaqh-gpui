@@ -30,7 +30,7 @@ package:
 # 只装配 NSIS 安装包(跳过构建,需 release exe 已在)
 [windows]
 package:
-    cargo packager --release --formats nsis
+    cargo packager --release --formats nsis -p qaqh-gpui
 
 # 清理构建产物
 clean:

@@ -17,7 +17,7 @@ use qaqh_ringing_contract::state::ToolCallState;
 use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_ringing_contract::state::TurnView;
 
-use crate::store::{ArgStream, SessionStore};
+use crate::store::{ArgStream, HandoffSeal, SessionStore};
 
 pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.seq = state.seq;
@@ -341,6 +341,18 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
         SessionEvent::GoalUpdated { goal } => {
             // 整字段替换;None = 已清除。链根与当前会话双流可能都发,幂等。
             store.goal = goal;
+        }
+        SessionEvent::HandoffSealed {
+            sealed_session_id,
+            successor_session_id,
+            work_summary,
+            ..
+        } => {
+            // ADR-0016 纯信息面:fork 本体不依赖本事件。仅封箱线本线需要标记,
+            // 后继线经 session.list 正常渲染。双发幂等:整字段替换(同 GoalUpdated 口径)。
+            if sealed_session_id == store.session_id {
+                store.handoff_seal = Some(HandoffSeal { successor_session_id, work_summary });
+            }
         }
     }
 }
