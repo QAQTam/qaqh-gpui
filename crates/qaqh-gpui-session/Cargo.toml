@@ -8,6 +8,10 @@ description = "QAQ-Harness GPUI 前端会话特性 crate:SessionStore + 时间�
 [lints]
 workspace = true
 
+[features]
+# 验收驱动机制(simulate_closed_bridge 随 SessionStore 在本 crate);由 bin 的 acceptance 转发启用。
+acceptance = []
+
 [dependencies]
 qaqh-gpui-wire = { workspace = true }
 qaqh-gpui-kit = { workspace = true }

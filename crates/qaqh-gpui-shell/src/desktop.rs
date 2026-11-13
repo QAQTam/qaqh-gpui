@@ -2,12 +2,12 @@
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
 use qaqh_gpui_kit::theme::Palette;
 use crate::daemon::DaemonStore;
-use qaqh_gpui_session::store::{SessionRow, SessionStore};
+use qaqh_gpui_session::store::SessionRow;
 use qaqh_gpui_kit::primitives::action_button;
-use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, Window, div, prelude::*, px};
+use gpui::{App, Context, Div, FontWeight, SharedString, div, prelude::*, px};
 use gpui_component::input::Input;
 use gpui_component::Sizable;
-use qaqh_client::{CommandTarget, RingingCommand, SessionListEntry};
+use qaqh_client::SessionListEntry;
 
 pub fn notify(cx: &App, session: &str, title: &str) {
     cx.show_system_notification(gpui::SystemNotification {

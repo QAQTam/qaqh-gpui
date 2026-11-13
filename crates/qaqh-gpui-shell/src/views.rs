@@ -3,63 +3,40 @@
 //! 颜色一律取 theme::Palette 语义槽;输入框用 gpui-component 的 Input/Textarea
 //! (状态实体 + 组件渲染,IME/选区/剪贴板由引擎承担)。
 
-use std::collections::HashSet;
 
 use gpui::prelude::*;
 use gpui::AnyElement;
 use gpui::ClickEvent;
 use gpui::Context;
 use gpui::Div;
-use gpui::Entity;
 use gpui::FontWeight;
-use gpui::Hsla;
 use gpui::InteractiveElement;
 use gpui::IntoElement;
-use gpui::KeyDownEvent;
 use gpui::ParentElement;
-use gpui::Render;
-use gpui::FollowMode;
 use gpui::SharedString;
 use gpui::StatefulInteractiveElement;
 use gpui::Styled;
 use gpui::Window;
 use gpui::div;
-use gpui::list;
 use gpui::px;
 use gpui::transparent_black;
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, Textarea};
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{Sizable, Size, WindowExt};
-use qaqh_ringing_contract::fact::ActivityState;
-use qaqh_ringing_contract::fact::AssistantBlockKind;
-use qaqh_ringing_contract::fact::ActorKind;
-use qaqh_ringing_contract::fact::InputPurpose;
-use qaqh_ringing_contract::fact::ContentValue;
-use qaqh_ringing_contract::fact::InteractionKind;
-use qaqh_ringing_contract::fact::ToolCallId;
-use qaqh_ringing_contract::state::ExecSessionState;
-use qaqh_ringing_contract::state::TimelineEntry;
-use qaqh_ringing_contract::state::ToolCallState;
-use qaqh_ringing_contract::state::ToolCallView;
-use qaqh_types::ToolCallOutcome;
+use gpui_component::button::ButtonVariants;
+use gpui_component::input::Input;
+use gpui_component::Sizable;
 use qaqh_config_api::ConfigPatch;
 
-use qaqh_gpui_wire::ask;
 use qaqh_gpui_wire::bridge::BridgeRequest;
 use qaqh_gpui_kit::settings;
 use qaqh_gpui_kit::settings::Density;
 use crate::daemon::DaemonStore;
 use qaqh_gpui_session::store::SessionRow;
-use qaqh_gpui_session::store::{ArgStream, SessionStore, SettingsEditor};
-use qaqh_gpui_session::store::StreamState;
+use qaqh_gpui_session::store::SettingsEditor;
 use qaqh_gpui_kit::theme::ActiveTheme;
 use qaqh_gpui_kit::theme::Palette;
 use qaqh_gpui_kit::theme::ThemeMode;
-use qaqh_gpui_kit::primitives::{action_button, section_card, section_header, setting_row, segmented_button, step_button, status_dot_colored};
+use qaqh_gpui_kit::primitives::{action_button, section_card, setting_row, segmented_button, step_button, status_dot_colored};
 use qaqh_gpui_session::timeline::status_dot;
-use qaqh_gpui_session::store::{next_model, next_option, model_effort_levels};
+use qaqh_gpui_session::store::model_effort_levels;
 
 /// 侧栏条目:选中 = accent 左边条 + selected 底色(借鉴 zed project_panel
 /// 的「背景 + 侧边状态边」模式,不搞圆角高亮)。

@@ -1,12 +1,12 @@
 //! Desktop lifecycle and controls, independent of timeline rendering.
-use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
+use qaqh_gpui_wire::bridge::BridgeRequest;
 use qaqh_gpui_kit::theme::Palette;
 use crate::store::SessionStore;
 use qaqh_gpui_kit::primitives::action_button;
-use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, Window, div, prelude::*, px};
+use gpui::{Context, Div, KeyDownEvent, PathPromptOptions, Window, div, prelude::*, px};
 use gpui_component::input::Input;
 use gpui_component::Sizable;
-use qaqh_client::{CommandTarget, RingingCommand, SessionListEntry};
+use qaqh_client::{CommandTarget, RingingCommand};
 /// 会话控制条:状态 pill + 分组幽灵动作(控制权 | 检索/导出 | 会话管理 | 危险区),
 /// 分隔线收口;停止会话是破坏性动作,放最右并落 Danger 色。
 pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t: &Palette) -> Div {

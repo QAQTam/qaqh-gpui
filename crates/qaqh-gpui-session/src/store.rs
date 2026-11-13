@@ -13,13 +13,11 @@ use gpui::Context;
 use gpui::Entity;
 use gpui::Window;
 use gpui::{ListAlignment, ListState, px};
-use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
 use qaqh_ringing_contract::fact::BlockId;
 use qaqh_ringing_contract::fact::ExecSessionId;
 use qaqh_ringing_contract::fact::InteractionId;
-use qaqh_ringing_contract::fact::InteractionKind;
 use qaqh_ringing_contract::fact::ToolCallId;
 use qaqh_ringing_contract::fact::TurnId;
 use qaqh_ringing_contract::state::DriverState;
@@ -33,14 +31,11 @@ use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_ringing_contract::state::TurnView;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
-use qaqh_gpui_wire::bridge::BridgeMsg;
 use qaqh_gpui_wire::bridge::BridgeRequest;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
-use gpui_component::WindowExt;
 use qaqh_client::{
     CommandTarget, RingingCommand, SessionSettingsPatch, ToolsSettingPatch,
 };
-use qaqh_config_api::ConfigDto;
 use qaqh_profile::ProfilesDocument;
 use qaqh_types::{ModelSelection, SessionListEntry, SettingValue};
 

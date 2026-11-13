@@ -14,7 +14,8 @@ workspace = true
 
 [features]
 # Local native acceptance driver; deliberately absent from release builds.
-acceptance = []
+# 转发到 session:模拟断桥等验收机制随 SessionStore 在 session crate。
+acceptance = ["qaqh-gpui-session/acceptance"]
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 # 嵌入 resources/windows/app.rc(应用图标);Linux 构建不拉这个包。

@@ -7,43 +7,23 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
-use gpui::App;
 use gpui::AppContext as _;
 use gpui::Context;
 use gpui::Entity;
 use gpui::Window;
-use gpui::{ListAlignment, ListState, px};
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::fact::ActivityState;
-use qaqh_ringing_contract::fact::AssistantBlockKind;
-use qaqh_ringing_contract::fact::BlockId;
-use qaqh_ringing_contract::fact::ExecSessionId;
-use qaqh_ringing_contract::fact::InteractionId;
 use qaqh_ringing_contract::fact::InteractionKind;
-use qaqh_ringing_contract::fact::ToolCallId;
-use qaqh_ringing_contract::fact::TurnId;
-use qaqh_ringing_contract::state::DriverState;
-use qaqh_ringing_contract::state::ExecSessionView;
-use qaqh_ringing_contract::state::GoalStatus;
-use qaqh_ringing_contract::state::GoalView;
-use qaqh_ringing_contract::state::InteractionView;
-use qaqh_ringing_contract::state::SubagentView;
-use qaqh_ringing_contract::state::TimelineEntry;
-use qaqh_ringing_contract::state::ToolCallView;
-use qaqh_ringing_contract::state::TurnView;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
 use qaqh_gpui_wire::bridge::BridgeMsg;
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use gpui_component::input::{InputEvent, InputState, TextareaState};
+use gpui_component::input::{InputEvent, InputState};
 use gpui_component::WindowExt;
-use qaqh_client::{
-    CommandTarget, RingingCommand, SessionSettingsPatch, ToolsSettingPatch,
-};
 use qaqh_config_api::ConfigDto;
 use qaqh_profile::ProfilesDocument;
-use qaqh_types::{ModelSelection, SessionListEntry, SettingValue};
-use qaqh_gpui_session::store::{SessionStore, SessionRow, TodoRow, WorkspaceGroup, SettingsEditor, AccountService, AccountSignIn, StreamState, rows_from, todos_from, groups, model_options_from};
+use qaqh_types::ModelSelection;
+use qaqh_gpui_session::store::{SessionStore, SessionRow, TodoRow, SettingsEditor, AccountService, AccountSignIn, StreamState, rows_from, todos_from, model_options_from};
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
