@@ -177,6 +177,16 @@ impl SessionStore {
         if !draft.text.is_empty() {
             composer.update(cx, |state, cx| state.set_value(draft.text.as_str(), window, cx));
         }
+        // 滚动条跟随滚动位置重绘:滚动帧经 defer 通知实体(gpui list 的内部
+        // 借用释放后再 update,MessageScroller 同款防借用模式)。
+        let timeline_list = ListState::new(1, ListAlignment::Top, px(200.));
+        let weak_store = cx.weak_entity();
+        timeline_list.set_scroll_handler(move |_, _, cx| {
+            let weak_store = weak_store.clone();
+            cx.defer(move |cx| {
+                let _ = weak_store.update(cx, |_, cx| cx.notify());
+            });
+        });
         Self {
             snapshot_pending: true,
             buffered_frames: Vec::new(),
@@ -211,7 +221,7 @@ impl SessionStore {
             stream: StreamState::Connecting,
             md_cache: crate::markdown::ParseCache::default(),
             tok_samples: std::collections::VecDeque::new(),
-            timeline_list: ListState::new(1, ListAlignment::Top, px(200.)),
+            timeline_list,
             timeline_follow_setting: None,
             settings: None,
             settings_pending: false,

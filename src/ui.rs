@@ -30,6 +30,7 @@ use gpui::transparent_black;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_component::dialog::Dialog;
 use gpui_component::input::{Input, Textarea};
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Sizable, Size, WindowExt};
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
@@ -2188,9 +2189,12 @@ impl Render for SessionStore {
             self.timeline_follow_setting = Some(follow);
         }
         let entity = cx.entity();
+        // 行 padding 挂在行上而非 list 上:gpui list 的滚动范围只从 items 高度
+        // 算,list 自带 padding 会让滚动条 thumb 永远到不了底(gpui-component
+        // MessageScroller 注释同口径)。
         let timeline = list(list_state, move |index, _, cx| {
             let store = entity.read(cx);
-            let row = div().w_full();
+            let row = div().w_full().px_3().when(index == 0, |row| row.pt_3());
             let gap = px((8.0 + ty.density_shift).max(2.));
             if let Some(entry) = store.entries.get(index) {
                 if hidden_timeline_entry(entry) {
@@ -2215,7 +2219,7 @@ impl Render for SessionStore {
                     _ => None,
                 }
             }).collect();
-            let footer = row.flex().flex_col().gap(gap)
+            let footer = row.pb_3().flex().flex_col().gap(gap)
                 .children(
                     store.streaming.iter().enumerate()
                         .filter(|(_, (_, kind, text))| has_assistant_text(*kind, text))
@@ -2283,14 +2287,15 @@ impl Render for SessionStore {
         .min_h_0()
         .w_full()
         .max_w(px(ty.content_width + 24.))
-        .mx_auto()
-        .p_3();
+        .mx_auto();
 
         // 消息浮面(Codex MainContentSurface 口径):圆角 16 的浮层托住时间线,
         // 与四周留 8px 呼吸边;面板色比 bg 提一级,不再通铺到底。
         // 必须显式 .flex().flex_col():gpui div 默认 display 是 Block,
         // Block 流里 list 的 flex_1 失效,高度塌缩为 0 → 正文全空。
+        // vertical_scrollbar:滚动条叠在 viewport 右缘,拖拽/滚轮共用 ListState。
         let timeline = div()
+            .id("timeline-panel")
             .flex()
             .flex_col()
             .flex_1()
@@ -2302,6 +2307,7 @@ impl Render for SessionStore {
             .border_1()
             .border_color(t.border)
             .overflow_hidden()
+            .vertical_scrollbar(&self.timeline_list)
             .child(timeline);
 
         // composer:组件库 Textarea(auto_grow,Enter 提交);受阻原因降为
