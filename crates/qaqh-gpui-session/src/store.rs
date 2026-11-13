@@ -770,3 +770,28 @@ impl AccountSignIn {
     }
 }
 
+pub fn next_option<'a, T: PartialEq>(options: &'a [T], current: Option<&T>) -> Option<&'a T> {
+    let index = current.and_then(|current| options.iter().position(|option| option == current));
+    match index {
+        Some(index) => options.get(index + 1).or_else(|| options.first()),
+        None => options.first(),
+    }
+}
+
+pub fn next_model<'a>(
+    options: &'a [qaqh_types::ModelSelection],
+    current: Option<&qaqh_types::ModelSelection>,
+) -> Option<&'a qaqh_types::ModelSelection> {
+    let current = current.and_then(|current| options.iter().find(|model| {
+        model.provider_id == current.provider_id && model.model_id == current.model_id
+    }));
+    next_option(options, current)
+}
+
+pub fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaqh_types::ModelSelection) -> Vec<String> {
+    catalog.providers.get(&model.provider_id)
+        .and_then(|provider| provider.models.get(&model.model_id))
+        .filter(|model| model.capabilities.reasoning)
+        .map(|model| model.reasoning_levels.clone()).unwrap_or_default()
+}
+

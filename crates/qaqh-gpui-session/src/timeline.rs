@@ -56,6 +56,8 @@ use crate::store::StreamState;
 use qaqh_gpui_kit::theme::ActiveTheme;
 use qaqh_gpui_kit::theme::Palette;
 use qaqh_gpui_kit::theme::ThemeMode;
+use qaqh_gpui_kit::primitives::action_button;
+use crate::store::{next_model, next_option, model_effort_levels};
 
 pub(crate) fn content_text(value: &ContentValue) -> &str {
     match value {

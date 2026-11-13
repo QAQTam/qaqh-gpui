@@ -6,7 +6,7 @@ use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_component::{Sizable, Size};
 
 /// 定色状态点(终态绿/红维度专用)。
-fn status_dot_colored(label: &str, color: Hsla, _t: &Palette) -> Div {
+pub fn status_dot_colored(label: &str, color: Hsla, _t: &Palette) -> Div {
     div()
         .flex()
         .items_center()
@@ -17,7 +17,7 @@ fn status_dot_colored(label: &str, color: Hsla, _t: &Palette) -> Div {
 
 
 /// 设置分区卡:小节标题 + 卡片容器,行间 hairline 由 setting_row 自带。
-pub(crate) fn section_card(title: &str, rows: Vec<Div>, t: &Palette) -> Div {
+pub fn section_card(title: &str, rows: Vec<Div>, t: &Palette) -> Div {
     div()
         .flex()
         .flex_col()
@@ -33,7 +33,7 @@ pub(crate) fn section_card(title: &str, rows: Vec<Div>, t: &Palette) -> Div {
         )
 }
 
-pub(crate) fn section_header(title: &str, t: &Palette) -> Div {
+pub fn section_header(title: &str, t: &Palette) -> Div {
     div()
         .pt_4()
         .pb_1()
@@ -41,7 +41,7 @@ pub(crate) fn section_header(title: &str, t: &Palette) -> Div {
 }
 
 /// 设置行(zed settings_ui 行布局):左标题+描述,右控件,行间分隔线。
-pub(crate) fn setting_row(label: &str, desc: &str, control: AnyElement, t: &Palette) -> Div {
+pub fn setting_row(label: &str, desc: &str, control: AnyElement, t: &Palette) -> Div {
     div()
         .flex()
         .items_center()
@@ -62,7 +62,7 @@ pub(crate) fn setting_row(label: &str, desc: &str, control: AnyElement, t: &Pale
         .child(control)
 }
 
-pub(crate) fn segmented_button(
+pub fn segmented_button(
     id: String,
     label: impl Into<SharedString>,
     active: bool,
@@ -86,7 +86,7 @@ pub(crate) fn segmented_button(
         .child(label.into())
 }
 
-fn step_button(
+pub fn step_button(
     id: &'static str,
     glyph: &'static str,
     t: &Palette,
@@ -109,7 +109,7 @@ fn step_button(
         .child(glyph)
 }
 
-pub(crate) fn action_button(
+pub fn action_button(
     cx: &gpui::App,
     id: String,
     label: &'static str,

@@ -57,6 +57,9 @@ use qaqh_gpui_session::store::StreamState;
 use qaqh_gpui_kit::theme::ActiveTheme;
 use qaqh_gpui_kit::theme::Palette;
 use qaqh_gpui_kit::theme::ThemeMode;
+use qaqh_gpui_kit::primitives::{action_button, section_card, section_header, setting_row, segmented_button, step_button, status_dot_colored};
+use qaqh_gpui_session::timeline::status_dot;
+use qaqh_gpui_session::store::{next_model, next_option, model_effort_levels};
 
 /// 侧栏条目:选中 = accent 左边条 + selected 底色(借鉴 zed project_panel
 /// 的「背景 + 侧边状态边」模式,不搞圆角高亮)。
@@ -704,31 +707,6 @@ pub(crate) fn settings_page(
         .when(is_local, |page| page.child(footer))
 }
 
-fn next_option<'a, T: PartialEq>(options: &'a [T], current: Option<&T>) -> Option<&'a T> {
-    let index = current.and_then(|current| options.iter().position(|option| option == current));
-    match index {
-        Some(index) => options.get(index + 1).or_else(|| options.first()),
-        None => options.first(),
-    }
-}
-
-fn next_model<'a>(
-    options: &'a [qaqh_types::ModelSelection],
-    current: Option<&qaqh_types::ModelSelection>,
-) -> Option<&'a qaqh_types::ModelSelection> {
-    let current = current.and_then(|current| options.iter().find(|model| {
-        model.provider_id == current.provider_id && model.model_id == current.model_id
-    }));
-    next_option(options, current)
-}
-
-fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaqh_types::ModelSelection) -> Vec<String> {
-    catalog.providers.get(&model.provider_id)
-        .and_then(|provider| provider.models.get(&model.model_id))
-        .filter(|model| model.capabilities.reasoning)
-        .map(|model| model.reasoning_levels.clone()).unwrap_or_default()
-}
-
 /// 新建会话面板从后端目录选择模型与模型支持的推理档位。
 pub(crate) fn new_session_panel(
     daemon: &mut DaemonStore,
@@ -926,4 +904,3 @@ pub(crate) fn permission_row(daemon: &DaemonStore, cx: &mut Context<DaemonStore>
     };
     setting_row("权限档位", "daemon 全局权限策略", control.into_any_element(), t)
 }
-
