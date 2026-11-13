@@ -1,7 +1,8 @@
-use crate::ui::{new_session_panel, settings_page, sidebar_row, team_dock, todo_dock};
+use crate::views::{new_session_panel, settings_page, sidebar_row, team_dock, todo_dock};
 use qaqh_gpui_wire::bridge::BridgeRequest;
 use qaqh_gpui_kit::{settings, theme::ActiveTheme};
-use crate::store::{DaemonStore, WorkspaceGroup};
+use crate::daemon::DaemonStore;
+use qaqh_gpui_session::store::WorkspaceGroup;
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, KeyDownEvent, SharedString, Window, div, px};
 
@@ -24,7 +25,7 @@ impl Render for DaemonStore {
             })
             .cloned()
             .collect();
-        let groups: Vec<WorkspaceGroup> = crate::store::groups(&visible, &self.workspaces);
+        let groups: Vec<WorkspaceGroup> = qaqh_gpui_session::store::groups(&visible, &self.workspaces);
         let mut rows: Vec<AnyElement> = Vec::new();
         for group in &groups {
             let key = group.id.clone().unwrap_or_else(|| "ungrouped".into());

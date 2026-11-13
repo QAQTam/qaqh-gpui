@@ -11,9 +11,10 @@ use qaqh_profile::{ModelDef, ProfilesDocument, ProviderDef};
 use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use crate::store::{DaemonStore, SettingsEditor};
+use crate::daemon::DaemonStore;
+use qaqh_gpui_session::store::SettingsEditor;
 use qaqh_gpui_kit::theme::Palette;
-use crate::ui::{action_button, section_header, segmented_button, setting_row};
+use qaqh_gpui_kit::primitives::{action_button, section_header, segmented_button, setting_row};
 
 type Submit = dyn Fn(&[Field], &mut DaemonStore, &mut Context<DaemonStore>) -> Result<(), String>;
 
@@ -272,7 +273,7 @@ fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -
     let signing = daemon
         .sign_in
         .as_ref()
-        .is_some_and(|flow| flow.service == crate::store::AccountService::Siwc);
+        .is_some_and(|flow| flow.service == qaqh_gpui_session::store::AccountService::Siwc);
     if signing {
         card = card.child(button(cx, t, "siwc-signin-cancel", "取消登录", move |daemon, _, _| {
             daemon.sign_in_cancel();
@@ -287,17 +288,17 @@ fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -
                         }
                     }))
                     .child(button(cx, t, "siwc-signout", "登出", move |daemon, _, _| {
-                        daemon.sign_out(crate::store::AccountService::Siwc);
+                        daemon.sign_out(qaqh_gpui_session::store::AccountService::Siwc);
                     }));
                 if status.status == st::SiwcConnectionState::ReauthRequired {
                     card = card.child(button(cx, t, "siwc-signin", "重新登录", move |daemon, _, _| {
-                        daemon.sign_in_start(crate::store::AccountService::Siwc);
+                        daemon.sign_in_start(qaqh_gpui_session::store::AccountService::Siwc);
                     }));
                 }
             }
             _ => {
                 card = card.child(button(cx, t, "siwc-signin", "登录 ChatGPT 套餐", move |daemon, _, _| {
-                    daemon.sign_in_start(crate::store::AccountService::Siwc);
+                    daemon.sign_in_start(qaqh_gpui_session::store::AccountService::Siwc);
                 }));
             }
         }
@@ -353,7 +354,7 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
     let signing = daemon
         .sign_in
         .as_ref()
-        .is_some_and(|flow| flow.service == crate::store::AccountService::Dsaccount);
+        .is_some_and(|flow| flow.service == qaqh_gpui_session::store::AccountService::Dsaccount);
     if signing {
         card = card.child(button(cx, t, "ds-signin-cancel", "取消登录", move |daemon, _, _| {
             daemon.sign_in_cancel();
@@ -366,11 +367,11 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                 }
             }))
             .child(button(cx, t, "ds-signout", "登出", move |daemon, _, _| {
-                daemon.sign_out(crate::store::AccountService::Dsaccount);
+                daemon.sign_out(qaqh_gpui_session::store::AccountService::Dsaccount);
             }));
     } else {
         card = card.child(button(cx, t, "ds-signin", "登录 DeepSeek 账号", move |daemon, _, _| {
-            daemon.sign_in_start(crate::store::AccountService::Dsaccount);
+            daemon.sign_in_start(qaqh_gpui_session::store::AccountService::Dsaccount);
         }));
     }
     if let Some(balance) = &daemon.ds_balance {
@@ -675,7 +676,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
         .flex()
         .flex_col()
         .child(section_header("运行策略", t))
-        .child(crate::ui::permission_row(daemon, cx, t))
+        .child(crate::views::permission_row(daemon, cx, t))
         .child(toggle_config(
             cx,
             t,
@@ -1461,7 +1462,7 @@ fn choose_model(
         daemon.lines.push("模型目录尚未载入".into());
         return;
     };
-    let options = crate::store::model_options_from(catalog);
+    let options = qaqh_gpui_session::store::model_options_from(catalog);
     if options.is_empty() {
         daemon.lines.push("请先在设置中添加并启用服务商模型".into());
         return;

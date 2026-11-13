@@ -5,5 +5,6 @@
 //! 分层设计借鉴 zed 的 Appearance/settings(仅借鉴设计,不搬代码)。
 
 pub mod kit;
+pub mod primitives;
 pub mod settings;
 pub mod theme;
