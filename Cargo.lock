@@ -5084,12 +5084,12 @@ dependencies = [
  "pulldown-cmark",
  "qaqh-client",
  "qaqh-config-api",
+ "qaqh-gpui-wire",
  "qaqh-profile",
  "qaqh-ringing-contract",
  "qaqh-types",
  "serde",
  "serde_json",
- "tokio",
  "tree-sitter-bash",
  "tree-sitter-go",
  "tree-sitter-highlight",
@@ -5098,6 +5098,22 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "qaqh-gpui-wire"
+version = "3.0.20261109"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "qaqh-client",
+ "qaqh-config-api",
+ "qaqh-profile",
+ "qaqh-ringing-contract",
+ "qaqh-types",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

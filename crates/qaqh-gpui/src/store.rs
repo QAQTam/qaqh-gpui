@@ -33,8 +33,8 @@ use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_ringing_contract::state::TurnView;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
-use crate::bridge::BridgeMsg;
-use crate::bridge::BridgeRequest;
+use qaqh_gpui_wire::bridge::BridgeMsg;
+use qaqh_gpui_wire::bridge::BridgeRequest;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
 use gpui_component::WindowExt;
 use qaqh_client::{
@@ -85,7 +85,7 @@ pub struct HandoffSeal {
 pub struct SessionStore {
     pub snapshot_pending: bool,
     pub buffered_frames: Vec<qaqh_ringing_contract::events::SessionEventFrame>,
-    pub outbox: Option<crate::delivery::Outbox>,
+    pub outbox: Option<qaqh_gpui_wire::delivery::Outbox>,
     pub images: Vec<qaqh_client::ImageBlock>,
     pub attachments: Vec<qaqh_client::ContentRef>,
     pub attachment_pending: bool,
@@ -255,7 +255,7 @@ impl SessionStore {
         if self.snapshot_pending { return Some("会话状态正在同步"); }
         if self.attachment_pending { return Some("附件正在准备"); }
         if self.outbox.as_ref().is_some_and(|o| matches!(o.state,
-            crate::delivery::DeliveryState::Sending | crate::delivery::DeliveryState::Accepted | crate::delivery::DeliveryState::Uncertain)) {
+            qaqh_gpui_wire::delivery::DeliveryState::Sending | qaqh_gpui_wire::delivery::DeliveryState::Accepted | qaqh_gpui_wire::delivery::DeliveryState::Uncertain)) {
             return Some("上一条消息尚未确认，请先查回执");
         }
         if self.driver.as_ref().and_then(|d| d.holder.as_ref()).is_some_and(|holder| Some(holder) != self.client_session_id.as_ref()) {
@@ -293,14 +293,14 @@ impl SessionStore {
         if text.is_empty() && self.images.is_empty() && self.attachments.is_empty() {
             return None;
         }
-        let outbox = crate::delivery::Outbox {
+        let outbox = qaqh_gpui_wire::delivery::Outbox {
             command_id: qaqh_ringing_contract::ulid::generate_ulid(),
             message: qaqh_client::ConversationSendMessage {
                 text, images: self.images.clone(), attachments: Some(self.attachments.clone()),
                 message_id: None, input_purpose: Default::default(), as_system: false,
                 inter_agent: None, subagent_terminal: None, widget_context: None,
             },
-            state: crate::delivery::DeliveryState::Sending, detail: String::new(),
+            state: qaqh_gpui_wire::delivery::DeliveryState::Sending, detail: String::new(),
         };
         self.outbox = Some(outbox);
         if let Err(error) = self.persist_draft(cx) {
@@ -326,9 +326,9 @@ impl SessionStore {
     }
     pub fn retry_message(&mut self) {
         if let Some(outbox) = &mut self.outbox {
-            outbox.state = crate::delivery::DeliveryState::Sending;
+            outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Sending;
             if self.requests.unbounded_send(BridgeRequest::SendMessage { seed: self.session_id.clone(), outbox: outbox.clone() }).is_err() {
-                outbox.state = crate::delivery::DeliveryState::Uncertain;
+                outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Uncertain;
                 outbox.detail = "连接已关闭，请重新连接".into();
             }
         }
@@ -787,7 +787,7 @@ fn decode<T: serde::de::DeserializeOwned>(
 
 pub struct DaemonStore {
     pub last_operation: Option<String>,
-    pub connection: crate::bridge::ConnectionState,
+    pub connection: qaqh_gpui_wire::bridge::ConnectionState,
     pub workbench: crate::workbench::Workbench,
     pub session_search: Entity<InputState>,
     pub show_archived: bool,
@@ -850,7 +850,7 @@ impl DaemonStore {
         .detach();
         Self {
             last_operation: None,
-            connection: crate::bridge::ConnectionState::Connecting,
+            connection: qaqh_gpui_wire::bridge::ConnectionState::Connecting,
             collapsed: workbench.collapsed.iter().cloned().collect(),
             workbench,
             session_search,
@@ -884,7 +884,7 @@ impl DaemonStore {
     pub fn handle(&mut self, message: BridgeMsg, window: &mut Window, cx: &mut Context<Self>) {
         match message {
             BridgeMsg::FromConnection(generation, message) => {
-                if generation == crate::bridge::connection_generation() { self.handle(*message, window, cx); }
+                if generation == qaqh_gpui_wire::bridge::connection_generation() { self.handle(*message, window, cx); }
             }
             BridgeMsg::Operation(name, target, result) => {
                 let label = match name.split('.').next().unwrap_or_default() {
@@ -896,7 +896,7 @@ impl DaemonStore {
                 };
                 match result {
                     Ok(ack) => {
-                        crate::diagnostics::record(if ack.status == qaqh_client::RingingCommandAckStatus::Accepted { "command_accepted" } else { "command_rejected" },
+                        qaqh_gpui_wire::diagnostics::record(if ack.status == qaqh_client::RingingCommandAckStatus::Accepted { "command_accepted" } else { "command_rejected" },
                             match &target { qaqh_client::CommandTarget::Session { session_id } => Some(session_id.as_str()), _ => None }, Some(&ack.command_id), None);
                         if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                             self.last_operation = Some(format!("{label} · 被拒绝 · {} {}", ack.code.unwrap_or_default(), ack.message.unwrap_or_default()));
@@ -918,7 +918,7 @@ impl DaemonStore {
                 cx.notify();
             }
             BridgeMsg::Connection(state) => {
-                let id = match &state { crate::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None };
+                let id = match &state { qaqh_gpui_wire::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None };
                 self.connection = state;
                 for store in &self.stores {
                     store.update(cx, |store, cx| {
@@ -937,21 +937,21 @@ impl DaemonStore {
                 if let Some(store) = self.stores.iter().find(|store| store.read(cx).session_id == seed) {
                     store.update(cx, |store, cx| {
                         if let Some(outbox) = &mut store.outbox && outbox.command_id == id {
-                            let was_pending = matches!(outbox.state, crate::delivery::DeliveryState::Sending | crate::delivery::DeliveryState::Uncertain);
+                            let was_pending = matches!(outbox.state, qaqh_gpui_wire::delivery::DeliveryState::Sending | qaqh_gpui_wire::delivery::DeliveryState::Uncertain);
                             match result {
-                                crate::bridge::DeliveryResult::Ack(ack) => outbox.acknowledge(&ack),
-                                crate::bridge::DeliveryResult::Receipt(status) => outbox.receipt(&status),
-                                crate::bridge::DeliveryResult::Unknown(detail) => {
-                                    outbox.state = crate::delivery::DeliveryState::Uncertain;
+                                qaqh_gpui_wire::bridge::DeliveryResult::Ack(ack) => outbox.acknowledge(&ack),
+                                qaqh_gpui_wire::bridge::DeliveryResult::Receipt(status) => outbox.receipt(&status),
+                                qaqh_gpui_wire::bridge::DeliveryResult::Unknown(detail) => {
+                                    outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Uncertain;
                                     outbox.detail = detail;
                                 }
                             }
-                            if was_pending && matches!(outbox.state, crate::delivery::DeliveryState::Accepted | crate::delivery::DeliveryState::Succeeded)
+                            if was_pending && matches!(outbox.state, qaqh_gpui_wire::delivery::DeliveryState::Accepted | qaqh_gpui_wire::delivery::DeliveryState::Succeeded)
                                 && store.composer.read(cx).value().trim() == outbox.message.text {
                                 store.composer.update(cx, |composer, cx| composer.set_value("", window, cx));
                                 store.images.clear(); store.attachments.clear();
                             }
-                            if outbox.state == crate::delivery::DeliveryState::Succeeded {
+                            if outbox.state == qaqh_gpui_wire::delivery::DeliveryState::Succeeded {
                                 outbox.message.images.clear(); outbox.message.attachments = None; outbox.message.text.clear();
                             }
                         }
@@ -965,8 +965,8 @@ impl DaemonStore {
                     store.update(cx, |store, cx| {
                         store.attachment_pending = false;
                         match result {
-                            Ok(crate::bridge::PreparedAttachment::Image(image)) => store.images.push(image),
-                            Ok(crate::bridge::PreparedAttachment::Content(reference)) => store.attachments.push(reference),
+                            Ok(qaqh_gpui_wire::bridge::PreparedAttachment::Image(image)) => store.images.push(image),
+                            Ok(qaqh_gpui_wire::bridge::PreparedAttachment::Content(reference)) => store.attachments.push(reference),
                             Err(error) => store.operation_error = Some(error),
                         }
                         cx.notify();
@@ -1146,7 +1146,7 @@ impl DaemonStore {
                 };
                 store.update(cx, |store, cx| {
                     crate::reducer::apply_snapshot(store, *state);
-                    crate::diagnostics::record("snapshot", Some(&store.session_id), None, Some(store.seq));
+                    qaqh_gpui_wire::diagnostics::record("snapshot", Some(&store.session_id), None, Some(store.seq));
                     store.snapshot_pending = false;
                     for frame in std::mem::take(&mut store.buffered_frames) { crate::reducer::apply_frame(store, frame, cx); }
                     cx.notify();
@@ -1487,7 +1487,7 @@ impl DaemonStore {
                 store.update(cx, |store, _| {
                     store.catalog = self.providers.clone();
                     store.client_session_id = match &self.connection {
-                        crate::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None,
+                        qaqh_gpui_wire::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None,
                     };
                 });
                 if let Some(cwd) = self.sessions.iter().find(|row| row.id == seed)

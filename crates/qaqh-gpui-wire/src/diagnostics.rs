@@ -1,7 +1,23 @@
 //! Allowlisted diagnostics: never record message bodies, URLs, tokens or settings.
-use std::{io::Write, path::PathBuf, sync::Mutex};
+use std::{io::Write, path::PathBuf, sync::Mutex, sync::OnceLock};
 static LOG: Mutex<()> = Mutex::new(());
 static EPOCH: Mutex<Option<String>> = Mutex::new(None);
+static VERSION: OnceLock<&'static str> = OnceLock::new();
+static REVISION: OnceLock<&'static str> = OnceLock::new();
+
+/// bin 启动时注入构建期版本与 provenance(build.rs 的 rustc-env 只对 bin 可见)。
+pub fn init(version: &'static str, revision: &'static str) {
+    VERSION.set(version).expect("diagnostics::init once at startup");
+    REVISION.set(revision).expect("diagnostics::init once at startup");
+}
+
+pub fn version() -> &'static str {
+    VERSION.get().expect("diagnostics::init before use")
+}
+
+pub fn revision() -> &'static str {
+    REVISION.get().expect("diagnostics::init before use")
+}
 
 pub fn set_epoch(epoch: String) {
     *EPOCH.lock().expect("epoch lock") = Some(epoch);
@@ -55,8 +71,8 @@ pub fn record(event: &str, session: Option<&str>, command: Option<&str>, seq: Op
 pub fn report() -> String {
     format!(
         "QAQHarness GPUI {}\nrevision: {}\ncommands: {}\nsession: {}\nplatform: {} / {}\nlogs: {}\n{}",
-        env!("CARGO_PKG_VERSION"),
-        env!("QAQH_BUILD_REVISION"),
+        version(),
+        revision(),
         qaqh_client::ringing::COMMAND_CONTRACT_REVISION,
         qaqh_client::ringing::SESSION_CONTRACT_REVISION,
         std::env::consts::OS,

@@ -46,8 +46,8 @@ use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_types::ToolCallOutcome;
 use qaqh_config_api::ConfigPatch;
 
-use crate::ask;
-use crate::bridge::BridgeRequest;
+use qaqh_gpui_wire::ask;
+use qaqh_gpui_wire::bridge::BridgeRequest;
 use crate::settings;
 use crate::settings::Density;
 use crate::store::DaemonStore;

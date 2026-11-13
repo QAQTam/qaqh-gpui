@@ -1,9 +1,7 @@
 //! One native integration driver, compiled only with --features acceptance.
 //! Uses the real stores, bridge, SDK and rendered window against an isolated daemon.
-use crate::{
-    bridge::{BridgeRequest, ConnectionState},
-    store::{DaemonStore, StreamState},
-};
+use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
+use crate::store::{DaemonStore, StreamState};
 use gpui::Context;
 use serde::Deserialize;
 use serde_json::json;

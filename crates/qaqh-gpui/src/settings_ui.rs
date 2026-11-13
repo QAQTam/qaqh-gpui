@@ -10,7 +10,7 @@ use qaqh_config_api::{ConfigPatch, ExecPatch, GoalsPatch, SandboxPatch, Subagent
 use qaqh_profile::{ModelDef, ProfilesDocument, ProviderDef};
 use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
-use crate::bridge::BridgeRequest;
+use qaqh_gpui_wire::bridge::BridgeRequest;
 use crate::store::{DaemonStore, SettingsEditor};
 use crate::theme::Palette;
 use crate::ui::{action_button, section_header, segmented_button, setting_row};

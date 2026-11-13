@@ -1,5 +1,5 @@
 //! Local workbench persistence, deliberately separate from daemon business state.
-use crate::delivery::{DeliveryState, Outbox};
+use qaqh_gpui_wire::delivery::{DeliveryState, Outbox};
 use qaqh_client::{ContentRef, ImageBlock};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};

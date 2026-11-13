@@ -19,6 +19,9 @@ license = "MIT OR Apache-2.0"
 string_slice = "deny"
 
 [workspace.dependencies]
+# ---- 前端内部 crate ----
+qaqh-gpui-wire = { path = "crates/qaqh-gpui-wire" }
+
 # ---- gpui 基座 ----
 # longbridge/gpui-kit 对 zed gpui 的 crates.io 快照重发布(gpui-pre-*),
 # 精确 pin——caret 会随周更快照漂移破坏编译(gpui-kit #3156 的教训)。

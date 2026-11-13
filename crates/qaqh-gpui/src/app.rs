@@ -17,9 +17,9 @@ use gpui::prelude::*;
 use gpui::px;
 use gpui::size;
 
-use crate::bridge;
-use crate::bridge::BridgeMsg;
-use crate::bridge::BridgeRequest;
+use qaqh_gpui_wire::bridge;
+use qaqh_gpui_wire::bridge::BridgeMsg;
+use qaqh_gpui_wire::bridge::BridgeRequest;
 use crate::store::DaemonStore;
 
 struct RootShell {
@@ -139,7 +139,7 @@ pub fn launch() {
                             if store.snapshot_pending && matches!(store.stream, crate::store::StreamState::Open) {
                                 let _ = store.requests().unbounded_send(BridgeRequest::Refill(store.session_id.clone()));
                             }
-                            if store.outbox.as_ref().is_some_and(|o| matches!(o.state, crate::delivery::DeliveryState::Accepted)) { store.check_receipt(); }
+                            if store.outbox.as_ref().is_some_and(|o| matches!(o.state, qaqh_gpui_wire::delivery::DeliveryState::Accepted)) { store.check_receipt(); }
                         }
                     });
                 }).is_err() {
@@ -178,7 +178,7 @@ pub fn launch() {
             // 通道关闭 = 桥线程已退出(panic/崩溃):把连接态标为失败,
             // 界面立刻显示原因,不再停在「正在连接」的假等待。
             let _ = pumping.update(cx, |daemon, cx| {
-                daemon.connection = crate::bridge::ConnectionState::Failed {
+                daemon.connection = qaqh_gpui_wire::bridge::ConnectionState::Failed {
                     detail: "桥线程已退出".into(),
                 };
                 cx.notify();

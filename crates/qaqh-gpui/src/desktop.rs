@@ -1,6 +1,6 @@
 //! Desktop lifecycle and controls, independent of timeline rendering.
+use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
 use crate::{
-    bridge::{BridgeRequest, ConnectionState},
     store::{DaemonStore, SessionRow, SessionStore},
     theme::Palette,
     ui::action_button,
@@ -84,7 +84,7 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                     t.dim,
                     cx.listener(|_, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            crate::diagnostics::report(),
+                            qaqh_gpui_wire::diagnostics::report(),
                         ));
                     }),
                     t,
@@ -489,7 +489,7 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
                         t,
                     ))
                     .children(
-                        matches!(outbox.state, crate::delivery::DeliveryState::Uncertain).then(
+                        matches!(outbox.state, qaqh_gpui_wire::delivery::DeliveryState::Uncertain).then(
                             || {
                                 action_button(cx, 
                                     "retry-message".into(),
@@ -507,8 +507,8 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
                     .children(
                         matches!(
                             outbox.state,
-                            crate::delivery::DeliveryState::Rejected
-                                | crate::delivery::DeliveryState::Failed
+                            qaqh_gpui_wire::delivery::DeliveryState::Rejected
+                                | qaqh_gpui_wire::delivery::DeliveryState::Failed
                         )
                         .then(|| {
                             action_button(cx, 

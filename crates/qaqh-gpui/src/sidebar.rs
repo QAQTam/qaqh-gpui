@@ -1,6 +1,6 @@
 use crate::ui::{new_session_panel, settings_page, sidebar_row, team_dock, todo_dock};
+use qaqh_gpui_wire::bridge::BridgeRequest;
 use crate::{
-    bridge::BridgeRequest,
     settings,
     store::{DaemonStore, WorkspaceGroup},
     theme::ActiveTheme,

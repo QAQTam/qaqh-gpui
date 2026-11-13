@@ -6,15 +6,11 @@
 mod app;
 #[cfg(feature = "acceptance")]
 mod acceptance;
-mod ask;
-mod bridge;
 mod code_panel;
-mod delivery;
 mod desktop;
 mod content;
 mod goal;
 mod sidebar;
-mod diagnostics;
 mod workbench;
 mod highlight;
 mod kit;
@@ -28,12 +24,14 @@ mod theme;
 mod ui;
 
 fn main() {
+    // 构建期版本/provenance 注入 wire 诊断面(build.rs env 只对 bin 可见)。
+    qaqh_gpui_wire::diagnostics::init(env!("QAQH_VERSION"), env!("QAQH_BUILD_REVISION"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => app::launch(),
         [flag] if flag == "--version" => println!("qaqh-gpui {} ({}){}", env!("QAQH_VERSION"), env!("QAQH_BUILD_REVISION"), if cfg!(feature = "acceptance") { " [acceptance]" } else { "" }),
-        [flag] if flag == "--diagnostics" => println!("{}", diagnostics::report()),
-        [flag] if flag == "--probe" => bridge::probe(),
+        [flag] if flag == "--diagnostics" => println!("{}", qaqh_gpui_wire::diagnostics::report()),
+        [flag] if flag == "--probe" => qaqh_gpui_wire::bridge::probe(),
         [flag] if flag == "--help" => println!("QAQHarness native desktop client\n\nqaqh-gpui                Open the desktop window\nqaqh-gpui --probe        Check daemon connectivity\nqaqh-gpui --diagnostics  Export redacted diagnostics\nqaqh-gpui --version      Show build information"),
         #[cfg(feature = "acceptance")]
         [flag, _root] if flag == "--acceptance-root" => app::launch(),
