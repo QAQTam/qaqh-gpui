@@ -1,0 +1,15 @@
+[package]
+name = "qaqh-gpui-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QAQ-Harness GPUI 前端外观/设置/组件原语层(settings+theme+kit)"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

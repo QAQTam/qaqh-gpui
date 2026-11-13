@@ -12,15 +12,10 @@ mod content;
 mod goal;
 mod sidebar;
 mod workbench;
-mod highlight;
-mod kit;
 mod markdown;
-mod media;
 mod reducer;
-mod settings;
 mod settings_ui;
 mod store;
-mod theme;
 mod ui;
 
 fn main() {

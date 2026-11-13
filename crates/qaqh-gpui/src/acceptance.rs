@@ -105,8 +105,8 @@ pub fn poll(
                         daemon.settings_form = None;
                     }
                     Action::ToggleTheme => {
-                        let next = crate::settings::get(cx).appearance.theme_mode.next();
-                        crate::settings::update(cx, |content| {
+                        let next = qaqh_gpui_kit::settings::get(cx).appearance.theme_mode.next();
+                        qaqh_gpui_kit::settings::update(cx, |content| {
                             content.appearance.theme_mode = next;
                         });
                     }

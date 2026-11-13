@@ -1,10 +1,7 @@
 use crate::ui::{new_session_panel, settings_page, sidebar_row, team_dock, todo_dock};
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use crate::{
-    settings,
-    store::{DaemonStore, WorkspaceGroup},
-    theme::ActiveTheme,
-};
+use qaqh_gpui_kit::{settings, theme::ActiveTheme};
+use crate::store::{DaemonStore, WorkspaceGroup};
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, KeyDownEvent, SharedString, Window, div, px};
 
@@ -180,13 +177,13 @@ impl Render for DaemonStore {
                             .px_1p5()
                             .rounded_full()
                             .text_xs()
-                            .bg(crate::kit::soft(t.faint, 0.14))
+                            .bg(qaqh_gpui_kit::kit::soft(t.faint, 0.14))
                             .text_color(t.dim)
                             .child(format!("{}", visible.len())),
                     )
                     .child(div().flex_1())
                     .child(
-                        crate::kit::ghost_chip(
+                        qaqh_gpui_kit::kit::ghost_chip(
                             "theme-toggle",
                             mode.label(),
                             false,
@@ -201,7 +198,7 @@ impl Render for DaemonStore {
                         ),
                     )
                     .child(
-                        crate::kit::ghost_chip(
+                        qaqh_gpui_kit::kit::ghost_chip(
                             "open-settings",
                             "设置",
                             self.settings_open,
@@ -241,9 +238,9 @@ impl Render for DaemonStore {
                 div()
                     .px_2()
                     .pb_1()
-                    .child(gpui::AnyElement::from(crate::kit::button(
+                    .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                         cx,
-                        crate::kit::BtnKind::Primary,
+                        qaqh_gpui_kit::kit::BtnKind::Primary,
                         "new-session",
                         "新建会话",
                         &t,

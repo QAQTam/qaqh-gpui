@@ -1,0 +1,23 @@
+[package]
+name = "qaqh-gpui-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QAQ-Harness GPUI 前端渲染原语:tree-sitter 语法高亮 + 附件图像"
+
+[lints]
+workspace = true
+
+[dependencies]
+qaqh-gpui-kit = { workspace = true }
+gpui = { workspace = true }
+qaqh-client = { workspace = true }
+base64 = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-bash = { workspace = true }

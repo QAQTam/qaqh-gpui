@@ -35,7 +35,7 @@ impl Default for Workbench {
 }
 
 fn path() -> PathBuf {
-    crate::settings::config_path().with_file_name("workbench.json")
+    qaqh_gpui_kit::settings::config_path().with_file_name("workbench.json")
 }
 
 pub fn load() -> Result<Workbench, String> {

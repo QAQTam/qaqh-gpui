@@ -12,8 +12,8 @@ use qaqh_ringing_contract::state::GoalStatus;
 use qaqh_ringing_contract::state::GoalView;
 
 use crate::store::SessionStore;
-use crate::theme::ActiveTheme as _;
-use crate::theme::Palette;
+use qaqh_gpui_kit::theme::ActiveTheme as _;
+use qaqh_gpui_kit::theme::Palette;
 
 /// 状态元数据:(标签, 颜色)。用户可控态 = active/paused;其余按语义着色
 /// 提示"需要人看一眼"(blocked)或系统熔断(usage/budget_limited)。
@@ -41,13 +41,13 @@ pub fn goal_badge(
         .px_2()
         .py_0p5()
         .rounded_full()
-        .bg(crate::kit::soft(color, 0.12))
+        .bg(qaqh_gpui_kit::kit::soft(color, 0.12))
         .text_xs()
         .cursor_pointer()
         .flex()
         .items_center()
         .gap_1p5()
-        .hover(|style| style.bg(crate::kit::soft(color, 0.2)))
+        .hover(|style| style.bg(qaqh_gpui_kit::kit::soft(color, 0.2)))
         .on_click(cx.listener(|store, _, window: &mut Window, cx| {
             open_dialog(store, window, cx);
         }))
@@ -55,7 +55,7 @@ pub fn goal_badge(
         .child(SharedString::from(label.to_owned()))
         .child(
             div()
-                .text_color(crate::kit::soft(color, 0.75))
+                .text_color(qaqh_gpui_kit::kit::soft(color, 0.75))
                 .child(SharedString::from(objective)),
         )
 }
@@ -108,7 +108,7 @@ pub fn goal_dialog(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(crate::kit::pill(label, color, &t))
+                .child(qaqh_gpui_kit::kit::pill(label, color, &t))
                 .child(
                     div()
                         .text_xs()
@@ -170,9 +170,9 @@ pub fn goal_dialog(
     let mut footer = div().flex().justify_end().gap_2();
     if let Some(goal_status) = status {
         if goal_status != GoalStatus::Paused {
-            footer = footer.child(gpui::AnyElement::from(crate::kit::button(
+            footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                 cx,
-                crate::kit::BtnKind::Ghost,
+                qaqh_gpui_kit::kit::BtnKind::Ghost,
                 "goal-pause",
                 "暂停",
                 &t,
@@ -186,9 +186,9 @@ pub fn goal_dialog(
         if goal_status == GoalStatus::Paused
             || matches!(goal_status, GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::BudgetLimited)
         {
-            footer = footer.child(gpui::AnyElement::from(crate::kit::button(
+            footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                 cx,
-                crate::kit::BtnKind::Soft,
+                qaqh_gpui_kit::kit::BtnKind::Soft,
                 "goal-resume",
                 "恢复",
                 &t,
@@ -199,9 +199,9 @@ pub fn goal_dialog(
                 }),
             )));
         }
-        footer = footer.child(gpui::AnyElement::from(crate::kit::button(
+        footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
             cx,
-            crate::kit::BtnKind::Danger,
+            qaqh_gpui_kit::kit::BtnKind::Danger,
             "goal-clear",
             "清除目标",
             &t,
@@ -212,9 +212,9 @@ pub fn goal_dialog(
             }),
         )));
     }
-    footer = footer.child(gpui::AnyElement::from(crate::kit::button(
+    footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
         cx,
-        if has_goal { crate::kit::BtnKind::Ghost } else { crate::kit::BtnKind::Primary },
+        if has_goal { qaqh_gpui_kit::kit::BtnKind::Ghost } else { qaqh_gpui_kit::kit::BtnKind::Primary },
         "goal-save",
         if has_goal { "保存修改" } else { "设定目标" },
         &t,

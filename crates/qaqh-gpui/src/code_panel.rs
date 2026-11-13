@@ -6,7 +6,8 @@ use gpui::{Context, Div, PathPromptOptions, SharedString, div, px};
 use qaqh_ringing_contract::fact::{ContentValue, TurnId};
 use qaqh_ringing_contract::state::ToolCallView;
 
-use crate::{settings::Typography, store::SessionStore, theme::Palette};
+use qaqh_gpui_kit::{settings::Typography, theme::Palette};
+use crate::store::SessionStore;
 
 #[derive(Clone)]
 pub struct Location {
@@ -438,7 +439,7 @@ pub fn render(
                                     .text_color(t.dim)
                                     .child(number.to_string()),
                             )
-                            .child(crate::highlight::code_text(line, lang, t))
+                            .child(qaqh_gpui_render::highlight::code_text(line, lang, t))
                     }))
                 }
                 Err(error) => div().text_color(t.warn).child(error.clone()),

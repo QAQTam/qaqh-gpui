@@ -12,7 +12,7 @@ use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
 use qaqh_gpui_wire::bridge::BridgeRequest;
 use crate::store::{DaemonStore, SettingsEditor};
-use crate::theme::Palette;
+use qaqh_gpui_kit::theme::Palette;
 use crate::ui::{action_button, section_header, segmented_button, setting_row};
 
 type Submit = dyn Fn(&[Field], &mut DaemonStore, &mut Context<DaemonStore>) -> Result<(), String>;
@@ -440,7 +440,7 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
     ]
     .into_iter()
     .map(|(mode, label, id)| {
-        crate::kit::segmented_item(
+        qaqh_gpui_kit::kit::segmented_item(
             format!("daemon-tab-{id}"),
             label,
             active == mode,
@@ -464,7 +464,7 @@ pub fn navigation(active: SettingsEditor, cx: &mut Context<DaemonStore>, t: &Pal
         .py_2()
         .border_b_1()
         .border_color(t.border)
-        .child(crate::kit::segmented_strip(tabs, t))
+        .child(qaqh_gpui_kit::kit::segmented_strip(tabs, t))
 }
 
 pub fn render(
@@ -485,7 +485,7 @@ pub fn render(
         SettingsEditor::Session => session(daemon, cx, t),
         SettingsEditor::Workspaces => workspaces(daemon, cx, t),
     };
-    crate::kit::card_padded(t).child(page)
+    qaqh_gpui_kit::kit::card_padded(t).child(page)
 }
 
 pub(crate) fn render_form(
@@ -562,9 +562,9 @@ pub(crate) fn render_form(
             .justify_end()
             .gap_2()
             .pt_2()
-            .child(crate::kit::button(
+            .child(qaqh_gpui_kit::kit::button(
                 &*cx,
-                crate::kit::BtnKind::Ghost,
+                qaqh_gpui_kit::kit::BtnKind::Ghost,
                 "settings-cancel",
                 "取消",
                 t,
@@ -573,9 +573,9 @@ pub(crate) fn render_form(
                     cx.notify();
                 }),
             ))
-            .child(crate::kit::button(
+            .child(qaqh_gpui_kit::kit::button(
                 &*cx,
-                crate::kit::BtnKind::Primary,
+                qaqh_gpui_kit::kit::BtnKind::Primary,
                 "settings-save",
                 if form.fields.is_empty() {
                     "确认"
@@ -594,7 +594,7 @@ pub(crate) fn render_form(
                 }),
             )),
     );
-    crate::kit::card_padded(t).child(body)
+    qaqh_gpui_kit::kit::card_padded(t).child(body)
 }
 
 fn edit_config(

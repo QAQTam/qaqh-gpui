@@ -20,7 +20,7 @@ use tree_sitter_highlight::HighlightConfiguration;
 use tree_sitter_highlight::HighlightEvent;
 use tree_sitter_highlight::Highlighter;
 
-use crate::theme::Palette;
+use qaqh_gpui_kit::theme::Palette;
 
 /// 捕获名表(与 configure 对齐;查询里未列出的捕获渲染为无样式)。
 const HIGHLIGHT_NAMES: &[&str] = &[
@@ -186,7 +186,7 @@ impl Engine {
 }
 
 /// FNV-1a 64 位内容哈希(markdown 缓存与本模块共用)。
-pub(crate) fn fnv1a(text: &str) -> u64 {
+pub fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);

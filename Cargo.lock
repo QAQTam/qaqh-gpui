@@ -5074,7 +5074,6 @@ dependencies = [
 name = "qaqh-gpui"
 version = "3.0.20261109"
 dependencies = [
- "base64 0.22.1",
  "embed-resource",
  "futures",
  "gpui-component",
@@ -5084,12 +5083,34 @@ dependencies = [
  "pulldown-cmark",
  "qaqh-client",
  "qaqh-config-api",
+ "qaqh-gpui-kit",
+ "qaqh-gpui-render",
  "qaqh-gpui-wire",
  "qaqh-profile",
  "qaqh-ringing-contract",
  "qaqh-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "qaqh-gpui-kit"
+version = "3.0.20261109"
+dependencies = [
+ "gpui-component",
+ "gpui-pre",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "qaqh-gpui-render"
+version = "3.0.20261109"
+dependencies = [
+ "base64 0.22.1",
+ "gpui-pre",
+ "qaqh-client",
+ "qaqh-gpui-kit",
  "tree-sitter-bash",
  "tree-sitter-go",
  "tree-sitter-highlight",

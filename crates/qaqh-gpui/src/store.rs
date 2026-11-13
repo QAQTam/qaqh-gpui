@@ -207,7 +207,7 @@ impl SessionStore {
             attachment_pending: false,
             operation_error: None,
             client_session_id: None,
-            output_budget: crate::settings::get(cx).behavior.output_tail_max,
+            output_budget: qaqh_gpui_kit::settings::get(cx).behavior.output_tail_max,
             search,
             search_open: false,
             session_id,
@@ -844,7 +844,7 @@ impl DaemonStore {
         cx.subscribe(&font_field, |this, _, event, cx| {
             if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
                 let text = this.font_field.read(cx).value().trim().to_string();
-                crate::settings::update(cx, |content| content.typography.ui_font_family = text);
+                qaqh_gpui_kit::settings::update(cx, |content| content.typography.ui_font_family = text);
             }
         })
         .detach();

@@ -36,8 +36,8 @@ use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
 
-use crate::settings::Typography;
-use crate::theme::Palette;
+use qaqh_gpui_kit::settings::Typography;
+use qaqh_gpui_kit::theme::Palette;
 
 type TableCell = (String, Vec<MdRun>);
 type CachedBlocks = (u64, Arc<Vec<MdBlock>>);
@@ -152,7 +152,7 @@ pub struct ParseCache {
 
 impl ParseCache {
     pub fn get(&self, section: usize, source: &str) -> Arc<Vec<MdBlock>> {
-        let hash = crate::highlight::fnv1a(source);
+        let hash = qaqh_gpui_render::highlight::fnv1a(source);
         let mut entries = self.entries.borrow_mut();
         if let Some((previous, blocks)) = entries.get(&section)
             && *previous == hash
@@ -759,7 +759,7 @@ fn render_block(
                         .text_size(px(ty.code_font_size))
                         .line_height(relative(ty.prose_line_height))
                         .overflow_x_scroll()
-                        .child(crate::highlight::code_text(code, lang.as_deref(), t)),
+                        .child(qaqh_gpui_render::highlight::code_text(code, lang.as_deref(), t)),
                 );
             card.into_any_element()
         }
@@ -778,7 +778,7 @@ fn render_block(
                 .gap_1p5()
                 .px_3()
                 .py_2p5()
-                .rounded(px(crate::kit::RADIUS_CARD))
+                .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
                 .border_1()
                 .border_color(t.border)
                 .bg(t.card)

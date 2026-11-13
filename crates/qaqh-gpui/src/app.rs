@@ -44,9 +44,9 @@ pub fn launch() {
         cx.set_app_identity("io.github.QAQTam.QAQHarness", "QAQHarness");
         // 顺序:settings 先于 theme(theme::init 读设置的主题模式);
         // gpui_component::init 建组件库全局(Theme/输入法/弹出层),theme::init 随后映射品牌色。
-        crate::settings::init(cx);
+        qaqh_gpui_kit::settings::init(cx);
         gpui_component::init(cx);
-        crate::theme::init(cx);
+        qaqh_gpui_kit::theme::init(cx);
         let (to_ui, mut from_bridge) = futures::channel::mpsc::unbounded::<BridgeMsg>();
         let (request_tx, request_rx) = futures::channel::mpsc::unbounded::<BridgeRequest>();
         // 窗口先行:InputState/TextareaState 只能在窗口上下文构造,DaemonStore
@@ -88,7 +88,7 @@ pub fn launch() {
                 cx.new(|cx| {
                     // 系统亮/暗切换 → 重选色板并刷新窗口(M1)。
                     cx.observe_window_appearance(window, |_, window, cx| {
-                        crate::theme::system_appearance_changed(window.appearance(), cx);
+                        qaqh_gpui_kit::theme::system_appearance_changed(window.appearance(), cx);
                     })
                     .detach();
                     // Root(gpui-base)承载组件库的 popover/menu/notification 窗口级层;

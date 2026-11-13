@@ -39,8 +39,9 @@ installer-icon = "../../packaging/app.ico"
 
 [dependencies]
 qaqh-gpui-wire = { workspace = true }
+qaqh-gpui-kit = { workspace = true }
+qaqh-gpui-render = { workspace = true }
 futures = { workspace = true }
-base64 = { workspace = true }
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 gpui-component = { workspace = true }
@@ -51,13 +52,5 @@ qaqh-types = { workspace = true }
 qaqh-config-api = { workspace = true }
 qaqh-profile = { workspace = true }
 pulldown-cmark = { workspace = true }
-tree-sitter-highlight = { workspace = true }
-tree-sitter-rust = { workspace = true }
-tree-sitter-python = { workspace = true }
-tree-sitter-typescript = { workspace = true }
-tree-sitter-javascript = { workspace = true }
-tree-sitter-go = { workspace = true }
-tree-sitter-json = { workspace = true }
-tree-sitter-bash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

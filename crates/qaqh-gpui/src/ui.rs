@@ -48,15 +48,15 @@ use qaqh_config_api::ConfigPatch;
 
 use qaqh_gpui_wire::ask;
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use crate::settings;
-use crate::settings::Density;
+use qaqh_gpui_kit::settings;
+use qaqh_gpui_kit::settings::Density;
 use crate::store::DaemonStore;
 use crate::store::SessionRow;
 use crate::store::{ArgStream, SessionStore, SettingsEditor};
 use crate::store::StreamState;
-use crate::theme::ActiveTheme;
-use crate::theme::Palette;
-use crate::theme::ThemeMode;
+use qaqh_gpui_kit::theme::ActiveTheme;
+use qaqh_gpui_kit::theme::Palette;
+use qaqh_gpui_kit::theme::ThemeMode;
 
 pub(crate) fn content_text(value: &ContentValue) -> &str {
     match value {
@@ -153,7 +153,7 @@ fn stream_badge(state: &StreamState, t: &Palette) -> Div {
         .py_0p5()
         .rounded_full()
         .text_xs()
-        .bg(crate::kit::soft(color, 0.12))
+        .bg(qaqh_gpui_kit::kit::soft(color, 0.12))
         .text_color(color)
         .child(label)
 }
@@ -269,7 +269,7 @@ pub(crate) fn todo_dock(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>)
                         .px_1p5()
                         .rounded_full()
                         .text_xs()
-                        .bg(crate::kit::soft(t.faint, 0.14))
+                        .bg(qaqh_gpui_kit::kit::soft(t.faint, 0.14))
                         .text_color(t.dim)
                         .child(SharedString::from(format!("{done}/{}", items.len()))),
                 ),
@@ -364,7 +364,7 @@ pub(crate) fn team_dock(daemon: &DaemonStore, cx: &Context<DaemonStore>) -> Opti
                         .px_1p5()
                         .rounded_full()
                         .text_xs()
-                        .bg(crate::kit::soft(t.faint, 0.14))
+                        .bg(qaqh_gpui_kit::kit::soft(t.faint, 0.14))
                         .text_color(t.dim)
                         .child(SharedString::from(format!("{done}/{}", tasks.len()))),
                 ),
@@ -691,9 +691,9 @@ pub(crate) fn settings_page(
                     settings::config_path().display()
                 ))),
         )
-        .child(gpui::AnyElement::from(crate::kit::button(
+        .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
             cx,
-            crate::kit::BtnKind::Danger,
+            qaqh_gpui_kit::kit::BtnKind::Danger,
             "reset-settings",
             "恢复默认",
             &t,
@@ -821,9 +821,9 @@ pub(crate) fn section_card(title: &str, rows: Vec<Div>, t: &Palette) -> Div {
         .flex()
         .flex_col()
         .gap_1p5()
-        .child(crate::kit::section_label(title, t).px_1())
+        .child(qaqh_gpui_kit::kit::section_label(title, t).px_1())
         .child(
-            crate::kit::card(t)
+            qaqh_gpui_kit::kit::card(t)
                 .flex()
                 .flex_col()
                 .px_3()
@@ -945,7 +945,7 @@ pub(crate) fn new_session_panel(
                         .flex_col()
                         .gap_3()
                         .child(
-                            crate::kit::card(&t)
+                            qaqh_gpui_kit::kit::card(&t)
                                 .flex()
                                 .flex_col()
                                 .px_3()
@@ -1012,9 +1012,9 @@ pub(crate) fn new_session_panel(
                                         .text_color(t.faint)
                                         .child("不选模型 = 跟随全局默认;可在设置页修改默认模型"),
                                 )
-                                .child(gpui::AnyElement::from(crate::kit::button(
+                                .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                                     cx,
-                                    crate::kit::BtnKind::Primary,
+                                    qaqh_gpui_kit::kit::BtnKind::Primary,
                                     "create-session",
                                     if daemon.creating_session { "创建中…" } else { "创建会话" },
                                     &t,
@@ -1059,7 +1059,7 @@ pub(crate) fn section_header(title: &str, t: &Palette) -> Div {
     div()
         .pt_4()
         .pb_1()
-        .child(crate::kit::section_label(title, t))
+        .child(qaqh_gpui_kit::kit::section_label(title, t))
 }
 
 /// 设置行(zed settings_ui 行布局):左标题+描述,右控件,行间分隔线。
@@ -1095,7 +1095,7 @@ pub(crate) fn segmented_button(
         .id(SharedString::from(id))
         .px_2()
         .py_1()
-        .rounded(px(crate::kit::RADIUS_CONTROL))
+        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
         .text_xs()
         .cursor_pointer()
         .when(active, |style| {
@@ -1118,7 +1118,7 @@ fn step_button(
         .id(id)
         .px_2()
         .py_1()
-        .rounded(px(crate::kit::RADIUS_CONTROL))
+        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
         .text_xs()
         .cursor_pointer()
         .min_w(px(28.))
@@ -1137,7 +1137,7 @@ fn user_bubble(text: &str, t: &Palette) -> Div {
         .max_w(px(640.))
         .px_3()
         .py_2()
-        .rounded(px(crate::kit::RADIUS_BUBBLE))
+        .rounded(px(qaqh_gpui_kit::kit::RADIUS_BUBBLE))
         .bg(t.bubble)
         .text_sm()
         .child(text.to_string())
@@ -1321,14 +1321,14 @@ fn tool_card(
                         .truncate()
                         .child(SharedString::from(format!("$ {command}")))
                 }))
-                .child(crate::kit::pill(status, status_color, t)),
+                .child(qaqh_gpui_kit::kit::pill(status, status_color, t)),
         );
     let mut card = content;
     let assemble = |content: Div, status_color: Hsla, t: &Palette| {
         div()
             .flex()
             .max_w_full()
-            .rounded(px(crate::kit::RADIUS_CONTROL))
+            .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
             .border_1()
             .border_color(t.border)
             .bg(t.card)
@@ -1503,7 +1503,7 @@ fn notice_line(label: &str, text: &str, color: Hsla, t: &Palette) -> Div {
         .gap_1()
         .px_3()
         .py_1p5()
-        .rounded(px(crate::kit::RADIUS_CARD))
+        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
         .bg(t.card)
         .border_1()
         .border_color(t.border)
@@ -1613,7 +1613,7 @@ fn timeline_entry(
                     InputPurpose::Interject => notice_line("运行中插话", &text, t.warn, t),
                 };
                 row = row
-                    .child(div().flex().flex_wrap().gap_2().children(images.iter().map(crate::media::preview)))
+                    .child(div().flex().flex_wrap().gap_2().children(images.iter().map(qaqh_gpui_render::media::preview)))
                     .children((!attachments.is_empty()).then(|| div().text_xs().child(format!("{} 个文本附件", attachments.len()))));
                 row.into_any_element()
             }
@@ -1674,7 +1674,7 @@ fn interaction_card(
     // 待交互卡:warn 色条 + 软底,和工具卡同一"色条卡"语言。
     div()
         .flex()
-        .rounded(px(crate::kit::RADIUS_CARD))
+        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
         .border_1()
         .border_color(t.border)
         .bg(t.warn_bg)
@@ -1810,17 +1810,17 @@ impl SessionStore {
                     .children(body)
                     .footer(
                         div().flex().justify_end().gap_2()
-                            .child(gpui::AnyElement::from(crate::kit::button(
+                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                                 cx,
-                                crate::kit::BtnKind::Soft,
+                                qaqh_gpui_kit::kit::BtnKind::Soft,
                                 format!("ask-submit-{iid}"),
                                 "提交回答",
                                 &t,
                                 submit,
                             )))
-                            .child(gpui::AnyElement::from(crate::kit::button(
+                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                                 cx,
-                                crate::kit::BtnKind::Ghost,
+                                qaqh_gpui_kit::kit::BtnKind::Ghost,
                                 format!("ask-skip-{iid}"),
                                 "跳过",
                                 &t,
@@ -1875,17 +1875,17 @@ impl SessionStore {
                     .children(body)
                     .footer(
                         div().flex().justify_end().gap_2()
-                            .child(gpui::AnyElement::from(crate::kit::button(
+                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                                 cx,
-                                crate::kit::BtnKind::Soft,
+                                qaqh_gpui_kit::kit::BtnKind::Soft,
                                 format!("ask-submit-{iid}"),
                                 "提交回答",
                                 &t,
                                 submit,
                             )))
-                            .child(gpui::AnyElement::from(crate::kit::button(
+                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                                 cx,
-                                crate::kit::BtnKind::Ghost,
+                                qaqh_gpui_kit::kit::BtnKind::Ghost,
                                 format!("ask-skip-{iid}"),
                                 "跳过",
                                 &t,
@@ -2009,7 +2009,7 @@ impl Render for SessionStore {
                 }))
                 .children(self.handoff_seal.as_ref().map(|seal| {
                     // ADR-0016 投影:标记旧线已封箱;点击经 Select 跳后继会话。
-                    crate::kit::pill(&format!("已封箱 → {}", seal.work_summary), t.dim, &t)
+                    qaqh_gpui_kit::kit::pill(&format!("已封箱 → {}", seal.work_summary), t.dim, &t)
                         .id("handoff-seal")
                         .cursor_pointer()
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
@@ -2022,7 +2022,7 @@ impl Render for SessionStore {
                     .then(|| self.tok_rate())
                     .flatten()
                     .map(|rate| {
-                        crate::kit::pill(&format!("≈ {:.0} tok/s", rate.max(1.)), t.accent, &t)
+                        qaqh_gpui_kit::kit::pill(&format!("≈ {:.0} tok/s", rate.max(1.)), t.accent, &t)
                             .into_any_element()
                     }))
                 .child(
@@ -2033,7 +2033,7 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .rounded(px(crate::kit::RADIUS_CONTROL))
+                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
                         .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
@@ -2061,7 +2061,7 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .rounded(px(crate::kit::RADIUS_CONTROL))
+                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
                         .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
@@ -2091,7 +2091,7 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .rounded(px(crate::kit::RADIUS_CONTROL))
+                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
                         .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
@@ -2114,7 +2114,7 @@ impl Render for SessionStore {
                         .rounded_md()
                         .text_xs()
                         .cursor_pointer()
-                        .rounded(px(crate::kit::RADIUS_CONTROL))
+                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
                         .text_color(t.dim)
                         .hover(|style| style.bg(t.hover))
                         .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
@@ -2136,9 +2136,9 @@ impl Render for SessionStore {
                     ),
                 )
                 .child(
-                    gpui::AnyElement::from(crate::kit::button(
+                    gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                         cx,
-                        crate::kit::BtnKind::Danger,
+                        qaqh_gpui_kit::kit::BtnKind::Danger,
                         format!("delete-{}", self.session_id),
                         if self.confirm_delete { "确认删除" } else { "删除" },
                         &t,

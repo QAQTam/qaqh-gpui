@@ -1,8 +1,8 @@
 //! Desktop lifecycle and controls, independent of timeline rendering.
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
+use qaqh_gpui_kit::theme::Palette;
 use crate::{
     store::{DaemonStore, SessionRow, SessionStore},
-    theme::Palette,
     ui::action_button,
 };
 use gpui::{App, Context, Div, FontWeight, KeyDownEvent, PathPromptOptions, SharedString, Window, div, prelude::*, px};
@@ -52,14 +52,14 @@ pub fn connection(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
         .mx_2()
         .mb_2()
         .p_2()
-        .rounded(px(crate::kit::RADIUS_CARD))
+        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
         .bg(t.card)
         .border_1()
         .border_color(t.border)
         .flex()
         .flex_col()
         .gap_1p5()
-        .child(crate::kit::pill(label, color, t))
+        .child(qaqh_gpui_kit::kit::pill(label, color, t))
         .children(detail.map(|detail| {
             div().text_xs().text_color(t.bad).child(detail)
         }))
@@ -164,7 +164,7 @@ pub fn welcome(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette)
         .gap_4()
         .bg(t.bg)
         .child(
-            crate::kit::hero(t)
+            qaqh_gpui_kit::kit::hero(t)
                 .child(
                     div()
                         .text_2xl()
@@ -185,16 +185,16 @@ pub fn welcome(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette)
                         .text_center()
                         .child("先在设置中添加服务商和模型，再选择工作目录并新建会话。"),
                 )
-                .child(crate::kit::pill(status_label, status_color, t))
+                .child(qaqh_gpui_kit::kit::pill(status_label, status_color, t))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_2()
                         .mt_2()
-                        .child(gpui::AnyElement::from(crate::kit::button(
+                        .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                             cx,
-                            crate::kit::BtnKind::Primary,
+                            qaqh_gpui_kit::kit::BtnKind::Primary,
                             "setup-model",
                             "配置服务商与模型",
                             t,
@@ -206,9 +206,9 @@ pub fn welcome(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette)
                                 cx.notify();
                             }),
                         )))
-                        .child(gpui::AnyElement::from(crate::kit::button(
+                        .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
                             cx,
-                            crate::kit::BtnKind::Ghost,
+                            qaqh_gpui_kit::kit::BtnKind::Ghost,
                             "welcome-new-session",
                             "新建会话",
                             t,
@@ -229,16 +229,16 @@ pub fn welcome(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette)
                 .gap_1p5()
                 .text_xs()
                 .text_color(t.faint)
-                .child(crate::kit::kbd("Ctrl+N", t))
+                .child(qaqh_gpui_kit::kit::kbd("Ctrl+N", t))
                 .child("新建")
                 .child(div().mx_1().child("·"))
-                .child(crate::kit::kbd("Ctrl+K", t))
+                .child(qaqh_gpui_kit::kit::kbd("Ctrl+K", t))
                 .child("搜索会话")
                 .child(div().mx_1().child("·"))
-                .child(crate::kit::kbd("Ctrl+F", t))
+                .child(qaqh_gpui_kit::kit::kbd("Ctrl+F", t))
                 .child("搜索消息")
                 .child(div().mx_1().child("·"))
-                .child(crate::kit::kbd("Ctrl+,", t))
+                .child(qaqh_gpui_kit::kit::kbd("Ctrl+,", t))
                 .child("设置"),
         )
         .child(
@@ -269,7 +269,7 @@ pub fn session_controls(store: &SessionStore, cx: &mut Context<SessionStore>, t:
         .items_center()
         .gap_1()
         .text_xs()
-        .child(crate::kit::pill(control_label, control_color, t))
+        .child(qaqh_gpui_kit::kit::pill(control_label, control_color, t))
         .child(action_button(cx,
             "driver-control".into(),
             if own {
@@ -472,7 +472,7 @@ pub fn composer_tools(store: &SessionStore, cx: &mut Context<SessionStore>, t: &
             .flex()
             .flex_wrap()
             .gap_2()
-            .children(store.images.iter().map(crate::media::preview)),
+            .children(store.images.iter().map(qaqh_gpui_render::media::preview)),
     );
     if let Some(outbox) = &store.outbox {
         tools = tools

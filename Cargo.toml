@@ -21,6 +21,8 @@ string_slice = "deny"
 [workspace.dependencies]
 # ---- 前端内部 crate ----
 qaqh-gpui-wire = { path = "crates/qaqh-gpui-wire" }
+qaqh-gpui-kit = { path = "crates/qaqh-gpui-kit" }
+qaqh-gpui-render = { path = "crates/qaqh-gpui-render" }
 
 # ---- gpui 基座 ----
 # longbridge/gpui-kit 对 zed gpui 的 crates.io 快照重发布(gpui-pre-*),
