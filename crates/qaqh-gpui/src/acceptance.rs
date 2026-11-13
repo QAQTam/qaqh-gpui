@@ -1,7 +1,8 @@
 //! One native integration driver, compiled only with --features acceptance.
 //! Uses the real stores, bridge, SDK and rendered window against an isolated daemon.
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
-use crate::store::{DaemonStore, StreamState};
+use qaqh_gpui_shell::daemon::DaemonStore;
+use qaqh_gpui_session::store::StreamState;
 use gpui::Context;
 use serde::Deserialize;
 use serde_json::json;
@@ -88,7 +89,7 @@ pub fn poll(
                     Action::Catalog => {
                         daemon.settings_open = true;
                         daemon.new_session_open = false;
-                        daemon.settings_editor = crate::store::SettingsEditor::Catalog;
+                        daemon.settings_editor = qaqh_gpui_session::store::SettingsEditor::Catalog;
                         daemon.settings_form = None;
                         let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
                         let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
@@ -101,7 +102,7 @@ pub fn poll(
                     Action::LocalSettings => {
                         daemon.settings_open = true;
                         daemon.new_session_open = false;
-                        daemon.settings_editor = crate::store::SettingsEditor::Local;
+                        daemon.settings_editor = qaqh_gpui_session::store::SettingsEditor::Local;
                         daemon.settings_form = None;
                     }
                     Action::ToggleTheme => {
@@ -113,7 +114,7 @@ pub fn poll(
                     Action::Workspaces => {
                         daemon.settings_open = true;
                         daemon.new_session_open = false;
-                        daemon.settings_editor = crate::store::SettingsEditor::Workspaces;
+                        daemon.settings_editor = qaqh_gpui_session::store::SettingsEditor::Workspaces;
                     }
                     Action::Welcome => {
                         daemon.current = None;

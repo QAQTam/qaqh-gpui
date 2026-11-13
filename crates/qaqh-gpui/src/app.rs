@@ -20,7 +20,7 @@ use gpui::size;
 use qaqh_gpui_wire::bridge;
 use qaqh_gpui_wire::bridge::BridgeMsg;
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use crate::store::DaemonStore;
+use qaqh_gpui_shell::daemon::DaemonStore;
 
 struct RootShell {
     daemon: Entity<DaemonStore>,
@@ -51,7 +51,7 @@ pub fn launch() {
         let (request_tx, request_rx) = futures::channel::mpsc::unbounded::<BridgeRequest>();
         // 窗口先行:InputState/TextareaState 只能在窗口上下文构造,DaemonStore
         // 随窗口诞生;持久化的窗口几何在开窗前读一次,开窗回调只消费。
-        let (workbench, load_error) = match crate::workbench::load() {
+        let (workbench, load_error) = match qaqh_gpui_session::persist::load() {
             Ok(state) => (state, None),
             Err(error) => (Default::default(), Some(format!("工作状态读取失败：{error}"))),
         };
@@ -136,7 +136,7 @@ pub fn launch() {
                         daemon.poll_sign_in();
                         for store in &daemon.stores {
                             let store = store.read(cx);
-                            if store.snapshot_pending && matches!(store.stream, crate::store::StreamState::Open) {
+                            if store.snapshot_pending && matches!(store.stream, qaqh_gpui_session::store::StreamState::Open) {
                                 let _ = store.requests().unbounded_send(BridgeRequest::Refill(store.session_id.clone()));
                             }
                             if store.outbox.as_ref().is_some_and(|o| matches!(o.state, qaqh_gpui_wire::delivery::DeliveryState::Accepted)) { store.check_receipt(); }

@@ -5080,15 +5080,11 @@ dependencies = [
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
- "pulldown-cmark",
- "qaqh-client",
- "qaqh-config-api",
  "qaqh-gpui-kit",
- "qaqh-gpui-render",
+ "qaqh-gpui-session",
+ "qaqh-gpui-shell",
  "qaqh-gpui-wire",
- "qaqh-profile",
  "qaqh-ringing-contract",
- "qaqh-types",
  "serde",
  "serde_json",
 ]
@@ -5119,6 +5115,45 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "qaqh-gpui-session"
+version = "3.0.20261109"
+dependencies = [
+ "futures",
+ "gpui-component",
+ "gpui-pre",
+ "pulldown-cmark",
+ "qaqh-client",
+ "qaqh-config-api",
+ "qaqh-gpui-kit",
+ "qaqh-gpui-render",
+ "qaqh-gpui-wire",
+ "qaqh-profile",
+ "qaqh-ringing-contract",
+ "qaqh-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "qaqh-gpui-shell"
+version = "3.0.20261109"
+dependencies = [
+ "futures",
+ "gpui-component",
+ "gpui-pre",
+ "qaqh-client",
+ "qaqh-config-api",
+ "qaqh-gpui-kit",
+ "qaqh-gpui-session",
+ "qaqh-gpui-wire",
+ "qaqh-profile",
+ "qaqh-ringing-contract",
+ "qaqh-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

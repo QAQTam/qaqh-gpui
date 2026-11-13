@@ -6,17 +6,6 @@
 mod app;
 #[cfg(feature = "acceptance")]
 mod acceptance;
-mod code_panel;
-mod desktop;
-mod content;
-mod goal;
-mod sidebar;
-mod workbench;
-mod markdown;
-mod reducer;
-mod settings_ui;
-mod store;
-mod ui;
 
 fn main() {
     // 构建期版本/provenance 注入 wire 诊断面(build.rs env 只对 bin 可见)。
