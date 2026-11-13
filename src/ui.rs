@@ -1620,6 +1620,9 @@ fn timeline_entry(
         TimelineEntry::AssistantBlock { block_kind, content, usage, generated_ms, .. } => {
             let section = assistant_section(block_kind, content_text(content), false, index * 2, store, entity, t, ty);
             div()
+                .flex()
+                .flex_col()
+                .max_w_full()
                 .child(section)
                 .children(usage_note(usage.as_ref(), *generated_ms, t))
                 .into_any_element()
@@ -2285,7 +2288,11 @@ impl Render for SessionStore {
 
         // 消息浮面(Codex MainContentSurface 口径):圆角 16 的浮层托住时间线,
         // 与四周留 8px 呼吸边;面板色比 bg 提一级,不再通铺到底。
+        // 必须显式 .flex().flex_col():gpui div 默认 display 是 Block,
+        // Block 流里 list 的 flex_1 失效,高度塌缩为 0 → 正文全空。
         let timeline = div()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h_0()
             .mx_2()
@@ -2294,6 +2301,7 @@ impl Render for SessionStore {
             .bg(t.panel)
             .border_1()
             .border_color(t.border)
+            .overflow_hidden()
             .child(timeline);
 
         // composer:组件库 Textarea(auto_grow,Enter 提交);受阻原因降为
