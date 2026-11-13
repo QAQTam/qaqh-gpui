@@ -20,7 +20,6 @@ use gpui::Window;
 use gpui::div;
 use gpui::px;
 use gpui::transparent_black;
-use gpui_component::button::ButtonVariants;
 use gpui_component::input::Input;
 use gpui_component::Sizable;
 use qaqh_config_api::ConfigPatch;

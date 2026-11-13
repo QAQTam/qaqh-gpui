@@ -26,7 +26,6 @@ use gpui::Window;
 use gpui::div;
 use gpui::list;
 use gpui::px;
-use gpui_component::button::ButtonVariants;
 use gpui_component::dialog::Dialog;
 use gpui_component::input::{Input, Textarea};
 use gpui_component::scroll::ScrollableElement as _;
