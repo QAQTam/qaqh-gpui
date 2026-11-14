@@ -1,5 +1,5 @@
 [toolchain]
-# 与 gpui-pre 快照(longbridge/gpui-kit 重发布)的工具链要求对齐,复用已装工具链(无额外下载)。
-channel = "1.98.1"
+# 不 pin 具体版本,跟随 rustup stable 通道的最新稳定版。
+channel = "stable"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

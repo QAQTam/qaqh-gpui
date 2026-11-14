@@ -3,15 +3,19 @@
 # 同一 cargo 图内重名是硬错误。
 [workspace]
 resolver = "3"
-members = ["crates/qaqh-gpui"]
+members = [
+    "crates/qaqh-gpui",
+    "crates/qaqh-gpui-wire",
+    "crates/qaqh-gpui-kit",
+    "crates/qaqh-gpui-render",
+    "crates/qaqh-gpui-session",
+    "crates/qaqh-gpui-shell",
+]
 # 默认产物 = 桌面应用:裸 cargo build/check/test 与 --features acceptance 的口径不变。
 default-members = ["crates/qaqh-gpui"]
 
 [workspace.package]
-# 3.0 线基线:日期占 patch 位(与 qaqh-backend 各 crate 的 3.0.YYYYMMDD 口径一致);
-# 展示版本 = 本基线 + "-g{12 位哈希}",由 bin crate 的 build.rs 构建期现算(QAQH_VERSION),
-# 哈希随提交走,不在 Cargo.toml 里写死。
-version = "3.0.20261109"
+version = "4.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -23,6 +27,8 @@ string_slice = "deny"
 qaqh-gpui-wire = { path = "crates/qaqh-gpui-wire" }
 qaqh-gpui-kit = { path = "crates/qaqh-gpui-kit" }
 qaqh-gpui-render = { path = "crates/qaqh-gpui-render" }
+qaqh-gpui-session = { path = "crates/qaqh-gpui-session" }
+qaqh-gpui-shell = { path = "crates/qaqh-gpui-shell" }
 
 # ---- gpui 基座 ----
 # longbridge/gpui-kit 对 zed gpui 的 crates.io 快照重发布(gpui-pre-*),

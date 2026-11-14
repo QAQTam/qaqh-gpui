@@ -18,7 +18,7 @@
 | 内存 | 7.7Gi,可用 ~1.3–1.6Gi | **瓶颈**。两个 ZCode 实例常驻(~340MB×2 + 两个 zcode-cli ~220MB×2) |
 | swap | 3.8Gi,已用 3.5Gi | 系统已深处换页,编译峰值控制必须保守 |
 | 磁盘 | 79Gi 可用 | 充裕;`target/` 预计 +4–6Gi |
-| 工具链 | 1.98.1 已安装(与 gpui-pre 快照的工具链要求对齐) | 零下载 |
+| 工具链 | stable 通道(rust-toolchain.toml 不 pin 版本) | rustup 解析最新稳定版 |
 | 前例 | 探索期曾以 `../gpui` vendor 检出本机构建过 gpui(该检出 2026-11-08 已删) | 系统级依赖(fontconfig/xkbcommon/wayland dev)已在 |
 
 **资源策略**(用户睡前指令:内存友好,避开两个后台 ZCode 的内存竞争):

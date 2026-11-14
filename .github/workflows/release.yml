@@ -17,7 +17,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang cmake pkg-config libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev libvulkan-dev libegl1-mesa-dev libglib2.0-dev libssl-dev mesa-vulkan-drivers weston
-          rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+          rustup toolchain install stable --profile minimal --component rustfmt
       - name: Materialize pinned sources
         working-directory: source/qaqh-gpui
         run: python3 scripts/prepare-sources.py

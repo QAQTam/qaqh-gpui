@@ -6,7 +6,7 @@ use gpui_component::Sizable;
 use qaqh_client::{
     ProviderUpsertDto, RingingCommand, SecretWrite, SessionSettingsPatch, ToolsSettingPatch,
 };
-use qaqh_config_api::{ConfigPatch, ExecPatch, GoalsPatch, SandboxPatch, SubagentPatch};
+use qaqh_config_api::{ConfigPatch, ExecPatch, GoalsPatch, SandboxPatch};
 use qaqh_profile::{ModelDef, ProfilesDocument, ProviderDef};
 use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
@@ -741,52 +741,8 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                     ..Default::default()
                 })
             },
-        ))
-        .child(section_header("子代理", t));
-    macro_rules! subagent {
-        ($label:literal, $field:ident, $read:expr, $convert:expr) => {
-            edit_config(cx, t, $label, $read, |field, cx| {
-                Ok(ConfigPatch {
-                    subagent: Some(SubagentPatch {
-                        $field: Some(($convert)(field, cx)?),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-            })
-        };
-    }
+        ));
     body = body
-        .child(subagent!(
-            "超时（秒）",
-            timeout_secs,
-            config.subagent.timeout_secs,
-            Field::number
-        ))
-        .child(subagent!(
-            "最大深度（重启后生效）",
-            max_depth,
-            config.subagent.max_depth,
-            Field::number
-        ))
-        .child(subagent!(
-            "每对会话排队上限",
-            message_in_flight_per_pair,
-            config.subagent.message_in_flight_per_pair,
-            Field::number
-        ))
-        .child(subagent!(
-            "每个发送者消息上限",
-            message_outbound_per_sender,
-            config.subagent.message_outbound_per_sender,
-            Field::number
-        ))
-        .child(subagent!(
-            "默认工具（逗号分隔）",
-            default_tools,
-            config.subagent.default_tools.join(", "),
-            |f: &Field, cx| Ok::<_, String>(list(&f.value(cx)))
-        ))
         .child(section_header("目标模式", t))
         .child(toggle_config(
             cx,

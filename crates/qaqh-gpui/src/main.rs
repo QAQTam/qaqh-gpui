@@ -8,12 +8,12 @@ mod app;
 mod acceptance;
 
 fn main() {
-    // 构建期版本/provenance 注入 wire 诊断面(build.rs env 只对 bin 可见)。
-    qaqh_gpui_wire::diagnostics::init(env!("QAQH_VERSION"), env!("QAQH_BUILD_REVISION"));
+    // 构建期版本注入 wire 诊断面(build.rs env 只对 bin 可见)。
+    qaqh_gpui_wire::diagnostics::init(env!("QAQH_VERSION"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => app::launch(),
-        [flag] if flag == "--version" => println!("qaqh-gpui {} ({}){}", env!("QAQH_VERSION"), env!("QAQH_BUILD_REVISION"), if cfg!(feature = "acceptance") { " [acceptance]" } else { "" }),
+        [flag] if flag == "--version" => println!("qaqh-gpui {}{}", env!("QAQH_VERSION"), if cfg!(feature = "acceptance") { " [acceptance]" } else { "" }),
         [flag] if flag == "--diagnostics" => println!("{}", qaqh_gpui_wire::diagnostics::report()),
         [flag] if flag == "--probe" => qaqh_gpui_wire::bridge::probe(),
         [flag] if flag == "--help" => println!("QAQHarness native desktop client\n\nqaqh-gpui                Open the desktop window\nqaqh-gpui --probe        Check daemon connectivity\nqaqh-gpui --diagnostics  Export redacted diagnostics\nqaqh-gpui --version      Show build information"),

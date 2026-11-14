@@ -5044,7 +5044,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qaqh-client"
-version = "3.0.20261110-g1842986"
+version = "4.0.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5065,14 +5065,14 @@ dependencies = [
 
 [[package]]
 name = "qaqh-config-api"
-version = "3.0.20261110-g1842986"
+version = "4.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "qaqh-gpui"
-version = "3.0.20261109"
+version = "4.0.0"
 dependencies = [
  "embed-resource",
  "futures",
@@ -5091,7 +5091,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-gpui-kit"
-version = "3.0.20261109"
+version = "4.0.0"
 dependencies = [
  "gpui-component",
  "gpui-pre",
@@ -5101,7 +5101,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-gpui-render"
-version = "3.0.20261109"
+version = "4.0.0"
 dependencies = [
  "base64 0.22.1",
  "gpui-pre",
@@ -5119,7 +5119,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-gpui-session"
-version = "3.0.20261109"
+version = "4.0.0"
 dependencies = [
  "futures",
  "gpui-component",
@@ -5139,7 +5139,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-gpui-shell"
-version = "3.0.20261109"
+version = "4.0.0"
 dependencies = [
  "futures",
  "gpui-component",
@@ -5158,7 +5158,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-gpui-wire"
-version = "3.0.20261109"
+version = "4.0.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -5174,7 +5174,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-profile"
-version = "3.0.20261110-g1842986"
+version = "4.0.0"
 dependencies = [
  "log",
  "qaqh-types",
@@ -5186,7 +5186,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing"
-version = "3.0.20261110-g1842986"
+version = "4.0.0"
 dependencies = [
  "qaqh-profile",
  "qaqh-ringing-contract",
@@ -5197,7 +5197,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing-contract"
-version = "3.0.20261110-g1842986"
+version = "4.0.0"
 dependencies = [
  "qaqh-types",
  "serde",
@@ -5209,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-types"
-version = "3.0.20261110-g1842986"
+version = "4.0.0"
 dependencies = [
  "serde",
  "serde_json",
