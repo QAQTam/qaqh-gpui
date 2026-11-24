@@ -1,4 +1,7 @@
-//! ASK v1 文本语法解析(与 `qaqh-workspace::ask_user` 同一语法,前端只消费渲染)。
+//! ASK v1 文本语法解析。权威实现在后端 `qaqh-workspace::ask_user`;其依赖图
+//! (tool-core/file-tools/permission…)进不了前端依赖图,故此处保持**受守卫的
+//! 镜像**(与 qaqh-client::service 的 SERVICE_METHODS 同一口径)。根治:后端把
+//! 解析器下沉到 K1 叶子 crate 后,删除本镜像改依赖之。
 //! ask 工具的 interaction.request 是 `{"input": "ASK v1 …"}` JSON;非法文档
 //! 不猜不修,回退自由文本应答。
 

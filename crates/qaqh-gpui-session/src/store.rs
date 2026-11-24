@@ -7,12 +7,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
-use gpui::App;
-use gpui::AppContext as _;
-use gpui::Context;
-use gpui::Entity;
-use gpui::Window;
-use gpui::{ListAlignment, ListState, px};
+use gpui_kit::App;
+use gpui_kit::AppContext as _;
+use gpui_kit::Context;
+use gpui_kit::Entity;
+use gpui_kit::Window;
+use gpui_kit::{ListAlignment, ListState, px};
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::AssistantBlockKind;
 use qaqh_ringing_contract::fact::BlockId;
@@ -20,7 +20,6 @@ use qaqh_ringing_contract::fact::ExecSessionId;
 use qaqh_ringing_contract::fact::InteractionId;
 use qaqh_ringing_contract::fact::ToolCallId;
 use qaqh_ringing_contract::fact::TurnId;
-use qaqh_ringing_contract::state::DriverState;
 use qaqh_ringing_contract::state::ExecSessionView;
 use qaqh_ringing_contract::state::GoalStatus;
 use qaqh_ringing_contract::state::GoalView;
@@ -32,12 +31,13 @@ use qaqh_ringing_contract::state::TurnView;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use gpui_component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use qaqh_client::{
     CommandTarget, RingingCommand, SessionSettingsPatch, ToolsSettingPatch,
 };
 use qaqh_profile::ProfilesDocument;
-use qaqh_types::{ModelSelection, SessionListEntry, SettingValue};
+use qaqh_types::{ModelSelection, SessionListEntry, SessionRunStatus, SettingValue};
+use qaqh_ringing_contract::state::ToolCallState;
 
 /// 单会话 SSE 流状态(由 `V2StreamStatus` 映射,避免 store 依赖 SDK 内部枚举形状)。
 pub enum StreamState {
@@ -77,6 +77,132 @@ pub struct HandoffSeal {
     pub work_summary: String,
 }
 
+/// ADR-016 交接卡事实:fork 文档/简述取 args(模型亲手写的结构化);T0/计划
+/// 开箱/自动接续取 output 机器面(5fa1762d),偏好 `args.auto_continue` 优先。
+/// 非布尔/缺省一律 true——字段缺省 ≠ 模型声明「不拽我」。机器面读不出时
+/// `sealed=false` 仍给卡片(electron inferred 路径同口径:入口照给,出处标出)。
+#[derive(Clone, Debug)]
+pub struct HandoffFacts {
+    pub summary: Option<String>,
+    pub doc: String,
+    /// 机器面 `handed_off === true`(权威封箱标记)。
+    pub sealed: bool,
+    pub sealed_at_ms: Option<u64>,
+    pub planned_open_at_ms: Option<u64>,
+    pub auto_continue: bool,
+}
+
+/// 毫秒钟(倒计时/开箱判定);daemon 与前端同机,unix ms 直接比对。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// handoff 工具调用 → 交接事实。主判据 = 机器面 `handed_off === true`;
+/// 文档正文优先取 args(output 里的同名字段只作冗余兜底),没有正文不配叫交接。
+pub fn handoff_facts(tool: &ToolCallView) -> Option<HandoffFacts> {
+    if tool.tool_name.as_deref() != Some("handoff") {
+        return None;
+    }
+    let success = matches!(&tool.state, ToolCallState::Finished { outcome } if outcome.is_success());
+    if !success {
+        return None;
+    }
+    let args = tool.args.as_ref()?;
+    let doc = args.get("handoff_doc")?.as_str()?.to_string();
+    if doc.trim().is_empty() {
+        return None;
+    }
+    let summary = args
+        .get("work_summary")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty());
+    let payload = tool
+        .output
+        .as_ref()
+        .and_then(|output| extract_machine_json(crate::timeline::content_text(output)));
+    let sealed = payload
+        .as_ref()
+        .is_some_and(|payload| payload.get("handed_off") == Some(&serde_json::Value::Bool(true)));
+    let arg_auto = args.get("auto_continue").and_then(|value| value.as_bool());
+    let output_auto = payload
+        .as_ref()
+        .and_then(|payload| payload.get("auto_continue"))
+        .and_then(|value| value.as_bool());
+    Some(HandoffFacts {
+        summary,
+        doc,
+        sealed,
+        sealed_at_ms: payload
+            .as_ref()
+            .and_then(|payload| payload.get("sealed_at_ms"))
+            .and_then(|value| value.as_u64()),
+        planned_open_at_ms: payload
+            .as_ref()
+            .and_then(|payload| payload.get("planned_open_at_ms"))
+            .and_then(|value| value.as_u64()),
+        auto_continue: arg_auto.or(output_auto).unwrap_or(true),
+    })
+}
+
+/// 取机器面 JSON(electron handoffPayloadFromOutput 同口径):输出是「前半句
+/// 人话 + ```json 机器面」;整段本身是 JSON 也吃;扫平衡对象段,带
+/// `handed_off` 的段优先,否则留第一段(文档正文里出现的 JSON 不会带这个键)。
+fn extract_machine_json(output: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
+        return Some(value);
+    }
+    let bytes = output.as_bytes();
+    let mut first = None;
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' {
+            continue;
+        }
+        let (mut depth, mut in_string, mut escaped) = (0i32, false, false);
+        for (offset, &byte) in bytes[start..].iter().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' if in_string => escaped = true,
+                b'"' => in_string = !in_string,
+                b'{' if !in_string => depth += 1,
+                b'}' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output[start..=start + offset]) {
+                            let with_seal = value.get("handed_off").is_some();
+                            if first.is_none() {
+                                first = Some(value.clone());
+                            }
+                            if with_seal {
+                                return Some(value);
+                            }
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    first
+}
+
+/// Provider 请求重试态(ADR-0018 展示面):仅展示、不落库、不进事实;
+/// 任何权威帧到达即由 reducer 清除(帧词表:重试中永远不与已展示文本并存)。
+#[derive(Clone, Debug)]
+pub struct ProviderRetry {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay_secs: u64,
+    pub error: String,
+}
+
 pub struct SessionStore {
     pub snapshot_pending: bool,
     pub buffered_frames: Vec<qaqh_ringing_contract::events::SessionEventFrame>,
@@ -103,6 +229,10 @@ pub struct SessionStore {
     /// 工具调用业务状态(单一权威,与 timeline 的 ToolCall 条目按 call_id 关联)。
     pub tools: Vec<ToolCallView>,
     pub expanded_tools: HashSet<ToolCallId>,
+    /// 展开的思考链路块(默认折叠,同 expanded_tools 口径)。
+    pub expanded_thinking: HashSet<BlockId>,
+    /// 展开的连续工具轨迹组(以组内首条 entry 索引为 key)。
+    pub expanded_groups: HashSet<usize>,
     /// 未 declare 的参数生成流:call_id → 流式摘要。
     pub arg_stream: Vec<ArgStream>,
     /// 运行中工具的输出尾窗:call_id → 累计文本。
@@ -113,13 +243,23 @@ pub struct SessionStore {
     pub goal: Option<GoalView>,
     /// 封箱事实(ADR-0016):HandoffSealed 事件维护;UI 投影(封箱标记/后继入口)读此。
     pub handoff_seal: Option<HandoffSeal>,
+    /// 开箱机器面(ADR-016/5fa1762d):handoff 工具终态成功时解析;倒计时投影。
+    pub handoff_open: Option<HandoffFacts>,
+    /// 自动接续待跳(封箱线正开着且模型未声明「不拽我」):HandoffSealed 落值,
+    /// daemon 消费后清零。
+    pub handoff_auto_jump: Option<String>,
+    /// 倒计时 ticker 已武装(防重复 spawn)。
+    pub handoff_ticking: bool,
+    /// Provider 请求重试中(ADR-0018):横幅投影;权威帧到达即清。
+    pub provider_retry: Option<ProviderRetry>,
     pub exec_sessions: Vec<ExecSessionView>,
     /// 执行会话输出:exec_session_id → (已收 offset 上界, 累计文本)。
     pub exec_output_tail: Vec<(ExecSessionId, u64, String)>,
-    pub driver: Option<DriverState>,
     pub stream: StreamState,
     /// markdown 解析缓存(M4):section key → (源哈希, 解析结果)。
     pub md_cache: crate::markdown::ParseCache,
+    /// 后台执行终端面板(pty 捕获流 → 只读 ANSI 屏)。
+    pub terminal_panel: crate::terminal_panel::TerminalPanel,
     /// 流式吐字速率采样:3s 滑窗,元素 = (到达时刻, 本次净增字符数)。
     /// 速率为估算(字符/4≈token);封口块由 usage/generated_ms 给权威值。
     pub tok_samples: std::collections::VecDeque<(std::time::Instant, i64)>,
@@ -128,18 +268,17 @@ pub struct SessionStore {
     pub settings: Option<SessionListEntry>,
     pub settings_pending: bool,
     pub catalog: Option<Arc<ProfilesDocument>>,
-    /// 删除确认二段态(第一次点击武装,第二次执行)。
-    pub confirm_delete: bool,
     /// composer 状态(M2):组件库 Textarea(auto_grow,Enter 提交,Shift+Enter 换行)。
     pub composer: Entity<TextareaState>,
     /// 重命名草稿(Some = 重命名模式)。
-    pub renaming: Option<Entity<InputState>>,
     /// ask 卡草稿,按 interaction_id。
     pub ask_drafts: Vec<(InteractionId, AskDraft)>,
     /// ask 卡未答提示(上次提交被拒时显示,成功提交/跳过/解决后清除)。
     pub ask_hint: Option<String>,
     /// goal Dialog 草稿(objective, 预算);Some = 对话框打开中。
     pub goal_draft: Option<(Entity<InputState>, Entity<InputState>)>,
+    /// 待二段确认撤回的 turn_id(conversation.truncate)。
+    pub confirm_truncate_turn: Option<String>,
     pub requests: UnboundedSender<BridgeRequest>,
 }
 
@@ -165,7 +304,7 @@ impl SessionStore {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
-                .placeholder("输入消息,Enter 发送…")
+                .placeholder("输入消息…")
         });
         // Enter(无 Shift)提交;Shift+Enter 由引擎插入换行(submit_on_enter 语义)。
         cx.subscribe(&composer, |this, _, event, cx| {
@@ -215,29 +354,34 @@ impl SessionStore {
             streaming: Vec::new(),
             tools: Vec::new(),
             expanded_tools: HashSet::new(),
+            expanded_thinking: HashSet::new(),
+            expanded_groups: HashSet::new(),
             arg_stream: Vec::new(),
             output_tail: Vec::new(),
             interactions: Vec::new(),
             subagents: Vec::new(),
             goal: None,
             handoff_seal: None,
+handoff_open: None,
+handoff_auto_jump: None,
+handoff_ticking: false,
+provider_retry: None,
             exec_sessions: Vec::new(),
             exec_output_tail: Vec::new(),
-            driver: None,
             stream: StreamState::Connecting,
             md_cache: crate::markdown::ParseCache::default(),
             tok_samples: std::collections::VecDeque::new(),
             timeline_list,
+            terminal_panel: crate::terminal_panel::TerminalPanel::new(cx),
             timeline_follow_setting: None,
             settings: None,
             settings_pending: false,
             catalog: None,
-            confirm_delete: false,
             composer,
-            renaming: None,
             ask_drafts: Vec::new(),
             ask_hint: None,
             goal_draft: None,
+            confirm_truncate_turn: None,
             requests,
         }
     }
@@ -252,9 +396,6 @@ impl SessionStore {
         if self.outbox.as_ref().is_some_and(|o| matches!(o.state,
             qaqh_gpui_wire::delivery::DeliveryState::Sending | qaqh_gpui_wire::delivery::DeliveryState::Accepted | qaqh_gpui_wire::delivery::DeliveryState::Uncertain)) {
             return Some("上一条消息尚未确认，请先查回执");
-        }
-        if self.driver.as_ref().and_then(|d| d.holder.as_ref()).is_some_and(|holder| Some(holder) != self.client_session_id.as_ref()) {
-            return Some("其他客户端持有控制权，可显式接管");
         }
         if self.interactions.iter().any(|i| i.resolution.is_none()) {
             return Some("有待应答的交互");
@@ -334,15 +475,62 @@ impl SessionStore {
         }
     }
 
-    pub fn respond_permission(&mut self, tool_call_id: String, approved: bool, trust_folder: bool) {
+    /// 被拒/失败的消息恢复为草稿:outbox 清空,文本/图片/附件回填 composer。
+    pub fn restore_outbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(outbox) = self.outbox.take() {
+            let text = outbox.message.text.clone();
+            self.composer.update(cx, |composer, cx| {
+                composer.set_value(text.as_str(), window, cx)
+            });
+            self.images = outbox.message.images;
+            self.attachments = outbox.message.attachments.unwrap_or_default();
+        }
+    }
+
+    pub fn respond_permission(
+        &mut self,
+        tool_call_id: String,
+        approved: bool,
+        scope: Option<qaqh_ringing_contract::fact::PermissionGrantScope>,
+    ) {
         let _ = self
             .requests
             .unbounded_send(BridgeRequest::RespondPermission {
                 seed: self.session_id.clone(),
                 tool_call_id,
                 approved,
-                trust_folder,
+                scope,
             });
+    }
+
+    /// 撤回并重编辑(conversation.truncate):截断含指定回合及其后的所有历史,并回填输入框。
+    pub fn truncate_turn(
+        &mut self,
+        turn_id: String,
+        prefill_text: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_running() {
+            self.operation_error = Some("当前会话正在运行中，请先停止后再撤回回合。".into());
+            self.confirm_truncate_turn = None;
+            cx.notify();
+            return;
+        }
+        let _ = self.requests.unbounded_send(BridgeRequest::Command {
+            target: CommandTarget::Session {
+                session_id: self.session_id.clone(),
+            },
+            command: RingingCommand::ConversationTruncate { turn_id },
+        });
+        if let Some(text) = prefill_text {
+            self.composer.update(cx, |composer, cx| {
+                composer.set_value(text.as_str(), window, cx);
+                composer.focus(window, cx);
+            });
+        }
+        self.confirm_truncate_turn = None;
+        cx.notify();
     }
 
     /// goal 控制(ADR-0015):objective=创建/改目标;status=状态迁移;
@@ -456,39 +644,6 @@ impl SessionStore {
         });
     }
 
-    /// 进入重命名模式,草稿取当前标题;Enter 提交由输入事件订阅驱动。
-    pub fn begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let state = cx.new(|cx| InputState::new(window, cx).placeholder("新标题…"));
-        cx.subscribe(&state, |this, _, event, cx| {
-            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                this.rename_commit(cx);
-            }
-        })
-        .detach();
-        self.renaming = Some(state);
-    }
-
-    /// Keep the edit until the authoritative metadata event confirms it.
-    pub fn rename_commit(&mut self, cx: &Context<Self>) {
-        let Some(draft) = self.renaming.as_ref() else {
-            return;
-        };
-        let title = draft.read(cx).value().trim().to_string();
-        if title.is_empty() {
-            return;
-        }
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::RenameSession {
-                seed: self.session_id.clone(),
-                title,
-            });
-    }
-
-    pub fn rename_cancel(&mut self) {
-        self.renaming = None;
-    }
-
     /// handoff fork(v3.1a):从本会话的 handoff 工具事实创建交接会话。
     /// 载荷抄本会话 meta 的 cwd/model_selection(electron forkHandoffSession 同口径),
     /// title = work_summary,首消息 = 交接文档,handoff_from = 本会话(goal 工作链接缝)。
@@ -497,6 +652,7 @@ impl SessionStore {
         let _ = self.requests.unbounded_send(BridgeRequest::CreateSession {
             cwd: meta.and_then(|meta| meta.cwd.clone()),
             model_selection: meta.and_then(|meta| meta.model_selection.clone()),
+            tool_mode: None,
             title: summary,
             first_message: Some(doc),
             handoff_from: Some(self.session_id.clone()),
@@ -609,23 +765,36 @@ impl SessionStore {
         });
     }
 
-    /// 脱离工作区分组(落入「未分组」)。
-    pub fn detach_from_workspace(&mut self) {
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::DetachSession {
-                seed: self.session_id.clone(),
-            });
+    /// 工作区目录尾段(供 TitleBar 面包屑与无标题降级)。
+    pub fn workspace_tail(&self) -> Option<gpui_kit::SharedString> {
+        self.settings
+            .as_ref()
+            .and_then(|entry| entry.meta.cwd.as_deref())
+            .filter(|cwd| !cwd.is_empty())
+            .map(|cwd| {
+                let trimmed = cwd.trim_end_matches(['/', '\\']);
+                let tail = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+                gpui_kit::SharedString::from(tail.to_owned())
+            })
     }
 
-    /// 删除本会话(幂等;名册轮询刷新列表)。
-    pub fn delete_self(&mut self) {
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::DeleteSession {
-                seed: self.session_id.clone(),
-            });
+    /// 清洗后展示标题:拦截空串/"(无标题)"/"ses_*" ULID,避免内部 ID 泄露到标题位。
+    pub fn display_title(&self) -> gpui_kit::SharedString {
+        if let Some(title) = self.title.as_deref().map(str::trim)
+            && !title.is_empty()
+            && title != "(无标题)"
+            && !title.starts_with("ses_")
+        {
+            return gpui_kit::SharedString::from(title.to_owned());
+        }
+        self.workspace_tail()
+            .unwrap_or_else(|| gpui_kit::SharedString::from("未命名会话"))
     }
+
+    pub fn is_running(&self) -> bool {
+        self.activity == Some(ActivityState::Running)
+    }
+
 }
 
 pub fn model_options_from(catalog: &ProfilesDocument) -> Vec<ModelSelection> {
@@ -638,14 +807,19 @@ pub fn model_options_from(catalog: &ProfilesDocument) -> Vec<ModelSelection> {
     }).filter(|model| qaqh_profile::resolve_model_selection(catalog, model).is_ok()).collect()
 }
 
-/// `session.list` 侧栏条目(原始 JSON 的最小投影)。
+/// `session.list` 侧栏条目:契约类型直用,status/updated_at 不经字符串化。
 #[derive(Clone)]
 pub struct SessionRow {
     pub id: String,
     pub title: String,
-    pub updated_at: String,
-    /// SessionRunStatus 词表字符串(running/waiting_user/cancelling/idle/not_running)。
-    pub status: String,
+    /// meta.updated_at 原样。注意:**后端给的是秒**(list 投影把
+    /// updated_at_ms/1000),只可同单位比较,不能当毫秒展示——侧栏
+    /// 「N 天前」的老 bug 就是把它当毫秒算的单位错位。
+    pub updated_at: u64,
+    /// 创建时刻(Unix 毫秒):DB `created_at_ms` 真值优先,`ses_<ULID>`
+    /// 自解码兜底;0 = 两者皆不可得。仅排序用。
+    pub created_at_ms: u64,
+    pub status: SessionRunStatus,
     pub workspace_id: Option<String>,
     pub cwd: Option<String>,
     pub archived: bool,
@@ -656,14 +830,14 @@ pub fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
         .map(|entry| SessionRow {
             id: entry.meta.session_id.clone(),
             title: entry.meta.title.clone().unwrap_or_else(|| "(无标题)".into()),
-            updated_at: entry.meta.updated_at.to_string(),
-            status: match entry.status {
-                qaqh_types::SessionRunStatus::NotRunning => "not_running",
-                qaqh_types::SessionRunStatus::Idle => "idle",
-                qaqh_types::SessionRunStatus::Running => "running",
-                qaqh_types::SessionRunStatus::WaitingUser => "waiting_user",
-                qaqh_types::SessionRunStatus::Cancelling => "cancelling",
-            }.into(),
+            updated_at: entry.meta.updated_at,
+            created_at_ms: entry
+                .meta
+                .created_at_ms
+                .filter(|ms| *ms > 0)
+                .or_else(|| session_created_at_ms(&entry.meta.session_id))
+                .unwrap_or(0),
+            status: entry.status,
             workspace_id: entry.workspace_id.clone(),
             cwd: entry.meta.cwd.clone(),
             archived: entry.meta.archived,
@@ -714,7 +888,17 @@ pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<Wor
         .into_iter()
         .map(|(entry, rows)| {
             let mut rows: Vec<SessionRow> = rows.into_iter().cloned().collect();
-            rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            // 组内新→旧:优先毫秒创建时刻(id 自解码兜底),旧数据退回
+            // updated_at(秒 ×1000 归一到毫秒量纲);决胜键 session_id 字典序
+            // (electron 同款绝对确定性排序)。
+            let recency = |row: &SessionRow| {
+                if row.created_at_ms > 0 {
+                    row.created_at_ms
+                } else {
+                    row.updated_at.saturating_mul(1000)
+                }
+            };
+            rows.sort_by(|a, b| recency(b).cmp(&recency(a)).then_with(|| a.id.cmp(&b.id)));
             WorkspaceGroup {
                 id: entry.map(|entry| entry.id.clone()),
                 title: entry.map(|entry| entry.title.clone()).unwrap_or_else(|| "未分组".into()),
@@ -722,6 +906,97 @@ pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<Wor
             }
         })
         .collect()
+}
+
+/// `ses_<ULID>` 会话 id → 创建时刻(Unix 毫秒)。
+///
+/// 生成规则在后端 qaqh-session/src/manager.rs `allocate_session` =
+/// `ses_` + Crockford base32(26 字符),载荷是 UUIDv7 的 16 字节
+/// (qaqh-ringing-contract/src/ulid.rs `generate_ulid`),前 48 bit 即 Unix
+/// 毫秒。这里只解码前 10 个字符(50 bit,时间戳占高 48);异形 id 一律 None。
+pub fn session_created_at_ms(session_id: &str) -> Option<u64> {
+    let ulid = session_id.strip_prefix("ses_")?;
+    let bytes = ulid.as_bytes();
+    if bytes.len() != 26 {
+        return None;
+    }
+    let mut ts: u64 = 0;
+    for &ch in &bytes[..10] {
+        let up = ch.to_ascii_uppercase();
+        let v = match up {
+            b'0'..=b'9' => u64::from(up - b'0'),
+            b'A'..=b'H' => u64::from(up - b'A' + 10),
+            b'J' | b'K' => u64::from(up - b'J' + 18),
+            b'M' | b'N' => u64::from(up - b'M' + 20),
+            b'P'..=b'T' => u64::from(up - b'P' + 22),
+            b'V'..=b'Z' => u64::from(up - b'V' + 27),
+            // Crockford 易混容错:I/L→1、O→0;U 不在字母表。
+            b'I' | b'L' => 1,
+            b'O' => 0,
+            _ => return None,
+        };
+        ts = (ts << 5) | v;
+    }
+    // 首字符只带 3 个有效位(26×5=130 > 128,网格顶 2 位恒 0),前 10 字符
+    // 累出的 50 bit 里时间戳正好占低 48 位,无需再移位。
+    Some(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 复刻后端 ulid.rs 的 Crockford 编码,验证解码往返一致。
+    fn encode_ulid(bytes: [u8; 16]) -> String {
+        const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let value = u128::from_be_bytes(bytes);
+        let mut out = String::with_capacity(26);
+        for position in (0..26).rev() {
+            let index = ((value >> (position * 5)) & 0x1f) as usize;
+            out.push(ALPHABET[index] as char);
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_creation_ms_from_ses_ulid() {
+        // UUIDv7 前 6 字节 = Unix 毫秒(48 bit),剩余 80 bit 随机位不影响。
+        let ms: u64 = 1_700_000_000_123;
+        let be = ms.to_be_bytes();
+        let mut bytes = [0u8; 16];
+        bytes[..6].copy_from_slice(&be[2..]);
+        bytes[6] = 0x70; // v7 版本位,形状保真即可。
+        let id = format!("ses_{}", encode_ulid(bytes));
+        assert_eq!(session_created_at_ms(&id), Some(ms));
+    }
+
+    #[test]
+    fn rejects_foreign_ids() {
+        assert_eq!(session_created_at_ms("ses_short"), None);
+        assert_eq!(session_created_at_ms("0123abcd-uuid-shape"), None);
+        assert_eq!(session_created_at_ms(""), None);
+    }
+
+    #[test]
+    fn groups_sort_prefers_created_ms_then_updated_fallback() {
+        let mk = |id: &str, updated_at: u64, created_at_ms: u64| SessionRow {
+            id: id.into(),
+            title: String::new(),
+            updated_at,
+            created_at_ms,
+            status: SessionRunStatus::NotRunning,
+            workspace_id: None,
+            cwd: None,
+            archived: false,
+        };
+        // ses_a 只有毫秒创建时刻,ses_b 是老数据(仅秒制 updated_at):
+        // 200_000ms > 100s×1000,新会话排前。
+        let old = mk("ses_b", 100, 0);
+        let new = mk("ses_a", 0, 200_000);
+        let grouped = groups(&[old, new], &[]);
+        let ids: Vec<_> = grouped[0].rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["ses_a", "ses_b"]);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -733,6 +1008,8 @@ pub enum SettingsEditor {
     Session,
     Accounts,
     Workspaces,
+    Archived,
+    About,
 }
 
 /// 服务面账号服务(siwc = ChatGPT 套餐 / dsaccount = DeepSeek 账号)。

@@ -193,17 +193,6 @@ try:
     report["scenarios"]["send-failure-recovery"] = {"passed": True, "command_id": pending["command_id"]}
     report["scenarios"]["install-first-message"] = {"passed": True, "binary": str(client_binary)}
     report["attachments"] = True
-    control("driver", release=False, stale_holder=None)
-    own = wait(lambda: current().get("client_session_id") if (current().get("driver") or {}).get("holder") == current().get("client_session_id") else None, "first driver")
-    second = open_client()
-    command(second, {"type": "session.attach"}, target)
-    control("driver", release=True, stale_holder=None)
-    wait(lambda: not (current().get("driver") or {}).get("holder"), "driver released")
-    command(second, {"type": "driver.claim", "client_session_id": second}, target)
-    wait(lambda: (current().get("driver") or {}).get("holder") == second, "second driver observed")
-    control("driver", release=False, stale_holder=second)
-    wait(lambda: (current().get("driver") or {}).get("holder") == own, "explicit takeover")
-    report["scenarios"]["driver-handoff"] = {"passed": True}
     metadata_client = open_client()
     (root / "other-workspace").mkdir()
     command(metadata_client, {"type": "workspace.create", "path": str(root / "other-workspace")})

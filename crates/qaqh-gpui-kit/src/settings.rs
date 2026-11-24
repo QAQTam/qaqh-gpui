@@ -9,12 +9,31 @@
 
 use std::path::PathBuf;
 
-use gpui::App;
-use gpui::Global;
+use gpui_kit::App;
+use gpui_kit::Global;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::theme::ThemeMode;
+use crate::theme::{ThemeMode, ThemePreset};
+
+/// GPU 动效档位:Full(120fps 完整物理弹簧与进退场) / Reduced(仅轻柔淡入淡出) / Off(零动效)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MotionLevel {
+    #[default]
+    Full,
+    Reduced,
+    Off,
+}
+
+impl MotionLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "流畅物理",
+            Self::Reduced => "精简动效",
+            Self::Off => "零动效",
+        }
+    }
+}
 
 /// UI 密度:影响时间线留白(electron 的 --space 节奏三档)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,18 +63,55 @@ impl Density {
     }
 }
 
+/// 终端与命令输出面板配色方案。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalScheme {
+    #[default]
+    Auto,
+    Obsidian,
+    OneDark,
+    TokyoNight,
+    WarmPaper,
+}
+
+impl TerminalScheme {
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Obsidian,
+        Self::OneDark,
+        Self::TokyoNight,
+        Self::WarmPaper,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "跟随主题",
+            Self::Obsidian => "极夜黑",
+            Self::OneDark => "One Dark",
+            Self::TokyoNight => "Tokyo Night",
+            Self::WarmPaper => "暖纸",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceContent {
     pub theme_mode: ThemeMode,
+    pub theme_preset: ThemePreset,
+    pub motion_level: MotionLevel,
     pub density: Density,
+    pub terminal_scheme: TerminalScheme,
 }
 
 impl Default for AppearanceContent {
     fn default() -> Self {
         Self {
             theme_mode: ThemeMode::default(),
+            theme_preset: ThemePreset::default(),
+            motion_level: MotionLevel::default(),
             density: Density::default(),
+            terminal_scheme: TerminalScheme::default(),
         }
     }
 }
@@ -178,7 +234,8 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut SettingsContent)) {
     f(&mut state.content);
     save(&state.path, &state.content);
     let mode = state.content.appearance.theme_mode;
-    crate::theme::apply_mode(mode, cx);
+    let preset = state.content.appearance.theme_preset;
+    crate::theme::apply_appearance(mode, preset, cx);
 }
 
 /// tmp + rename 原子写,防半截文件。

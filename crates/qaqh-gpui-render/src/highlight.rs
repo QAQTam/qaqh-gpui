@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use gpui::FontStyle;
-use gpui::HighlightStyle;
-use gpui::StyledText;
-use gpui::px;
+use gpui_kit::FontStyle;
+use gpui_kit::HighlightStyle;
+use gpui_kit::StyledText;
+use gpui_kit::px;
 use tree_sitter_highlight::HighlightConfiguration;
 use tree_sitter_highlight::HighlightEvent;
 use tree_sitter_highlight::Highlighter;
@@ -241,7 +241,7 @@ fn name_style(name: &str, t: &Palette) -> HighlightStyle {
         }
         "error" => HighlightStyle {
             color: Some(t.bad),
-            underline: Some(gpui::UnderlineStyle {
+            underline: Some(gpui_kit::UnderlineStyle {
                 thickness: px(1.),
                 color: None,
                 wavy: true,

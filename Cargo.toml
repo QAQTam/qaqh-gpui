@@ -15,7 +15,7 @@ members = [
 default-members = ["crates/qaqh-gpui"]
 
 [workspace.package]
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -30,27 +30,12 @@ qaqh-gpui-render = { path = "crates/qaqh-gpui-render" }
 qaqh-gpui-session = { path = "crates/qaqh-gpui-session" }
 qaqh-gpui-shell = { path = "crates/qaqh-gpui-shell" }
 
-# ---- gpui 基座 ----
-# longbridge/gpui-kit 对 zed gpui 的 crates.io 快照重发布(gpui-pre-*),
-# 精确 pin——caret 会随周更快照漂移破坏编译(gpui-kit #3156 的教训)。
-#   gpui-pre 0.3.11 @ 2026-11-02,zed main 快照,与原 vendor(e21ff1b @ 2026-11-04)同源;
-#   包内 lib 名与原版一致(gpui/gpui_platform),业务代码零改动。
-# 拆平台版结构:gpui 是平台无关核心,Linux 后端经 gpui_platform(wayland/x11)接线;
-# Windows 后端由 gpui_platform 的 cfg(target_os="windows") 自动接 gpui-pre-windows,无需特征。
-# wayland/x11 在 gpui-pre 本体上是空标记特征;windows-manifest 在 Windows 嵌 DPI manifest。
-gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = [
-    "font-kit",
-    "wayland",
-    "windows-manifest",
-] }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["wayland"] }
-# 组件库(Apache-2.0):Button/Modal/Popover/Table/Dock 等 60+ 件。
-# 精确 pin 与 gpui-pre 快照咬合;升版必须连同 gpui-pre pin 一起动(pin 纪律)。
-# tree-sitter-languages/decimal/inspector/syntect features 全不启用:高亮用本仓 highlight.rs。
-gpui-component = "=0.9.0"
-# 组件库图标包(Lucide,rust-embed 内嵌):窗口 AssetSource 注册 gpui_kit_assets::Assets,
-# 不注册则组件的菜单/图标一律空白。
-gpui-kit-assets = "0.9.0"
+# ---- gpui-kit 统一基座(纯原生,零 WebView) ----
+# longbridge/gpui-kit 单一顶层伞包(Apache-2.0):内部严格锁死同源的
+# gpui-pre(=0.3.14) + gpui-pre-platform(=0.3.14) + gpui-base(0.11.0)
+# + gpui-component(0.11.0) + gpui-kit-assets(0.11.0),避免 4 个散包手工 pin 漂移。
+# 默认挂上游 gpui-pre 后端;不启用 tree-sitter-languages/decimal/inspector/syntect/speech。
+gpui-kit = "=0.11.0"
 
 # ---- 后端 path 依赖(相对 workspace 根,与 qaqh-tui 同路;后端仓必须与该相对路径共存) ----
 # RingingV2 传输权威实现。协议类型经它转出,前端零自建、零转换层。
@@ -82,6 +67,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 仅用 tokio::time::sleep(桥线程等待重试);runtime 复用 qaqh-client 的全局运行时。
 tokio = { version = "1", default-features = false, features = ["time"] }
+# 完整 VT100/xterm/ConPTY 虚拟终端内核(Apache-2.0,仅用无头 Term + vte::ansi::Processor,不启本地 PTY)。
+alacritty_terminal = "0.26"
 
 # 内存受限环境:dev profile 压低编译峰值——
 # 16 个 codegen 单元压低单 crate 编译峰值,limited 调试信息压低产物与链接期峰值。

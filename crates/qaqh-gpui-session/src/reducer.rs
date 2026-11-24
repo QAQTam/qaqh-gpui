@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use gpui::Context;
+use gpui_kit::Context;
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::events::SessionEventFrame;
 use qaqh_ringing_contract::fact::ToolCallId;
@@ -26,6 +26,7 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.title = state.title;
     store.turns = state.turns;
     store.entries = state.timeline;
+    store.expanded_groups.clear();
     store.timeline_list.reset(store.entries.len() + 1);
     store.tools = state.tools;
     store.interactions = state.interactions;
@@ -37,7 +38,6 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.subagents = state.subagents;
     store.exec_sessions = state.exec_sessions;
     store.goal = state.goal;
-    store.driver = state.driver;
     clear_transient(store);
 }
 
@@ -48,6 +48,7 @@ pub fn clear_transient(store: &mut SessionStore) {
     store.output_tail.clear();
     store.exec_output_tail.clear();
     store.md_cache.clear();
+    store.provider_retry = None;
 }
 
 pub fn apply_frame(store: &mut SessionStore, frame: SessionEventFrame, cx: &mut Context<SessionStore>) {
@@ -55,6 +56,11 @@ pub fn apply_frame(store: &mut SessionStore, frame: SessionEventFrame, cx: &mut 
         return;
     }
     store.seq = frame.seq + 1;
+    // 重试态是瞬态展示:任何权威帧(含下一条重试帧之外的一切)到达即清,
+    // 重试帧自身只刷新计数/原因。
+    if !matches!(&frame.event, SessionEvent::ProviderRetrying { .. }) {
+        store.provider_retry = None;
+    }
     apply_event(store, frame.event, cx);
     for (_, text) in &mut store.output_tail { trim_tail(text, store.output_budget); }
     for (_, _, text) in &mut store.exec_output_tail { trim_tail(text, store.output_budget); }
@@ -156,6 +162,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                     exec_session_id: None,
                     output: None,
                     output_truncated: false,
+                    diff: None,
                     metrics: None,
                     code_delta: None,
                     effects: Vec::new(),
@@ -181,6 +188,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                     exec_session_id: None,
                     output: None,
                     output_truncated: false,
+                    diff: None,
                     metrics: None,
                     code_delta: None,
                     effects: Vec::new(),
@@ -201,16 +209,19 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             exec_session_id,
             output,
             output_truncated,
+            diff,
             metrics,
             code_delta,
             effects,
         } => {
             store.output_tail.retain(|slot| slot.0 != call_id);
             store.arg_stream.retain(|slot| slot.call_id != call_id);
+            let finished_call_id = call_id.clone();
             let updated = upsert_tool(store, &call_id, |existing| {
                 existing.exec_session_id = exec_session_id.clone();
                 existing.output = output.clone();
                 existing.output_truncated = output_truncated;
+                existing.diff = diff.clone();
                 existing.metrics = metrics.clone();
                 existing.code_delta = code_delta.clone();
                 existing.effects = effects.clone();
@@ -226,10 +237,22 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                     exec_session_id,
                     output,
                     output_truncated,
+                    diff,
                     metrics,
                     code_delta,
                     effects,
                 });
+            }
+            // ADR-016 开箱机器面:handoff 工具终态成功即解析 T0/计划开箱并武装
+            // 倒计时(纯展示,§决策 3)。
+            if updated {
+                if let Some(view) = store.tools.iter().find(|view| view.call_id == finished_call_id)
+                    && view.tool_name.as_deref() == Some("handoff")
+                {
+                    store.handoff_open = crate::store::handoff_facts(view)
+                        .filter(|facts| facts.sealed && facts.planned_open_at_ms.is_some());
+                    arm_handoff_tick(store, cx);
+                }
             }
         }
         SessionEvent::ExecSessionStarted { session } => upsert_exec(store, session),
@@ -259,6 +282,22 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                 .exec_output_tail
                 .push((exec_session_id, end_offset, text)),
         },
+        // Provider 重试(turn 级运行态陈述):仅展示,任何权威帧到达即清。
+        SessionEvent::ProviderRetrying {
+            attempt,
+            max_attempts,
+            delay_secs,
+            error,
+            ..
+        } => {
+            // 仅展示(不落库、不进事实);attempt 从 1 计,delay/error 原样透传。
+            store.provider_retry = Some(crate::store::ProviderRetry {
+                attempt,
+                max_attempts,
+                delay_secs,
+                error,
+            });
+        }
         SessionEvent::TimelineAppended { entry } => {
             if let TimelineEntry::AssistantBlock { block_id, .. } = &entry {
                 store.streaming.retain(|slot| &slot.0 != block_id);
@@ -299,6 +338,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                 TimelineEntry::AssistantBlock { turn_id, .. } => !removed.contains(turn_id),
                 TimelineEntry::Compaction { .. } => true,
             });
+            store.expanded_groups.clear();
             store.timeline_list.reset(store.entries.len() + 1);
         }
         SessionEvent::InteractionRequested { interaction } => {
@@ -331,12 +371,7 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             }
         }
         SessionEvent::SessionMetaChanged { title } => {
-            // 重命名草稿与权威标题一致才收口;草稿值经实体读取。
-            if store.renaming.as_ref().is_some_and(|draft| Some(draft.read(cx).value().trim()) == title.as_deref()) { store.renaming = None; }
             store.title = title;
-        }
-        SessionEvent::DriverChanged { driver } => {
-            store.driver = driver;
         }
         SessionEvent::GoalUpdated { goal } => {
             // 整字段替换;None = 已清除。链根与当前会话双流可能都发,幂等。
@@ -346,15 +381,75 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             sealed_session_id,
             successor_session_id,
             work_summary,
+            turn_id,
             ..
         } => {
             // ADR-0016 纯信息面:fork 本体不依赖本事件。仅封箱线本线需要标记,
             // 后继线经 session.list 正常渲染。双发幂等:整字段替换(同 GoalUpdated 口径)。
             if sealed_session_id == store.session_id {
-                store.handoff_seal = Some(HandoffSeal { successor_session_id, work_summary });
+                store.handoff_seal = Some(HandoffSeal {
+                    successor_session_id: successor_session_id.clone(),
+                    work_summary,
+                });
+                // 自动接续偏好:同回合 handoff 工具的 args/output;false = 「不拽我」
+                // (内核照常 fork,只是前端不自动跳)。
+                let auto_continue = store
+                    .tools
+                    .iter()
+                    .find(|tool| {
+                        tool.tool_name.as_deref() == Some("handoff")
+                            && tool.turn_id.as_ref() == Some(&turn_id)
+                    })
+                    .and_then(crate::store::handoff_facts)
+                    .map(|facts| facts.auto_continue)
+                    .unwrap_or(true);
+                store.handoff_auto_jump = auto_continue.then(|| successor_session_id);
             }
         }
+        SessionEvent::PromptBlocked { reason } => {
+            store.operation_error = Some(format!("输入被 Hook 拦截：{reason}"));
+        }
+        SessionEvent::HookStarted { .. } | SessionEvent::HookFinished { .. } => {}
     }
+}
+
+/// 倒计时 ticker:纯展示驱动(ADR-0016 §决策 3)——到点停表,不自做任何事;
+/// 自动跳转只由 HandoffSealed 权威事件触发,不看本地钟。250ms 节拍,
+/// 封箱/到点即停,不常驻。
+fn arm_handoff_tick(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
+    let Some(facts) = &store.handoff_open else { return };
+    if facts.planned_open_at_ms.unwrap_or(0) <= crate::store::now_ms() {
+        return;
+    }
+    if store.handoff_ticking {
+        return;
+    }
+    store.handoff_ticking = true;
+    cx.spawn(async move |entity, cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let continue_tick = entity
+                .update(cx, |store, cx| {
+                    let done = store.handoff_seal.is_some()
+                        || store
+                            .handoff_open
+                            .as_ref()
+                            .is_none_or(|facts| facts.planned_open_at_ms.unwrap_or(0) <= crate::store::now_ms());
+                    if done {
+                        store.handoff_ticking = false;
+                    }
+                    cx.notify();
+                    !done
+                })
+                .unwrap_or(false);
+            if !continue_tick {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 /// 按 call_id 更新既有工具视图;不存在返回 false。

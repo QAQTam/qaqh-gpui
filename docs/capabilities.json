@@ -1,6 +1,6 @@
 {
-  "command_revision": "ringing-commands-7",
-  "session_revision": "ringing-session-2",
+  "command_revision": "ringing-commands-11",
+  "session_revision": "ringing-session-5",
   "commands": {
     "session.create": {
       "status": "supported"
@@ -32,7 +32,8 @@
       "status": "supported"
     },
     "session.shutdown": {
-      "status": "supported"
+      "status": "deferred",
+      "reason": "当前无独立关停入口"
     },
     "agent.reload_config": {
       "status": "supported"
@@ -43,19 +44,24 @@
     "conversation.cancel": {
       "status": "supported"
     },
+    "conversation.truncate": {
+      "status": "deferred",
+      "reason": "回合撤回入口尚未接入 GPUI"
+    },
+    "goal.set": {
+      "status": "supported"
+    },
+    "goal.get": {
+      "status": "deferred",
+      "reason": "目标状态通过会话读模型下发，暂不单独发起查询"
+    },
+    "goal.clear": {
+      "status": "supported"
+    },
     "interaction.ask.respond": {
       "status": "supported"
     },
     "interaction.ask.dismiss": {
-      "status": "supported"
-    },
-    "driver.claim": {
-      "status": "supported"
-    },
-    "driver.release": {
-      "status": "supported"
-    },
-    "plan.review.respond": {
       "status": "supported"
     },
     "tool.permission.respond": {
@@ -69,6 +75,10 @@
     },
     "provider.list": {
       "status": "supported"
+    },
+    "provider.presets.list": {
+      "status": "deferred",
+      "reason": "设置页内置预设列表尚未接入"
     },
     "provider.upsert": {
       "status": "supported"
@@ -92,22 +102,6 @@
       "status": "deferred",
       "reason": "权限策略通过 config.save 编辑"
     },
-    "profile.create": {
-      "status": "supported"
-    },
-    "profile.set_default": {
-      "status": "excluded",
-      "reason": "模型默认值统一通过 model.selection.set_default；不提供旧 profile 默认值入口"
-    },
-    "profile.apply": {
-      "status": "supported"
-    },
-    "profile.save_current": {
-      "status": "supported"
-    },
-    "profile.delete": {
-      "status": "supported"
-    },
     "workspace.set": {
       "status": "deferred",
       "reason": "新建会话选择 cwd；已有会话不切换执行根目录"
@@ -125,11 +119,8 @@
       "status": "supported"
     },
     "workspace.detach": {
-      "status": "supported"
-    },
-    "subagent.spawn": {
       "status": "deferred",
-      "reason": "当前展示代理结果，手动创建代理留待团队工作流"
+      "reason": "当前通过 workspace.delete 管理工作区移除"
     },
     "todo.set": {
       "status": "deferred",

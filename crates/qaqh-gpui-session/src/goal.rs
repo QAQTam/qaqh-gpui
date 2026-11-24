@@ -2,12 +2,13 @@
 //! 语义纪律:取消续跑回合 ≠ 停止目标(要停必须显式 pause);blocked/complete
 //! 是审计声明,用户只控制 active/paused;用量是内核记账权威值,前端不自算。
 
-use gpui::prelude::*;
-use gpui::{Context, Stateful, Div, Hsla, SharedString, Window, div, px};
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState};
-use gpui_component::Sizable;
-use gpui_component::WindowExt;
+use gpui_kit::prelude::*;
+use gpui_kit::{Context, Stateful, Div, Hsla, SharedString, Window, div, px};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{Icon, Sizable, Size};
+use gpui_kit::component::WindowExt;
+use gpui_kit::assets::IconName;
 use qaqh_ringing_contract::state::GoalStatus;
 use qaqh_ringing_contract::state::GoalView;
 
@@ -28,36 +29,46 @@ pub fn status_meta(status: GoalStatus, t: &Palette) -> (&'static str, Hsla) {
     }
 }
 
-/// 头部徽标:状态点 + 状态词 + objective 摘要;点击打开详情 Dialog。
+/// 头部徽标:圆角状态胶囊(供 TitleBar 面包屑调用);点击打开详情 Dialog。
 pub fn goal_badge(
     goal: &GoalView,
-    cx: &mut Context<SessionStore>,
+    session: &gpui_kit::Entity<SessionStore>,
     t: &Palette,
 ) -> Stateful<Div> {
     let (label, color) = status_meta(goal.status, t);
-    let objective: String = goal.objective.chars().take(24).collect();
+    let objective: String = goal.objective.chars().take(20).collect();
+    let entity = session.clone();
     div()
         .id("goal-badge")
-        .px_2()
-        .py_0p5()
+        .h(px(24.))
+        .px_2p5()
         .rounded_full()
         .bg(qaqh_gpui_kit::kit::soft(color, 0.12))
+        .border_1()
+        .border_color(qaqh_gpui_kit::kit::soft(color, 0.24))
         .text_xs()
         .cursor_pointer()
         .flex()
         .items_center()
         .gap_1p5()
         .hover(|style| style.bg(qaqh_gpui_kit::kit::soft(color, 0.2)))
-        .on_click(cx.listener(|store, _, window: &mut Window, cx| {
-            open_dialog(store, window, cx);
-        }))
-        .child(div().size_1p5().rounded_full().bg(color))
-        .child(SharedString::from(label.to_owned()))
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, window: &mut Window, cx: &mut gpui_kit::App| {
+            let _ = entity.update(cx, |store, cx| open_dialog(store, window, cx));
+        })
         .child(
-            div()
-                .text_color(qaqh_gpui_kit::kit::soft(color, 0.75))
-                .child(SharedString::from(objective)),
+            Icon::new(IconName::Target)
+                .with_size(Size::XSmall)
+                .text_color(color),
         )
+        .child(SharedString::from(label.to_owned()))
+        .when(!objective.is_empty(), |badge| {
+            badge.child(
+                div()
+                    .text_color(qaqh_gpui_kit::kit::soft(color, 0.8))
+                    .child(SharedString::from(objective)),
+            )
+        })
 }
 
 /// 打开 goal Dialog:控制条入口与徽标入口同源;草稿每次打开重建种当前值。
@@ -100,7 +111,7 @@ pub fn goal_dialog(
     let Some((objective_field, budget_field)) = store.goal_draft.clone() else {
         return dialog;
     };
-    let mut body: Vec<gpui::AnyElement> = Vec::new();
+    let mut body: Vec<gpui_kit::AnyElement> = Vec::new();
     if let Some(goal) = store.goal.clone() {
         let (label, color) = status_meta(goal.status, &t);
         body.push(
@@ -170,7 +181,7 @@ pub fn goal_dialog(
     let mut footer = div().flex().justify_end().gap_2();
     if let Some(goal_status) = status {
         if goal_status != GoalStatus::Paused {
-            footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+            footer = footer.child(gpui_kit::AnyElement::from(qaqh_gpui_kit::kit::button(
                 cx,
                 qaqh_gpui_kit::kit::BtnKind::Ghost,
                 "goal-pause",
@@ -186,7 +197,7 @@ pub fn goal_dialog(
         if goal_status == GoalStatus::Paused
             || matches!(goal_status, GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::BudgetLimited)
         {
-            footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+            footer = footer.child(gpui_kit::AnyElement::from(qaqh_gpui_kit::kit::button(
                 cx,
                 qaqh_gpui_kit::kit::BtnKind::Soft,
                 "goal-resume",
@@ -199,7 +210,7 @@ pub fn goal_dialog(
                 }),
             )));
         }
-        footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+        footer = footer.child(gpui_kit::AnyElement::from(qaqh_gpui_kit::kit::button(
             cx,
             qaqh_gpui_kit::kit::BtnKind::Danger,
             "goal-clear",
@@ -212,7 +223,7 @@ pub fn goal_dialog(
             }),
         )));
     }
-    footer = footer.child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+    footer = footer.child(gpui_kit::AnyElement::from(qaqh_gpui_kit::kit::button(
         cx,
         if has_goal { qaqh_gpui_kit::kit::BtnKind::Ghost } else { qaqh_gpui_kit::kit::BtnKind::Primary },
         "goal-save",

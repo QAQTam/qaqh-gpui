@@ -5,11 +5,14 @@
 //! DaemonStore(shell)是顶层消息泵,向下调用本 crate;本 crate 绝不反向引用 shell。
 
 pub mod code_panel;
-pub mod content;
+pub mod composer;
 pub mod controls;
 pub mod goal;
 pub mod markdown;
 pub mod persist;
 pub mod reducer;
 pub mod store;
+pub mod terminal;
+pub mod terminal_panel;
+pub mod terminal_view;
 pub mod timeline;

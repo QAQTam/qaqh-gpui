@@ -2,3 +2,6 @@
 /logs
 /dist
 __pycache__/
+
+# QAQ-Harness 会话运行时状态(todo/journal/trash/widgets),非项目内容
+/.qaqh/

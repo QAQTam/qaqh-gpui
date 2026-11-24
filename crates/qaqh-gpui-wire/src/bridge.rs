@@ -9,9 +9,12 @@ use qaqh_client::discovery::ensure_daemon_running;
 use qaqh_client::discovery::read_discovery;
 use qaqh_client::discovery::DiscoveryExt;
 use qaqh_client::v2_stream::V2StreamStatus;
+use qaqh_client::shell_stream::{ShellStream, ShellStreamHandlers, ShellStreamStatus};
+use qaqh_client::ringing::ShellStreamEvent;
+use std::collections::HashMap;
 use qaqh_client::{
     AskAnswer, Client, ClientHandlers, ClientOptions, CommandOptions, CommandPrecondition,
-    CommandTarget, RingingCommand,
+    CommandTarget, QueryRequest, RingingCommand,
     RingingV2ResyncRequired, SessionSettingsPatch,
 };
 use qaqh_client::ringing_v2::RingingV2CommandAck;
@@ -20,7 +23,7 @@ use qaqh_types::SessionListEntry;
 use qaqh_config_api::{ConfigDto, ConfigPatch};
 use qaqh_profile::ProfilesDocument;
 use qaqh_ringing_contract::events::SessionEventFrame;
-use qaqh_ringing_contract::fact::{ContentRef, TurnId};
+use qaqh_ringing_contract::fact::{ContentRef, PermissionGrantScope, TurnId};
 use qaqh_ringing_contract::state::SessionState;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 use serde_json::json;
@@ -48,8 +51,112 @@ pub enum PreparedAttachment {
     Content(ContentRef),
 }
 
+/// `shell.list` / `shell.open` 的 wire 镜像(qaqh-runtime service_methods.rs
+/// `ShellView` 同形状;gpui 不依赖 runtime crate,故本地镜像)。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ShellInfo {
+    pub id: String,
+    pub pid: u32,
+    pub shell: String,
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub alive: bool,
+    pub output_offset: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ShellListResult {
+    shells: Vec<ShellInfo>,
+}
+
+/// `skills.catalog` 单个技能条目(镜像 qaqh-runtime `SkillCatalogEntry`)。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SkillCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub scope: String,
+    pub origin: String,
+    pub path: String,
+}
+
+/// `skills.catalog` 发现期诊断。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SkillCatalogDiagnostic {
+    pub severity: String,
+    pub path: String,
+    pub message: String,
+}
+
+/// `skills.catalog` daemon 原生返回结构。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SkillsCatalogResult {
+    pub skills: Vec<SkillCatalogEntry>,
+    pub diagnostics: Vec<SkillCatalogDiagnostic>,
+}
+
+/// 附带发现归属工作区名的技能卡片条目。
+#[derive(Debug, Clone)]
+pub struct ScannedSkill {
+    pub entry: SkillCatalogEntry,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScannedSkillIssue {
+    pub root: String,
+    pub message: String,
+    pub forbidden: bool,
+}
+
+/// 跨工作区去重聚合并排序后的全量 Skills 扫描报告。
+#[derive(Debug, Clone, Default)]
+pub struct SkillsScanReport {
+    pub project: Vec<ScannedSkill>,
+    pub user: Vec<ScannedSkill>,
+    pub issues: Vec<ScannedSkillIssue>,
+    pub daemon_unreachable: bool,
+}
+
+/// `provider.presets.list` 官方内置服务商预设视图。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPresetView {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub wire: qaqh_types::Wire,
+    pub credential: qaqh_types::CredentialSource,
+}
+
+/// shell ws 流生命周期给 UI 的镜像(client `ShellStreamStatus` 的 wire 侧投影,
+/// electron ShellStreamEvent.ts 同位)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellUiStatus {
+    Connecting,
+    Open,
+    Reconnecting { retry_ms: u64, reason: String },
+    /// 本地退订/客户端关闭;shell 进程不受影响(ADR-0028 §D5 断联不 kill)。
+    Unsubscribed { reason: String },
+    /// 协议 `closed{reason}`:shell 真终止(退出/被收走/daemon 关停)。
+    Terminated { reason: String },
+}
+
+/// serve 持有的活跃 shell 订阅表:id → 流句柄 + 已交付字节
+/// (重连回放的 `from_offset` 权威,ADR-0028 切片 5)。
+pub type ShellTable = HashMap<String, ShellEntry>;
+pub struct ShellEntry {
+    pub stream: ShellStream,
+    pub delivered: Arc<AtomicU64>,
+}
+
 fn send_line(to_ui: &UnboundedSender<BridgeMsg>, text: &str) {
     let _ = to_ui.unbounded_send(BridgeMsg::Line(text.into()));
+}
+
+fn send_shell_error(to_ui: &UnboundedSender<BridgeMsg>, text: &str) {
+    send_line(to_ui, text);
+    let _ = to_ui.unbounded_send(BridgeMsg::ShellError(text.into()));
 }
 
 /// 桥 → GPUI 方向的消息。
@@ -59,7 +166,6 @@ pub enum BridgeMsg {
     Connection(ConnectionState),
     Delivery(String, String, DeliveryResult),
     Attachment(String, Result<PreparedAttachment, String>),
-    ResolvedContent(String, ContentRef, Result<String, String>),
     Operation(String, CommandTarget, Result<RingingV2CommandAck, String>),
     /// 人类可读状态行(含命令受理/失败报告)。
     Line(String),
@@ -67,6 +173,8 @@ pub enum BridgeMsg {
     Sessions(Vec<SessionListEntry>),
     /// `workspace.list` 条目(侧栏分组)。
     Workspaces(Vec<WorkspaceEntry>),
+    /// `skills.catalog` 扫描结果(工作区聚合)。
+    SkillsCatalog(SkillsScanReport),
     /// 当前会话的 `todo.list` 快照。
     Todos(String, qaqh_ringing_contract::todo::TodoListSnapshot),
     /// `GET /ringing/v2/sessions/{seed}/team` 快照(团队花名册/任务板/留言板)。
@@ -86,6 +194,8 @@ pub enum BridgeMsg {
     Config(ConfigDto),
     /// provider.list 的权威目录。
     Providers(ProfilesDocument),
+    /// provider.presets.list 的官方预设表。
+    ProviderPresets(Vec<ProviderPresetView>),
     /// 取消看门狗到点:该会话仍未回终态(electron CANCEL_WATCHDOG 模式)。
     Watchdog(String),
     /// 服务面结果(siwc/dsaccount 账号管理器):method 原样带回,
@@ -99,6 +209,18 @@ pub enum BridgeMsg {
         settings: Option<SessionListEntry>,
         write_completed: bool,
     },
+    /// `shell.list` 全量(权威;开/关后桥侧顺带刷新)。
+    Shells(Vec<ShellInfo>),
+    /// `shell.open` 单条结果(UI 追加并聚焦)。
+    ShellOpened(ShellInfo),
+    /// `shell.close` 成功(UI 移除标签)。
+    ShellRemoved(String),
+    /// shell ws 下行裸字节(PTY 输出)。
+    ShellBytes { shell_id: String, bytes: Vec<u8> },
+    /// shell ws 生命周期状态迁移。
+    ShellStatus { shell_id: String, status: ShellUiStatus },
+    /// shell 操作/订阅失败，由终端坞与全局提示直接展示。
+    ShellError(String),
 }
 
 /// 测试可观测性:`QAQH_GPUI_TRACE=1` 时把协议层动态打到 stderr。
@@ -108,14 +230,21 @@ fn trace(msg: &str) {
     }
 }
 
+/// typed 查询:QueryRequest 封闭枚举由客户端映射 method+params,前端不再裸写方法名。
+async fn query_typed<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    request: QueryRequest,
+) -> Result<T, qaqh_client::ClientError> {
+    let value = client.query(request).await?;
+    serde_json::from_value(value).map_err(qaqh_client::ClientError::from)
+}
+
 /// GPUI → 桥方向的请求。
 pub enum BridgeRequest {
     Reconnect,
     Command { target: CommandTarget, command: RingingCommand },
-    Driver { seed: String, release: bool, stale_holder: Option<String> },
     Receipt { seed: String, command_id: String },
     AttachFile { seed: String, path: std::path::PathBuf },
-    ResolveContent { seed: String, reference: ContentRef },
     ReviewContent {
         session_id: String,
         turn: TurnId,
@@ -133,8 +262,8 @@ pub enum BridgeRequest {
         seed: String,
         tool_call_id: String,
         approved: bool,
-        /// "始终允许" = 信任当前工作区目录。
-        trust_folder: bool,
+        /// 本次/本会话/持久信任作用范围；拒绝时为 None。
+        scope: Option<PermissionGrantScope>,
     },
     /// interaction.ask.respond(answers 已按题 id 组装)。
     RespondAsk {
@@ -162,6 +291,7 @@ pub enum BridgeRequest {
     CreateSession {
         cwd: Option<String>,
         model_selection: Option<ModelSelection>,
+        tool_mode: Option<String>,
         title: Option<String>,
         first_message: Option<String>,
         /// handoff 工作链接缝(ADR-0015 切片F):来源会话 id;普通新建缺席。
@@ -174,8 +304,6 @@ pub enum BridgeRequest {
     },
     /// workspace.move_session(把该会话移入目标分组)。
     MoveSession { seed: String, workspace_id: String },
-    /// workspace.detach(该会话脱离分组)。
-    DetachSession { seed: String },
     SaveConfig(ConfigPatch),
     ManageCatalog {
         command: RingingCommand,
@@ -183,8 +311,14 @@ pub enum BridgeRequest {
     },
     /// provider.list(命令;结果在 ack.result)。
     ListProviders,
+    /// provider.presets.list(命令;结果在 ack.result)。
+    ListProviderPresets,
     /// config.load 查询。
     QueryConfig,
+    /// `skills.catalog` 扫描请求:传 `(Option<cwd>, 显示工作区名)` 列表。
+    QuerySkills {
+        workspaces: Vec<(Option<String>, String)>,
+    },
     /// session.delete(名册轮询自然刷新列表)。
     DeleteSession { seed: String },
     /// 取消看门狗:after_ms 后仍无终态则通知 UI 本地收口。
@@ -195,6 +329,18 @@ pub enum BridgeRequest {
         method: String,
         params: serde_json::Value,
     },
+    /// `shell.list`(终端坞打开/重连后刷新)。
+    ShellList,
+    /// `shell.open`(cols/rows 由桥侧按 ansi 解析器口径固定 80×24)。
+    ShellOpen { cwd: Option<String>, shell: Option<String> },
+    /// `shell.close`(真收进程;UI 先行移除标签)。
+    ShellClose { shell_id: String },
+    /// ws `stdin{bytes}`;一次 keystroke / 一次粘贴各一帧。
+    ShellStdin { shell_id: String, bytes: Vec<u8> },
+    /// ws `resize{cols,rows}`(无回执;真值读 shell.list)。
+    ShellResize { shell_id: String, cols: u16, rows: u16 },
+    /// 主动重建订阅:回放整段有界尾,配合 UI 清屏。
+    ShellAttach { shell_id: String },
 }
 
 /// `--probe`:无 GUI 连通性验证,打印与窗口相同的状态行。
@@ -261,10 +407,7 @@ pub async fn run_connection(report: impl Fn(String)) {
         qaqh_client::ringing::SESSION_CONTRACT_REVISION,
     ));
 
-    match client
-        .service_v2::<_, Vec<SessionListEntry>>("session.list", json!({}))
-        .await
-    {
+    match query_typed::<Vec<SessionListEntry>>(&client, QueryRequest::SessionList).await {
         Ok(value) => {
             let count = value.len();
             report(format!("session.list:{count} 个会话"));
@@ -293,6 +436,7 @@ async fn serve(
     let mut client: Option<Client> = None;
     let mut selected: Option<String> = None;
     let mut failures = 0;
+    let mut shells: ShellTable = HashMap::new();
     let mut roster = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -306,7 +450,7 @@ async fn serve(
                 }
                 if let BridgeRequest::Select(seed) = &request { selected = Some(seed.clone()); }
                 if let Some(client) = &client {
-                    handle_request(client, &to_ui, request).await;
+                    handle_request(client, &to_ui, &mut shells, request).await;
                 } else {
                     match request {
                         BridgeRequest::SendMessage { seed, outbox } => {
@@ -320,8 +464,22 @@ async fn serve(
                             let _ = to_ui.unbounded_send(BridgeMsg::SessionSettings { seed, settings: None, write_completed: true });
                         }
                         BridgeRequest::CreateSession { .. } => { let _ = to_ui.unbounded_send(BridgeMsg::CreateFailed); }
+                        BridgeRequest::QuerySkills { .. } => {
+                            let _ = to_ui.unbounded_send(BridgeMsg::SkillsCatalog(SkillsScanReport {
+                                daemon_unreachable: true,
+                                ..Default::default()
+                            }));
+                        }
                         BridgeRequest::Service { method, .. } => {
                             let _ = to_ui.unbounded_send(BridgeMsg::ServiceResult { method, result: Err("连接尚未恢复".into()) });
+                        }
+                        BridgeRequest::ShellList => send_line(&to_ui, "连接尚未恢复，跳过 shell.list"),
+                        BridgeRequest::ShellOpen { .. }
+                        | BridgeRequest::ShellClose { .. }
+                        | BridgeRequest::ShellStdin { .. }
+                        | BridgeRequest::ShellResize { .. }
+                        | BridgeRequest::ShellAttach { .. } => {
+                            send_shell_error(&to_ui, "daemon 尚未连接，无法打开或操作交互终端");
                         }
                         _ => send_line(&to_ui, "连接尚未恢复，请连接成功后重试操作"),
                     }
@@ -342,7 +500,14 @@ async fn serve(
                             query_providers(&active, &to_ui).await;
                             poll_roster(&active, &to_ui).await;
                             if let Some(seed) = &selected {
-                                handle_request(&active, &to_ui, BridgeRequest::Select(seed.clone())).await;
+                                handle_request(&active, &to_ui, &mut shells, BridgeRequest::Select(seed.clone())).await;
+                            }
+                            // 换了新 client,旧订阅随 client_stop 已死;按既有
+                            // delivered 重订阅 —— 回放从断点续,不重刷屏。
+                            for shell_id in shells.keys().cloned().collect::<Vec<_>>() {
+                                if let Err(error) = shell_spawn(&active, &to_ui, &mut shells, &shell_id).await {
+                                    send_shell_error(&to_ui, &format!("shell 重订阅失败({shell_id}):{error}"));
+                                }
                             }
                             client = Some(active);
                         }
@@ -447,6 +612,7 @@ async fn establish(
 async fn handle_request(
     client: &Client,
     to_ui: &UnboundedSender<BridgeMsg>,
+    shells: &mut ShellTable,
     request: BridgeRequest,
 ) {
     match request {
@@ -456,33 +622,12 @@ async fn handle_request(
             if let CommandTarget::Session { session_id } = target { query_session_settings(client, to_ui, &session_id, false).await; }
             poll_roster(client, to_ui).await;
         }
-        BridgeRequest::Driver { seed, release, stale_holder } => {
-            if let Some(state) = client.v2_session_state().await {
-                let command = if release {
-                    RingingCommand::DriverRelease { client_session_id: state.client_session_id, expected_epoch: None }
-                } else {
-                    RingingCommand::DriverClaim { client_session_id: state.client_session_id, stale_holder }
-                };
-                send_command(client, to_ui, CommandTarget::Session { session_id: seed.clone() }, command).await;
-                refill(client, to_ui, &seed).await;
-            }
-        }
         BridgeRequest::Receipt { seed, command_id } => {
             let result = match client.command_status_v2_typed(&command_id).await {
                 Ok(status) => DeliveryResult::Receipt(status),
                 Err(error) => DeliveryResult::Unknown(format!("回执查询失败：{error}")),
             };
             let _ = to_ui.unbounded_send(BridgeMsg::Delivery(seed, command_id, result));
-        }
-        BridgeRequest::ResolveContent { seed, reference } => {
-            let client = client.clone(); let tx = to_ui.clone();
-            tokio::spawn(async move {
-                let result = match client.download_content(&reference).await {
-                    Ok(bytes) => String::from_utf8(bytes).map_err(|_| "引用内容不是 UTF-8 文本".into()),
-                    Err(error) => Err(error.to_string()),
-                };
-                let _ = tx.unbounded_send(BridgeMsg::ResolvedContent(seed, reference, result));
-            });
         }
         BridgeRequest::AttachFile { seed, path } => {
             let client = client.clone(); let tx = to_ui.clone();
@@ -542,8 +687,9 @@ async fn handle_request(
             seed,
             tool_call_id,
             approved,
-            trust_folder,
+            scope,
         } => {
+            let trust_folder = approved && matches!(scope, Some(PermissionGrantScope::Persistent));
             send_command(
                 client,
                 to_ui,
@@ -552,6 +698,7 @@ async fn handle_request(
                     tool_call_id,
                     approved,
                     trust_folder,
+                    scope: approved.then_some(scope).flatten(),
                 },
             )
             .await;
@@ -620,12 +767,12 @@ async fn handle_request(
             )
             .await;
         }
-        BridgeRequest::CreateSession { cwd, model_selection, title, first_message, handoff_from } => {
+        BridgeRequest::CreateSession { cwd, model_selection, tool_mode, title, first_message, handoff_from } => {
             let command = RingingCommand::SessionCreate {
                 cwd: cwd.clone(),
                 title,
                 model_selection,
-                tool_mode: None,
+                tool_mode,
                 custom_tools: None,
                 handoff_from,
             };
@@ -684,15 +831,6 @@ async fn handle_request(
             )
             .await;
         }
-        BridgeRequest::DetachSession { seed } => {
-            send_command(
-                client,
-                to_ui,
-                CommandTarget::Session { session_id: seed },
-                RingingCommand::WorkspaceDetach {},
-            )
-            .await;
-        }
         BridgeRequest::SaveConfig(patch) => {
             match serde_json::to_value(patch) {
                 Ok(patch) => {
@@ -723,8 +861,10 @@ async fn handle_request(
             query_config(client, to_ui).await;
         }
         BridgeRequest::ListProviders => query_providers(client, to_ui).await,
+        BridgeRequest::ListProviderPresets => query_provider_presets(client, to_ui).await,
 
         BridgeRequest::QueryConfig => query_config(client, to_ui).await,
+        BridgeRequest::QuerySkills { workspaces } => query_skills(client, to_ui, workspaces).await,
         BridgeRequest::DeleteSession { seed } => {
             send_command(
                 client,
@@ -746,7 +886,133 @@ async fn handle_request(
             let result = client.service_call(&method, params).await.map_err(|error| error.to_string());
             let _ = to_ui.unbounded_send(BridgeMsg::ServiceResult { method, result });
         }
+        BridgeRequest::ShellList => match client
+            .service_v2::<_, ShellListResult>("shell.list", json!({}))
+            .await
+        {
+            Ok(result) => {
+                shells.retain(|id, _| result.shells.iter().any(|info| &info.id == id));
+                let to_subscribe: Vec<String> = result
+                    .shells
+                    .iter()
+                    .filter(|info| info.alive && !shells.contains_key(&info.id))
+                    .map(|info| info.id.clone())
+                    .collect();
+                let _ = to_ui.unbounded_send(BridgeMsg::Shells(result.shells));
+                for shell_id in to_subscribe {
+                    if let Err(error) = shell_spawn(client, to_ui, shells, &shell_id).await {
+                        send_shell_error(to_ui, &format!("shell 流订阅失败({shell_id}):{error}"));
+                    }
+                }
+            }
+            Err(error) => send_shell_error(to_ui, &format!("shell.list 失败:{error}")),
+        },
+        BridgeRequest::ShellOpen { cwd, shell } => {
+            // 几何按 ansi.rs 解析器口径固定(终端坞不做 per-tab 测量)。
+            let params = json!({ "cols": 80u16, "rows": 24u16, "cwd": cwd, "shell": shell });
+            match client.service_v2::<_, ShellInfo>("shell.open", params).await {
+                Ok(info) => {
+                    let shell_id = info.id.clone();
+                    // 先把页签发给 UI,再建立 ws 流,避免首帧状态/字节早于建页签到达。
+                    let _ = to_ui.unbounded_send(BridgeMsg::ShellOpened(info));
+                    if let Err(error) = shell_spawn(client, to_ui, shells, &shell_id).await {
+                        send_shell_error(to_ui, &format!("shell 流订阅失败:{error}"));
+                    }
+                }
+                Err(error) => send_shell_error(to_ui, &format!("shell.open 失败:{error}")),
+            }
+        }
+        BridgeRequest::ShellClose { shell_id } => {
+            // 先退订阅再收进程:close 只断 ws 订阅,服务面才 kill(§D5)。
+            shells.remove(&shell_id);
+            match client
+                .service_v2::<_, serde_json::Value>("shell.close", json!({ "shell_id": shell_id }))
+                .await
+            {
+                Ok(_) => {
+                    let _ = to_ui.unbounded_send(BridgeMsg::ShellRemoved(shell_id));
+                }
+                Err(error) => send_shell_error(to_ui, &format!("shell.close 失败:{error}")),
+            }
+        }
+        BridgeRequest::ShellStdin { shell_id, bytes } => {
+            if let Some(entry) = shells.get(&shell_id) {
+                if let Err(error) = entry.stream.stdin(&bytes).await {
+                    send_shell_error(to_ui, &format!("shell 输入丢失({shell_id}):{error}"));
+                }
+            } else {
+                send_shell_error(
+                    to_ui,
+                    &format!("shell 数据流未订阅({shell_id})，可点击「清屏重建」重连"),
+                );
+            }
+        }
+        BridgeRequest::ShellResize { shell_id, cols, rows } => {
+            if let Some(entry) = shells.get(&shell_id) {
+                let _ = entry.stream.resize(cols, rows).await;
+            }
+        }
+        BridgeRequest::ShellAttach { shell_id } => {
+            if let Some(entry) = shells.get_mut(&shell_id) {
+                entry.delivered.store(0, Ordering::Relaxed);
+                if let Err(error) = entry.stream.attach(None).await {
+                    send_shell_error(to_ui, &format!("shell 重放请求失败({shell_id}):{error}"));
+                }
+            } else if let Err(error) = shell_spawn(client, to_ui, shells, &shell_id).await {
+                send_shell_error(to_ui, &format!("shell 重订阅失败({shell_id}):{error}"));
+            }
+        }
     }
+}
+
+/// 起一条 shell ws 订阅:回调把字节/状态镜像进 BridgeMsg;delivered 计数
+/// 跨重连保留在表里,Worker 重拨自动带 `from_offset`(shell_stream.rs §D5)。
+async fn shell_spawn(
+    client: &Client,
+    to_ui: &UnboundedSender<BridgeMsg>,
+    shells: &mut ShellTable,
+    shell_id: &str,
+) -> Result<(), String> {
+    let generation = CONNECTION_GENERATION.load(Ordering::Acquire);
+    // delivered 跨重连保留:重订阅时复用旧条目的计数,回放从断点续。
+    let delivered: Arc<AtomicU64> = shells
+        .get(shell_id)
+        .map(|entry| entry.delivered.clone())
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    let bytes_tx = to_ui.clone();
+    let bytes_delivered = delivered.clone();
+    let event_tx = to_ui.clone();
+    let status_tx = to_ui.clone();
+    let handlers = ShellStreamHandlers {
+        on_bytes: Arc::new(move |shell_id: String, bytes: Vec<u8>| {
+            bytes_delivered.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            from_connection(&bytes_tx, generation, BridgeMsg::ShellBytes { shell_id, bytes });
+        }),
+        on_event: Arc::new(move |shell_id: String, event: ShellStreamEvent| {
+            // 词表只有 closed 一帧(§D3),直接解构。
+            let ShellStreamEvent::Closed { reason } = event;
+            from_connection(&event_tx, generation, BridgeMsg::ShellStatus {
+                shell_id,
+                status: ShellUiStatus::Terminated { reason },
+            });
+        }),
+        on_status: Arc::new(move |shell_id: String, status: ShellStreamStatus| {
+            let status = match status {
+                ShellStreamStatus::Connecting => ShellUiStatus::Connecting,
+                ShellStreamStatus::Open { .. } => ShellUiStatus::Open,
+                ShellStreamStatus::Reconnecting { retry_ms, reason, .. } => {
+                    ShellUiStatus::Reconnecting { retry_ms, reason }
+                }
+                ShellStreamStatus::Closed { reason } => ShellUiStatus::Unsubscribed { reason },
+            };
+            from_connection(&status_tx, generation, BridgeMsg::ShellStatus { shell_id, status });
+        }),
+    };
+    let stream = ShellStream::start(shell_id, client, handlers)
+        .await
+        .map_err(|error| error.to_string())?;
+    shells.insert(shell_id.to_string(), ShellEntry { stream, delivered });
+    Ok(())
 }
 
 async fn query_providers(client: &Client, to_ui: &UnboundedSender<BridgeMsg>) {
@@ -776,8 +1042,40 @@ async fn query_providers(client: &Client, to_ui: &UnboundedSender<BridgeMsg>) {
     }
 }
 
+async fn query_provider_presets(client: &Client, to_ui: &UnboundedSender<BridgeMsg>) {
+    let result = client
+        .send_command_v2_typed(
+            CommandTarget::Global,
+            RingingCommand::ProviderPresets {},
+            CommandOptions::default(),
+        )
+        .await;
+    let result = match result {
+        Ok(ack) => match ack.result {
+            Some(result) => result,
+            None => {
+                send_line(
+                    to_ui,
+                    &format!("服务商预设读取失败: {:?} {:?}", ack.status, ack.code),
+                );
+                return;
+            }
+        },
+        Err(error) => {
+            send_line(to_ui, &format!("服务商预设读取失败: {error}"));
+            return;
+        }
+    };
+    match serde_json::from_value(result) {
+        Ok(presets) => {
+            let _ = to_ui.unbounded_send(BridgeMsg::ProviderPresets(presets));
+        }
+        Err(error) => send_line(to_ui, &format!("服务商预设解析失败: {error}")),
+    }
+}
+
 async fn query_config(client: &Client, to_ui: &UnboundedSender<BridgeMsg>) {
-    match client.service_v2("config.load", json!({})).await {
+    match query_typed::<ConfigDto>(client, QueryRequest::ConfigLoad).await {
         Ok(config) => { let _ = to_ui.unbounded_send(BridgeMsg::Config(config)); }
         Err(error) => send_line(to_ui, &format!("config.load 失败: {error}")),
     }
@@ -789,7 +1087,12 @@ async fn query_session_settings(
     seed: &str,
     write_completed: bool,
 ) {
-    let meta = match client.service_v2("session.meta", json!({ "session_id": seed })).await {
+    let meta = match query_typed::<Option<SessionListEntry>>(
+        client,
+        QueryRequest::SessionMeta { session_id: seed.to_owned() },
+    )
+    .await
+    {
         Ok(meta) => meta,
         Err(error) => {
             send_line(to_ui, &format!("session.meta 失败: {error}"));
@@ -803,7 +1106,8 @@ async fn query_session_settings(
     });
 }
 
-/// 名册轮询:session.list(原始)+ workspace.list(typed)。
+/// 名册轮询。session.list 需带 include_archived,而 QueryRequest::SessionList
+/// 尚无参数位——保留通用出口,后端建模变体后收编 query_typed。
 async fn poll_roster(client: &Client, to_ui: &UnboundedSender<BridgeMsg>) -> bool {
     let success = match client
         .service_v2::<_, Vec<SessionListEntry>>("session.list", json!({ "include_archived": true }))
@@ -820,10 +1124,7 @@ async fn poll_roster(client: &Client, to_ui: &UnboundedSender<BridgeMsg>) -> boo
         crate::diagnostics::set_epoch(state.server_epoch);
         let _ = to_ui.unbounded_send(BridgeMsg::Connection(ConnectionState::Ready { client_session_id: state.client_session_id }));
     }
-    match client
-        .service_v2::<_, Vec<WorkspaceEntry>>("workspace.list", json!({}))
-        .await
-    {
+    match query_typed::<Vec<WorkspaceEntry>>(client, QueryRequest::WorkspaceList).await {
         Ok(entries) => {
             trace(&format!("workspace.list {} 组", entries.len()));
             let _ = to_ui.unbounded_send(BridgeMsg::Workspaces(entries));
@@ -855,6 +1156,78 @@ async fn query_team(client: &Client, to_ui: &UnboundedSender<BridgeMsg>, seed: &
         }
         Err(error) => trace(&format!("team {seed} 失败:{error}")),
     }
+}
+
+/// 按工作区聚合查询 daemon `skills.catalog`,按 path 去重并按 name 排序。
+async fn query_skills(
+    client: &Client,
+    to_ui: &UnboundedSender<BridgeMsg>,
+    workspaces: Vec<(Option<String>, String)>,
+) {
+    let scopes = if workspaces.is_empty() {
+        vec![(None, "当前目录".to_owned())]
+    } else {
+        workspaces
+    };
+    let mut project = Vec::new();
+    let mut user = Vec::new();
+    let mut issues = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut any_succeeded = false;
+
+    for (cwd, label) in scopes {
+        match query_typed::<SkillsCatalogResult>(client, QueryRequest::SkillsCatalog { cwd }).await {
+            Ok(result) => {
+                any_succeeded = true;
+                for entry in result.skills {
+                    if !seen_paths.insert(entry.path.clone()) {
+                        continue;
+                    }
+                    let is_user = entry.scope == "user";
+                    let scanned = ScannedSkill {
+                        entry,
+                        workspace: label.clone(),
+                    };
+                    if is_user {
+                        user.push(scanned);
+                    } else {
+                        project.push(scanned);
+                    }
+                }
+                for diagnostic in result.diagnostics {
+                    let root = if diagnostic.path.is_empty() {
+                        label.clone()
+                    } else {
+                        diagnostic.path
+                    };
+                    issues.push(ScannedSkillIssue {
+                        root,
+                        message: format!("{}: {}", diagnostic.severity, diagnostic.message),
+                        forbidden: false,
+                    });
+                }
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                let lower = msg.to_ascii_lowercase();
+                let forbidden = lower.contains("forbidden") || lower.contains("not allowed");
+                issues.push(ScannedSkillIssue {
+                    root: label,
+                    message: msg,
+                    forbidden,
+                });
+            }
+        }
+    }
+
+    project.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
+    user.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
+    let _ = to_ui.unbounded_send(BridgeMsg::SkillsCatalog(SkillsScanReport {
+        project,
+        user,
+        issues,
+        daemon_unreachable: !any_succeeded,
+    }));
 }
 
 async fn prepare_attachment(client: &Client, seed: &str, path: &std::path::Path) -> Result<PreparedAttachment, String> {
@@ -913,7 +1286,9 @@ async fn send_command(
 
 async fn refill(client: &Client, to_ui: &UnboundedSender<BridgeMsg>, seed: &str) {
     query_session_settings(client, to_ui, seed, false).await;
-    match client.bootstrap_v2(seed).await {
+    // timeline_tail=None = 全量快照(旧语义);Some(n) 需 UI 配合 timeline_from_ord
+    // 按需取历史,reducer 尚未接线,不半途启用。
+    match client.bootstrap_v2(seed, None).await {
         Ok(bootstrap) => {
             trace(&format!(
                 "snapshot seed={seed} seq={} turns={} timeline={} tools={} interactions={} exec={}",

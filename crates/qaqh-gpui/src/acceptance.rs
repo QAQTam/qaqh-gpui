@@ -3,7 +3,7 @@
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
 use qaqh_gpui_shell::daemon::DaemonStore;
 use qaqh_gpui_session::store::StreamState;
-use gpui::Context;
+use gpui_kit::Context;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -36,10 +36,6 @@ enum Action {
     LongSession {
         entries: usize,
     },
-    Driver {
-        release: bool,
-        stale_holder: Option<String>,
-    },
     Attach {
         path: PathBuf,
     },
@@ -58,7 +54,7 @@ enum Action {
 
 pub fn poll(
     daemon: &mut DaemonStore,
-    window: &mut gpui::Window,
+    window: &mut gpui_kit::Window,
     cx: &mut Context<DaemonStore>,
 ) {
     let args: Vec<_> = std::env::args().collect();
@@ -95,9 +91,7 @@ pub fn poll(
                         let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
                     }
                     Action::NewSession => {
-                        daemon.new_session_open = true;
-                        daemon.settings_open = false;
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                        daemon.open_startup(None, window, cx);
                     }
                     Action::LocalSettings => {
                         daemon.settings_open = true;
@@ -117,8 +111,10 @@ pub fn poll(
                         daemon.settings_editor = qaqh_gpui_session::store::SettingsEditor::Workspaces;
                     }
                     Action::Welcome => {
+                        daemon.section = qaqh_gpui_shell::daemon::PrimarySection::Home;
                         daemon.current = None;
                         daemon.settings_open = false;
+                        daemon.new_session_open = false;
                     }
                     action => {
                         if let Some(store) = daemon.current.clone() {
@@ -131,7 +127,6 @@ pub fn poll(
                                 Action::Receipt => store.check_receipt(),
                                 Action::Refill => { store.snapshot_pending = true; let _ = store.requests().unbounded_send(BridgeRequest::Refill(store.session_id.clone())); },
                                 Action::Attach { path } => { store.attachment_pending = true; let _ = store.requests().unbounded_send(BridgeRequest::AttachFile { seed: store.session_id.clone(), path }); },
-                                Action::Driver { release, stale_holder } => { let _ = store.requests().unbounded_send(BridgeRequest::Driver { seed: store.session_id.clone(), release, stale_holder }); },
                                 Action::LongSession { entries } => {
                                     let template = store.entries.iter().find(|entry| matches!(entry, qaqh_ringing_contract::state::TimelineEntry::Input { .. })).cloned().expect("real input fixture");
                                     for index in 0..entries {
@@ -159,7 +154,7 @@ pub fn poll(
         let store = store.read(cx);
         json!({"id": store.session_id, "draft":store.composer.read(cx).value().to_string(),"entries":store.entries.len(),
             "snapshot_pending":store.snapshot_pending,"stream_open":matches!(store.stream, StreamState::Open),
-            "outbox":store.outbox,"driver":store.driver,"client_session_id":store.client_session_id,
+            "outbox":store.outbox,"client_session_id":store.client_session_id,
             "images":store.images.len(),"attachments":store.attachments.len(),"attachment_pending":store.attachment_pending,
             "error":store.operation_error})
     });

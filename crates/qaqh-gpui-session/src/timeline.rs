@@ -1,73 +1,158 @@
-//! 元素构建(M3):主题 token 化 + 分组侧栏/时间线/composer/交互应答卡/todo 右栏。
-//! `Entity<T: Render>` 即元素:DaemonStore 为根,SessionStore 经实体直接挂载。
-//! 颜色一律取 theme::Palette 语义槽;输入框用 gpui-component 的 Input/Textarea
-//! (状态实体 + 组件渲染,IME/选区/剪贴板由引擎承担)。
+//! 时间线渲染(DESIGN LAW v3.0 · v5.0.0):
+//! - 纯净悬浮主舞台:去掉冗余会话头,专注叙事阅读与交互;
+//! - Antigravity 无框轨迹脊柱(ToolBurst / Thinking):左侧 1px 脊柱 + 物理弹簧 MotionReveal;
+//! - 中性扫光思考态 + 底部 20px 渐隐过渡 + 无空白常驻 footer。
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use gpui::prelude::*;
-use gpui::AnyElement;
-use gpui::ClickEvent;
-use gpui::Context;
-use gpui::Div;
-use gpui::Entity;
-use gpui::FontWeight;
-use gpui::Hsla;
-use gpui::InteractiveElement;
-use gpui::IntoElement;
-use gpui::KeyDownEvent;
-use gpui::ParentElement;
-use gpui::Render;
-use gpui::FollowMode;
-use gpui::SharedString;
-use gpui::StatefulInteractiveElement;
-use gpui::Styled;
-use gpui::Window;
-use gpui::div;
-use gpui::list;
-use gpui::px;
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, Textarea};
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{Sizable, WindowExt};
-use qaqh_ringing_contract::fact::ActivityState;
-use qaqh_ringing_contract::fact::AssistantBlockKind;
-use qaqh_ringing_contract::fact::ActorKind;
-use qaqh_ringing_contract::fact::InputPurpose;
-use qaqh_ringing_contract::fact::ContentValue;
-use qaqh_ringing_contract::fact::InteractionKind;
-use qaqh_ringing_contract::fact::ToolCallId;
-use qaqh_ringing_contract::state::ExecSessionState;
-use qaqh_ringing_contract::state::TimelineEntry;
-use qaqh_ringing_contract::state::ToolCallState;
-use qaqh_ringing_contract::state::ToolCallView;
-use qaqh_types::ToolCallOutcome;
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, Div, Entity, FollowMode,
+    FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, list, px, relative,
+};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::Input;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{Icon, Sizable, Size, WindowExt};
+use gpui_kit::assets::IconName;
+use qaqh_ringing_contract::fact::{
+    ActorKind, AssistantBlockKind, BlockId, ContentValue, InputPurpose, InteractionKind,
+    PermissionGrantScope, ToolCallId,
+};
+use qaqh_ringing_contract::state::{
+    ExecSessionState, TimelineEntry, ToolCallState, ToolCallView,
+};
+use qaqh_types::{SessionRunStatus, ToolCallOutcome};
 
-use qaqh_gpui_wire::ask;
-use qaqh_gpui_kit::settings;
-use crate::store::{ArgStream, SessionStore};
-use crate::store::StreamState;
-use qaqh_gpui_kit::theme::ActiveTheme;
-use qaqh_gpui_kit::theme::Palette;
+use qaqh_gpui_kit::kit::{
+    RADIUS_BUBBLE, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, soft,
+};
+use qaqh_gpui_kit::motion::{
+    accordion_reveal, bottom_fade_mask, effective_motion, live_dot, pulse_easing, shimmer_label,
+    spring_chevron,
+};
 use qaqh_gpui_kit::primitives::action_button;
-use crate::store::{next_model, next_option, model_effort_levels};
+use qaqh_gpui_kit::settings::{self, MotionLevel};
+use qaqh_gpui_kit::theme::{ActiveTheme, Palette};
+use qaqh_gpui_wire::ask;
+
+use crate::store::{ArgStream, SessionStore};
 
 pub(crate) fn content_text(value: &ContentValue) -> &str {
     match value {
         ContentValue::Inline { text } => text,
-        ContentValue::Ref { .. } => "引用内容：点击上方「加载引用内容」读取",
+        ContentValue::Ref { .. } => "引用内容（未加载）",
         ContentValue::Unavailable(_) => "内容不可用",
     }
 }
 
+/// 视图投影条目:单条或连续成功工具归组(不改变 entries 数据真值)。
+pub(crate) enum TimelineItem {
+    Single(usize),
+    ToolBurst {
+        group_id: usize,
+        indices: Vec<usize>,
+    },
+}
+
+fn is_groupable_tool(store: &SessionStore, entry: &TimelineEntry) -> bool {
+    let TimelineEntry::ToolCall { call_id, .. } = entry else {
+        return false;
+    };
+    let Some(tool) = store.tools.iter().find(|tool| &tool.call_id == call_id) else {
+        return false;
+    };
+    if crate::store::handoff_facts(tool).is_some() {
+        return false;
+    }
+    matches!(
+        &tool.state,
+        ToolCallState::Finished { outcome } if outcome.is_success()
+    )
+}
+
+pub(crate) fn build_timeline_items(store: &SessionStore) -> Vec<TimelineItem> {
+    let mut items = Vec::new();
+    let mut burst: Vec<usize> = Vec::new();
+    let flush = |burst: &mut Vec<usize>, items: &mut Vec<TimelineItem>| {
+        if burst.len() >= 2 {
+            let group_id = burst[0];
+            items.push(TimelineItem::ToolBurst {
+                group_id,
+                indices: std::mem::take(burst),
+            });
+        } else if let Some(single) = burst.pop() {
+            items.push(TimelineItem::Single(single));
+        }
+    };
+
+    for (index, entry) in store.entries.iter().enumerate() {
+        if hidden_timeline_entry(entry) {
+            continue;
+        }
+        if is_groupable_tool(store, entry) {
+            burst.push(index);
+        } else {
+            flush(&mut burst, &mut items);
+            items.push(TimelineItem::Single(index));
+        }
+    }
+    flush(&mut burst, &mut items);
+    items
+}
+
+/// 搜索跳转索引映射:原始 entry 下标 → 当前投影列表项下标。
+pub(crate) fn display_index_for_entry(store: &SessionStore, entry_index: usize) -> usize {
+    let items = build_timeline_items(store);
+    items
+        .iter()
+        .position(|item| match item {
+            TimelineItem::Single(index) => *index == entry_index,
+            TimelineItem::ToolBurst { indices, .. } => indices.contains(&entry_index),
+        })
+        .unwrap_or(0)
+}
+
+/// 「复制对话」:跟随最后一条 assistant 输出,把当前时间线全文写进剪贴板。
+fn copy_conversation_chip(entity: &Entity<SessionStore>, t: &Palette) -> AnyElement {
+    let entity = entity.downgrade();
+    div()
+        .id("copy-conversation")
+        .mt_1p5()
+        .self_start()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_2p5()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
+        .cursor_pointer()
+        .text_xs()
+        .text_color(t.dim)
+        .hover(|style| style.bg(t.hover).text_color(t.text))
+        .child(Icon::new(IconName::Copy).with_size(Size::XSmall).text_color(t.dim))
+        .child("复制全文对话")
+        .on_click(move |_, _, cx| {
+            let _ = entity.update(cx, |store, cx| {
+                let text = crate::controls::conversation_text(store);
+                if !text.is_empty() {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                }
+            });
+        })
+        .into_any_element()
+}
+
 fn state_label(state: &ToolCallState) -> &'static str {
     match state {
-        ToolCallState::Declared => "已声明",
-        ToolCallState::AwaitingInteraction { .. } => "等待授权",
+        ToolCallState::Declared => "已就绪",
+        ToolCallState::AwaitingInteraction { .. } => "等待确认",
         ToolCallState::Running => "执行中",
         ToolCallState::Cancelling => "取消中",
         ToolCallState::Finished { outcome } => match outcome {
-            ToolCallOutcome::Completed => "完成",
+            ToolCallOutcome::Completed => "已完成",
             ToolCallOutcome::Yielded { .. } => "后台运行",
             ToolCallOutcome::Failed { .. } => "失败",
             ToolCallOutcome::Cancelled { .. } => "已取消",
@@ -99,23 +184,24 @@ fn exec_state_label(state: &ExecSessionState, t: &Palette) -> (&'static str, Hsl
     }
 }
 
-fn activity_label(activity: ActivityState) -> &'static str {
-    match activity {
-        ActivityState::Idle => "空闲",
-        ActivityState::Running => "运行中",
-        ActivityState::WaitingUser => "等待输入",
-        ActivityState::Cancelling => "取消中",
+/// 会话运行状态的语义色:运行 accent,等待/取消 warn,空闲/未运行 dim。
+pub fn status_color(status: SessionRunStatus, t: &Palette) -> Hsla {
+    match status {
+        SessionRunStatus::Running => t.accent,
+        SessionRunStatus::WaitingUser | SessionRunStatus::Cancelling => t.warn,
+        SessionRunStatus::Idle | SessionRunStatus::NotRunning => t.dim,
     }
 }
 
-/// 侧栏状态点:running/waiting_user/cancelling 显示,其余不显示。
-pub fn status_dot(status: &str, t: &Palette) -> Div {
-    let (color, label) = match status {
-        "running" => (t.accent, "运行中"),
-        "waiting_user" => (t.warn, "待响应"),
-        "cancelling" => (t.warn, "取消中"),
-        "idle" => (t.dim, "空闲"),
-        _ => (t.dim, ""),
+/// 侧栏状态点:运行/待响应/取消中高亮,空闲置灰,未加载不显示。
+pub fn status_dot(status: SessionRunStatus, t: &Palette) -> Div {
+    let color = status_color(status, t);
+    let label = match status {
+        SessionRunStatus::Running => "运行中",
+        SessionRunStatus::WaitingUser => "待响应",
+        SessionRunStatus::Cancelling => "取消中",
+        SessionRunStatus::Idle => "空闲",
+        SessionRunStatus::NotRunning => "",
     };
     if label.is_empty() {
         return div();
@@ -124,47 +210,26 @@ pub fn status_dot(status: &str, t: &Palette) -> Div {
         .flex()
         .items_center()
         .gap_1()
-        .child(
-            div()
-                .size_1p5()
-                .rounded_full()
-                .bg(color),
-        )
+        .child(div().size_1p5().rounded_full().bg(color))
         .child(div().text_xs().text_color(color).child(label))
-}
-
-fn stream_badge(state: &StreamState, t: &Palette) -> Div {
-    let (color, label): (Hsla, SharedString) = match state {
-        StreamState::Connecting => (t.warn, "连接中".into()),
-        StreamState::Open => (t.ok, "实时".into()),
-        StreamState::Reconnecting { retry_ms } => {
-            (t.warn, SharedString::from(format!("重连 {retry_ms}ms")))
-        }
-        StreamState::Closed { reason } => (t.bad, SharedString::from(format!("断开:{reason}"))),
-    };
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_full()
-        .text_xs()
-        .bg(qaqh_gpui_kit::kit::soft(color, 0.12))
-        .text_color(color)
-        .child(label)
 }
 
 fn user_bubble(text: &str, t: &Palette) -> Div {
     div()
         .self_end()
         .max_w(px(640.))
-        .px_3()
-        .py_2()
-        .rounded(px(qaqh_gpui_kit::kit::RADIUS_BUBBLE))
+        .px_4()
+        .py_2p5()
+        .rounded(px(RADIUS_BUBBLE))
         .bg(t.bubble)
+        .border_1()
+        .border_color(soft(t.accent, 0.18))
         .text_sm()
+        .text_color(t.text)
         .child(text.to_string())
 }
 
-/// UTF-8 安全尾部截断(参照 electron 的 16KB 尾策略,不劈多字节字)。
+/// UTF-8 安全尾部截断。
 fn utf8_tail(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
@@ -188,25 +253,21 @@ fn tool_summary(name: &str, state: &ToolCallState) -> Option<&'static str> {
         "delete" => ("正在删除文件", "已删除文件"),
         "search" => ("正在搜索网页", "已搜索网页"),
         "web_fetch" => ("正在读取网页", "已读取网页"),
-        // 子代理/团队协作面(ADR-0014)。
         "spawn_subagent" => ("正在派生子代理", "已派生子代理"),
         "send_message" => ("正在发送代理消息", "已发送代理消息"),
         "wait_agent" => ("正在等待子代理", "子代理已返回"),
         "list_agents" => ("正在查看代理列表", "已查看代理列表"),
         "interrupt_agent" => ("正在打断子代理", "已打断子代理"),
-        // 任务板(electron v3.1a 施工单 §二)。
         "task_create" => ("正在创建任务", "已创建任务"),
         "task_claim" => ("正在认领任务", "已更新认领"),
         "task_update" => ("正在更新任务", "已更新任务"),
         "task_close" => ("正在关闭任务", "已关闭任务"),
         "task_list" => ("正在列出任务", "已列出任务"),
-        // 留言板。
         "board_channel_create" => ("正在创建频道", "已创建频道"),
         "board_thread_create" => ("正在创建话题", "已创建话题"),
         "board_post" => ("正在留言", "已留言"),
         "board_subscribe" => ("正在更新订阅", "已更新订阅"),
         "board_list" => ("正在查看留言板", "已查看留言板"),
-        // Goal(ADR-0015)。
         "create_goal" => ("正在设定目标", "已设定目标"),
         "update_goal" => ("正在更新目标", "已更新目标"),
         "get_goal" => ("正在读取目标", "已读取目标"),
@@ -220,22 +281,147 @@ fn tool_summary(name: &str, state: &ToolCallState) -> Option<&'static str> {
     }
 }
 
+fn tool_category_icon(name: &str, is_exec: bool) -> IconName {
+    if is_exec {
+        return IconName::Terminal;
+    }
+    match name {
+        "read" | "read_image" => IconName::FileText,
+        "edit" | "apply_patch" | "write" | "delete" => IconName::FilePen,
+        "glob" | "grep" | "search" | "web_fetch" => IconName::Search,
+        "todo_write" | "todo_update" | "todo_list" | "task_create" | "task_claim"
+        | "task_update" | "task_close" | "task_list" => IconName::ListChecks,
+        "spawn_subagent" | "send_message" | "wait_agent" | "list_agents"
+        | "interrupt_agent" => IconName::Bot,
+        _ => IconName::Wrench,
+    }
+}
+
+fn summarize_burst(store: &SessionStore, indices: &[usize]) -> String {
+    let (mut cmds, mut files, mut searches, mut todos, mut agents, mut others) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for &idx in indices {
+        let Some(TimelineEntry::ToolCall { call_id, .. }) = store.entries.get(idx) else {
+            continue;
+        };
+        let Some(tool) = store.tools.iter().find(|t| &t.call_id == call_id) else {
+            others += 1;
+            continue;
+        };
+        let name = tool.tool_name.as_deref().unwrap_or("");
+        let is_exec = name == "exec_command"
+            || store.exec_sessions.iter().any(|e| e.origin_call_id == tool.call_id);
+        if is_exec {
+            cmds += 1;
+        } else if matches!(name, "edit" | "apply_patch" | "write" | "delete") {
+            files += 1;
+        } else if matches!(name, "read" | "read_image" | "glob" | "grep" | "search" | "web_fetch") {
+            searches += 1;
+        } else if matches!(name, "todo_write" | "todo_update" | "todo_list") {
+            todos += 1;
+        } else if name.starts_with("spawn_")
+            || name.ends_with("_agent")
+            || name.starts_with("task_")
+            || name.starts_with("board_")
+        {
+            agents += 1;
+        } else {
+            others += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    if cmds > 0 {
+        parts.push(format!("命令 ×{cmds}"));
+    }
+    if files > 0 {
+        parts.push(format!("改写 ×{files}"));
+    }
+    if searches > 0 {
+        parts.push(format!("查阅 ×{searches}"));
+    }
+    if todos > 0 {
+        parts.push(format!("待办 ×{todos}"));
+    }
+    if agents > 0 {
+        parts.push(format!("协作 ×{agents}"));
+    }
+    if others > 0 {
+        parts.push(format!("工具 ×{others}"));
+    }
+    if parts.is_empty() {
+        format!("已完成 {} 项操作", indices.len())
+    } else {
+        format!("已完成 {} 项操作 · {}", indices.len(), parts.join(" · "))
+    }
+}
+
 fn tool_status_only(name: &str) -> bool {
-    matches!(name, "ask" | "todo_write" | "todo_update" | "todo_list" | "task_list" | "board_list" | "list_agents" | "get_goal")
+    matches!(
+        name,
+        "ask"
+            | "todo_write"
+            | "todo_update"
+            | "todo_list"
+            | "task_list"
+            | "board_list"
+            | "list_agents"
+            | "get_goal"
+    )
 }
 
-fn tool_status_line(title: String, t: &Palette) -> Div {
-    div().px_2().py_1().text_xs().text_color(t.dim).truncate()
-        .child(SharedString::from(title))
+fn tool_status_line(name: &str, title: String, state: &ToolCallState, t: &Palette) -> Div {
+    let icon = tool_category_icon(name, false);
+    let color = state_color(state, t);
+    div()
+        .px_2p5()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .text_color(t.dim)
+        .child(Icon::new(icon).with_size(Size::XSmall).text_color(color))
+        .child(div().min_w_0().truncate().child(SharedString::from(title)))
 }
 
+/// 折叠行状态 icon:loader(运行时旋转)/圈对/圈叹号。
+fn tool_status_icon(call_id: &ToolCallId, state: &ToolCallState, t: &Palette) -> AnyElement {
+    let (name, spin) = match state {
+        ToolCallState::Finished { outcome } if outcome.is_success() => {
+            (IconName::CircleCheck, false)
+        }
+        ToolCallState::Finished { .. } => (IconName::CircleAlert, false),
+        ToolCallState::Declared => (IconName::LoaderCircle, false),
+        _ => (IconName::LoaderCircle, true),
+    };
+    let icon = Icon::new(name)
+        .with_size(Size::XSmall)
+        .text_color(state_color(state, t));
+    if spin {
+        icon.with_animation(
+            SharedString::from(format!("tool-spin-{}", call_id.0)),
+            Animation::new(std::time::Duration::from_millis(900)).repeat(),
+            |icon, value| icon.rotate(gpui_kit::Radians(value * std::f32::consts::TAU)),
+        )
+        .into_any_element()
+    } else {
+        icon.into_any_element()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tool_toggle(
     entity: &Entity<SessionStore>,
     call_id: &ToolCallId,
     expanded: bool,
+    status: AnyElement,
+    category: IconName,
     title: String,
+    delta: Option<(usize, usize)>,
+    animate_motion: bool,
     t: &Palette,
-) -> gpui::Stateful<Div> {
+) -> gpui_kit::Stateful<Div> {
     let entity = entity.downgrade();
     let call_id = call_id.clone();
     div()
@@ -243,15 +429,40 @@ fn tool_toggle(
         .flex()
         .items_center()
         .gap_2()
-        .px_2()
-        .py_1()
-        .rounded_md()
+        .px_2p5()
+        .py_1p5()
+        .rounded(px(RADIUS_CONTROL))
         .text_xs()
         .text_color(t.dim)
         .cursor_pointer()
-        .hover(|style| style.bg(t.btn_hover))
-        .child(div().flex_shrink_0().child(if expanded { "▾" } else { "▸" }))
-        .child(div().min_w_0().truncate().child(SharedString::from(title)))
+        .hover(|style| style.bg(t.hover).text_color(t.text))
+        .child(div().flex_shrink_0().child(status))
+        .child(
+            Icon::new(category)
+                .with_size(Size::XSmall)
+                .text_color(t.dim),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(title)))
+        .children(delta.filter(|&(a, r)| a > 0 || r > 0).map(|(added, removed)| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_1p5()
+                .py(px(1.))
+                .rounded(px(RADIUS_CHIP))
+                .bg(t.surface_subtle)
+                .font_family("monospace")
+                .text_xs()
+                .child(div().text_color(t.ok).child(format!("+{added}")))
+                .child(div().text_color(t.bad).child(format!("−{removed}")))
+        }))
+        .child(spring_chevron(
+            SharedString::from(format!("tool-chev-{}", call_id.0)),
+            expanded,
+            t.faint,
+            animate_motion,
+        ))
         .on_click(move |_, _, cx| {
             let _ = entity.update(cx, |store, cx| {
                 if !store.expanded_tools.remove(&call_id) {
@@ -262,8 +473,7 @@ fn tool_toggle(
         })
 }
 
-/// spawn_subagent 的 fork 徽标后缀:mode:"fork" = 上下文继承,标注「继承历史」。
-/// 只认声明后的完整 args;参数未定形时不猜。
+/// spawn_subagent 的 fork 徽标后缀。
 fn fork_suffix(name: &str, args: Option<&serde_json::Value>) -> &'static str {
     let is_fork = name == "spawn_subagent"
         && args
@@ -273,8 +483,36 @@ fn fork_suffix(name: &str, args: Option<&serde_json::Value>) -> &'static str {
     if is_fork { " · 继承历史" } else { "" }
 }
 
+/// 参数标量摘要:key=value 拼接,字符串值截 72 字。
+fn args_summary(args: &serde_json::Value) -> Option<String> {
+    let object = args.as_object()?;
+    let parts: Vec<String> = object
+        .iter()
+        .filter_map(|(key, value)| {
+            let rendered = match value {
+                serde_json::Value::String(text) => {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let capped: String = text.chars().take(72).collect();
+                    format!(
+                        "{capped}{}",
+                        if text.chars().count() > 72 { "…" } else { "" }
+                    )
+                }
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::Bool(flag) => flag.to_string(),
+                _ => return None,
+            };
+            Some(format!("{key}={rendered}"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("  "))
+}
+
 fn tool_card(
-    cx: &gpui::App,
+    cx: &gpui_kit::App,
     store: &SessionStore,
     entity: &Entity<SessionStore>,
     tool: &ToolCallView,
@@ -282,7 +520,10 @@ fn tool_card(
     tail_max: usize,
 ) -> Div {
     let name = tool.tool_name.as_deref().unwrap_or("(未知工具)");
-    let exec = store.exec_sessions.iter().find(|exec| exec.origin_call_id == tool.call_id);
+    let exec = store
+        .exec_sessions
+        .iter()
+        .find(|exec| exec.origin_call_id == tool.call_id);
     let is_exec = exec.is_some() || name == "exec_command";
     let command = if let Some(exec) = exec {
         Some(exec.command.as_str())
@@ -299,74 +540,81 @@ fn tool_card(
     let fork_suffix = fork_suffix(name, tool.args.as_ref());
     let title = if let Some(command) = command {
         let command = command.replace(['\r', '\n'], " ");
-        format!("{name}  $ {command}  ·  {status}")
+        format!("$ {command}  ·  {status}")
     } else if let Some(summary) = tool_summary(name, &tool.state) {
         format!("{summary}{fork_suffix}")
     } else {
         format!("{name}  ·  {status}{fork_suffix}")
     };
     if tool_status_only(name) {
-        return tool_status_line(title, t);
+        return tool_status_line(name, title, &tool.state, t);
     }
     let expanded = store.expanded_tools.contains(&tool.call_id);
-    let header = tool_toggle(entity, &tool.call_id, expanded, title, t);
+    let delta = tool
+        .code_delta
+        .as_ref()
+        .map(|d| (d.lines_added, d.lines_removed));
+    let animate_motion = effective_motion(cx) != MotionLevel::Off;
+    let header = tool_toggle(
+        entity,
+        &tool.call_id,
+        expanded,
+        tool_status_icon(&tool.call_id, &tool.state, t),
+        tool_category_icon(name, is_exec),
+        title,
+        delta,
+        animate_motion,
+        t,
+    );
     if !expanded {
         return div().child(header);
     }
-    // 展开卡:圆角卡面 + 左侧状态色条,命令行用 code 面层收进"终端"质感。
-    // card 持续累积子元素(参数/输出/控制),外层横排只放色条+内容列,
-    // 内容列在末尾组装(见 assemble)。
-    let content = div().flex().flex_col().gap_1p5().py_2().pr_3().min_w_0()
-        .child(header)
+
+    // 展开卡:圆角卡片 + 顶部柔和头栏 + 状态 pill。
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .max_w_full()
+        .rounded(px(RADIUS_CARD))
+        .border_1()
+        .border_color(t.border_subtle)
+        .bg(t.card)
+        .shadow(shadow_card(t))
+        .overflow_hidden()
         .child(
             div()
                 .flex()
-                .gap_2()
                 .items_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .flex_shrink_0()
-                        .text_color(t.accent)
-                        .child(SharedString::from(format!("⚙ {name}"))),
-                )
-                .children(command.map(|command| {
-                    div()
-                        .min_w_0()
-                        .text_sm()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded(px(4.))
-                        .bg(t.code_bg)
-                        .text_color(t.text)
-                        .truncate()
-                        .child(SharedString::from(format!("$ {command}")))
-                }))
+                .justify_between()
+                .gap_2()
+                .px_1p5()
+                .py_1()
+                .bg(t.surface_subtle)
+                .border_b_1()
+                .border_color(t.border_subtle)
+                .child(div().flex_1().min_w_0().child(header))
                 .child(qaqh_gpui_kit::kit::pill(status, status_color, t)),
         );
-    let mut card = content;
-    let assemble = |content: Div, status_color: Hsla, t: &Palette| {
-        div()
-            .flex()
-            .max_w_full()
-            .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
-            .border_1()
-            .border_color(t.border)
-            .bg(t.card)
-            .overflow_hidden()
-            .child(div().w(px(3.)).flex_shrink_0().bg(status_color))
-            .child(content)
-    };
+
+    let mut body = div().flex().flex_col().gap_2().p_3().min_w_0();
     if !is_exec && let Some(args) = &tool.args {
-        card = card.child(
+        body = body.children(args_summary(args).map(|summary| {
             div()
+                .px_2p5()
+                .py_1()
+                .rounded(px(RADIUS_CHIP))
+                .bg(t.surface_subtle)
+                .font_family("monospace")
                 .text_xs()
                 .text_color(t.dim)
-                .child(SharedString::from(format!("参数 {args}"))),
-        );
+                .truncate()
+                .child(SharedString::from(summary))
+        }));
     }
     let raw_output = if let Some(exec) = exec {
-        store.exec_output_tail.iter()
+        store
+            .exec_output_tail
+            .iter()
             .find(|(id, end, text)| id == &exec.id && *end > exec.next_offset && !text.is_empty())
             .map_or(exec.output_preview.as_str(), |(_, _, text)| text.as_str())
     } else if matches!(tool.state, ToolCallState::Finished { .. }) {
@@ -378,23 +626,27 @@ fn tool_card(
             .find(|(call_id, _)| call_id == &tool.call_id)
             .map_or("", |(_, tail)| tail.as_str())
     };
-    // 历史快照可能只保留工具结果，提取命令输出而非展示结果 JSON。
     let result = if is_exec && exec.is_none() {
         serde_json::from_str::<serde_json::Value>(raw_output).ok()
     } else {
         None
     };
-    let output = result.as_ref()
+    let output = result
+        .as_ref()
         .and_then(|result| result.get("output")?.as_str())
         .unwrap_or(raw_output);
     let (output, truncated) = utf8_tail(output, tail_max);
     if !output.is_empty() {
-        card = card.child(
+        body = body.child(
             div()
+                .id(SharedString::from(format!("tool-output-{}", tool.call_id.0)))
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .font_family("monospace")
                 .text_xs()
-                .px_2()
-                .py_1p5()
-                .rounded(px(5.))
+                .px_3()
+                .py_2()
+                .rounded(px(RADIUS_CONTROL))
                 .bg(t.code_bg)
                 .text_color(t.dim)
                 .min_w_0()
@@ -405,67 +657,322 @@ fn tool_card(
                 })),
         );
         if truncated {
-            card = card.child(div().text_xs().text_color(t.faint).child("(仅显示输出尾部)"));
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(t.faint)
+                    .child("(仅显示输出尾部)"),
+            );
         }
     }
-    if let Some(exec) = exec && !exec.state.is_terminal() {
+    if let Some(exec) = exec
+        && !exec.state.is_terminal()
+    {
         let id = exec.id.0.clone();
         let control = |terminate| {
             let entity = entity.downgrade();
             let exec_id = id.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+            move |_: &ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 let _ = entity.update(cx, |store, _| store.exec_control(exec_id.clone(), terminate));
             }
         };
-        card = card.child(
+        body = body.child(
             div()
                 .flex()
                 .gap_2()
-                .child(action_button(cx, format!("exec-int-{id}"), "中断", t.warn, control(false), t))
-                .child(action_button(cx, format!("exec-term-{id}"), "终止", t.bad, control(true), t)),
+                .child(action_button(
+                    cx,
+                    format!("exec-int-{id}"),
+                    "中断",
+                    t.warn,
+                    control(false),
+                    t,
+                ))
+                .child(action_button(
+                    cx,
+                    format!("exec-term-{id}"),
+                    "终止",
+                    t.bad,
+                    control(true),
+                    t,
+                )),
         );
     }
-    if let Some((summary, doc)) = handoff_fork_payload(tool) {
-        // 封箱成功 → 回合尾部入口(electron HandoffCard 同位):新会话继续交接。
+    if let Some(facts) = crate::store::handoff_facts(tool) {
+        body = body.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(div().size_1p5().rounded_full().bg(if facts.sealed {
+                    t.ok
+                } else {
+                    t.warn
+                }))
+                .child(div().text_xs().text_color(t.dim).child(if facts.sealed {
+                    "已封箱"
+                } else {
+                    "推断交接(机器面未读出)"
+                })),
+        );
+        if facts.sealed
+            && store.handoff_seal.is_none()
+            && let Some(planned_open) = facts.planned_open_at_ms
+        {
+            if planned_open > crate::store::now_ms() {
+                body = body.child(handoff_countdown(planned_open, facts.sealed_at_ms, t));
+            } else {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(t.dim)
+                        .child("阅读窗已结束,等待后继会话开箱…"),
+                );
+            }
+        }
+        if !facts.auto_continue {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child("模型声明:交接后不自动接续 —— 需要时手动打开。"),
+            );
+        }
         let entity = entity.downgrade();
-        card = card.child(
+        body = body.child(
             div().flex().gap_2().child(action_button(
                 cx,
                 "handoff-fork".into(),
                 "继续这条交接 →",
                 t.accent,
-                move |_, _, cx: &mut gpui::App| {
-                    let _ = entity.update(cx, |store, _| store.fork_handoff(summary.clone(), doc.clone()));
+                move |_, _, cx: &mut gpui_kit::App| {
+                    let _ = entity.update(cx, |store, _| {
+                        store.fork_handoff(facts.summary.clone(), facts.doc.clone())
+                    });
                 },
                 t,
             )),
         );
     }
-    assemble(card, status_color, t)
+    if let Some(exec) = exec {
+        let exec_id = exec.id.0.clone();
+        let exec_handle = exec.id.clone();
+        let entity = entity.downgrade();
+        body = body.child(
+            div()
+                .id(SharedString::from(format!(
+                    "exec-open-terminal-{}",
+                    exec_id
+                )))
+                .self_start()
+                .px_2p5()
+                .py_1()
+                .rounded(px(RADIUS_CHIP))
+                .bg(t.accent_soft)
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .text_color(t.accent)
+                .hover(|style| style.bg(t.accent_bg))
+                .child("在执行终端面板中查看 →")
+                .on_click(move |_, _, cx| {
+                    let _ = entity.update(cx, |store, cx| {
+                        crate::terminal_panel::open(store, Some(exec_handle.clone()), cx);
+                    });
+                }),
+        );
+    }
+    card = card.child(body);
+    card
 }
 
-/// handoff 工具的 fork 事实:(work_summary, handoff_doc)。
-/// 判据同 electron:tool_name == "handoff" 且封箱成功;文档取 args(模型亲手写的那份)。
-/// args 缺文档时不给按钮——不猜 output 里的自由文本。
-fn handoff_fork_payload(tool: &ToolCallView) -> Option<(Option<String>, String)> {
-    if tool.tool_name.as_deref() != Some("handoff") {
-        return None;
-    }
-    let success = matches!(&tool.state, ToolCallState::Finished { outcome } if outcome.is_success());
-    if !success {
-        return None;
-    }
-    let args = tool.args.as_ref()?;
-    let doc = args.get("handoff_doc")?.as_str()?.to_string();
-    if doc.trim().is_empty() {
-        return None;
-    }
-    let summary = args
-        .get("work_summary")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .filter(|text| !text.trim().is_empty());
-    Some((summary, doc))
+/// 连续成功工具调用「无框轨迹脊柱」:Antigravity 极简紧凑行 + 1px 左侧脊柱 + MotionReveal 弹簧展开。
+fn tool_burst_card(
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+    entity: &Entity<SessionStore>,
+    group_id: usize,
+    indices: &[usize],
+    t: &Palette,
+    tail_max: usize,
+) -> Div {
+    let animate_motion = effective_motion(cx) != MotionLevel::Off;
+    let (expanded, summary) = {
+        let store = entity.read(cx);
+        (
+            store.expanded_groups.contains(&group_id),
+            summarize_burst(store, indices),
+        )
+    };
+    let weak = entity.downgrade();
+    let header = div()
+        .id(SharedString::from(format!("tool-burst-{group_id}")))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_click(move |_, _, cx| {
+            let _ = weak.update(cx, |store, cx| {
+                if !store.expanded_groups.remove(&group_id) {
+                    store.expanded_groups.insert(group_id);
+                }
+                cx.notify();
+            });
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    Icon::new(IconName::CircleCheck)
+                        .with_size(Size::XSmall)
+                        .text_color(t.ok),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.dim)
+                        .truncate()
+                        .child(SharedString::from(summary)),
+                ),
+        )
+        .child(spring_chevron(
+            SharedString::from(format!("burst-chev-{group_id}")),
+            expanded,
+            t.faint,
+            animate_motion,
+        ));
+
+    let entity_for_spine = entity.clone();
+    let indices_owned = indices.to_vec();
+    let t_copy = *t;
+    let revealed = accordion_reveal(
+        SharedString::from(format!("burst-reveal-{group_id}")),
+        expanded,
+        window,
+        cx,
+        move |cx| {
+            let store = entity_for_spine.read(cx);
+            let mut spine = div()
+                .mt_1()
+                .ml_2p5()
+                .pl_3()
+                .border_l_1()
+                .border_color(t_copy.border_subtle)
+                .flex()
+                .flex_col()
+                .gap_1();
+            for &idx in &indices_owned {
+                if let Some(TimelineEntry::ToolCall { call_id, .. }) = store.entries.get(idx)
+                    && let Some(tool) = store.tools.iter().find(|tool| &tool.call_id == call_id)
+                {
+                    spine = spine.child(tool_card(
+                        cx,
+                        store,
+                        &entity_for_spine,
+                        tool,
+                        &t_copy,
+                        tail_max,
+                    ));
+                }
+            }
+            spine.into_any_element()
+        },
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .child(header)
+        .children(revealed)
+}
+
+/// 阅读窗倒计时行。
+fn handoff_countdown(planned_open_at_ms: u64, sealed_at_ms: Option<u64>, t: &Palette) -> Div {
+    let total = planned_open_at_ms
+        .saturating_sub(sealed_at_ms.unwrap_or(0))
+        .max(1) as f32;
+    let remaining = planned_open_at_ms.saturating_sub(crate::store::now_ms());
+    let fraction = ((remaining as f32 / total).clamp(0., 1.) * 1000.).round() / 1000.;
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .size_1p5()
+                .rounded_full()
+                .bg(t.accent)
+                .with_animation(
+                    "handoff-pulse",
+                    Animation::new(std::time::Duration::from_millis(1200))
+                        .repeat()
+                        .with_easing(pulse_easing),
+                    move |style, value| style.opacity(0.35 + 0.65 * value),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(t.dim)
+                .child(SharedString::from(format!(
+                    "阅读窗 {}s",
+                    remaining.div_ceil(1000)
+                ))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .h_1p5()
+                .rounded_full()
+                .bg(soft(t.faint, 0.16))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .rounded_full()
+                        .bg(t.accent)
+                        .w(relative(fraction)),
+                ),
+        )
+}
+
+/// Provider 重试横幅:居中圆角警示胶囊。
+pub(crate) fn provider_retry_banner(store: &SessionStore, t: &Palette) -> Option<Div> {
+    let retry = store.provider_retry.as_ref()?;
+    Some(
+        div()
+            .mx_4()
+            .mb_1p5()
+            .px_3()
+            .py_1p5()
+            .rounded(px(RADIUS_CONTROL))
+            .bg(soft(t.warn, 0.12))
+            .border_1()
+            .border_color(soft(t.warn, 0.25))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(live_dot("provider-retry", t.warn, true))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(t.warn)
+                    .child(SharedString::from(format!(
+                        "模型请求重试中 ({}/{}) · {}s 后重试 · {}",
+                        retry.attempt, retry.max_attempts, retry.delay_secs, retry.error
+                    ))),
+            ),
+    )
 }
 
 fn has_assistant_text(kind: AssistantBlockKind, text: &str) -> bool {
@@ -475,73 +982,248 @@ fn has_assistant_text(kind: AssistantBlockKind, text: &str) -> bool {
 fn hidden_timeline_entry(entry: &TimelineEntry) -> bool {
     match entry {
         TimelineEntry::ToolResult { .. } => true,
-        TimelineEntry::AssistantBlock { block_kind, content, .. } => {
-            !has_assistant_text(*block_kind, content_text(content))
-        }
+        TimelineEntry::AssistantBlock {
+            block_kind,
+            content,
+            ..
+        } => !has_assistant_text(*block_kind, content_text(content)),
         _ => false,
     }
 }
 
-/// 助手块 markdown 区。流式光标单独渲染，避免改变 Markdown 源。
+/// 思考链路折叠头:Antigravity 无框行 + Sparkles 图标 + 流式中性扫光文字 + 物理弹簧箭头。
+fn thinking_toggle(
+    entity: &Entity<SessionStore>,
+    block_id: &BlockId,
+    expanded: bool,
+    live: bool,
+    title: String,
+    animate_motion: bool,
+    t: &Palette,
+) -> gpui_kit::Stateful<Div> {
+    let entity = entity.downgrade();
+    let block_id = block_id.clone();
+    let label_el: AnyElement = if live && !expanded {
+        shimmer_label(
+            format!("thinking-shimmer-{}", block_id.0),
+            "正在深度思考…",
+            t,
+        )
+    } else {
+        div()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(t.dim)
+            .truncate()
+            .child(SharedString::from(title))
+            .into_any_element()
+    };
+
+    div()
+        .id(SharedString::from(format!("thinking-toggle-{}", block_id.0)))
+        .self_start()
+        .max_w_full()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_1p5()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .child(
+            Icon::new(IconName::Sparkles)
+                .with_size(Size::XSmall)
+                .text_color(if live { t.text } else { t.dim }),
+        )
+        .child(div().min_w_0().flex_1().child(label_el))
+        .child(spring_chevron(
+            SharedString::from(format!("think-chev-{}", block_id.0)),
+            expanded,
+            t.faint,
+            animate_motion,
+        ))
+        .on_click(move |_, _, cx| {
+            let _ = entity.update(cx, |store, cx| {
+                if !store.expanded_thinking.remove(&block_id) {
+                    store.expanded_thinking.insert(block_id.clone());
+                }
+                cx.notify();
+            });
+        })
+}
+
+#[derive(Clone, Copy)]
+enum AssistantSource {
+    Entry(usize),
+    Streaming(usize),
+}
+
+fn assistant_source_text<'a>(store: &'a SessionStore, source: AssistantSource) -> &'a str {
+    match source {
+        AssistantSource::Entry(idx) => match store.entries.get(idx) {
+            Some(TimelineEntry::AssistantBlock { content, .. }) => content_text(content),
+            _ => "",
+        },
+        AssistantSource::Streaming(idx) => store
+            .streaming
+            .get(idx)
+            .map(|(_, _, text)| text.as_str())
+            .unwrap_or(""),
+    }
+}
+
+/// 助手块 markdown 区(Reasoning 使用无框思考行 + 左侧 1px 脊柱 MotionReveal 展开)。
+#[allow(clippy::too_many_arguments)]
 fn assistant_section(
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
     kind: &AssistantBlockKind,
-    text: &str,
+    source: AssistantSource,
     live: bool,
     section: usize,
-    store: &SessionStore,
+    block_id: &BlockId,
     entity: &Entity<SessionStore>,
     t: &Palette,
     ty: &settings::Typography,
-) -> gpui::Stateful<Div> {
-    let label = match kind {
-        AssistantBlockKind::Reasoning => "思考",
-        AssistantBlockKind::Answer => "回答",
-        AssistantBlockKind::ToolCall => "工具",
+) -> gpui_kit::Stateful<Div> {
+    let animate_motion = effective_motion(cx) != MotionLevel::Off;
+    let reasoning = matches!(kind, AssistantBlockKind::Reasoning);
+    let (expanded, header, body) = {
+        let store = entity.read(cx);
+        let text = assistant_source_text(store, source);
+        let expanded = reasoning && store.expanded_thinking.contains(block_id);
+        let collapsed = reasoning && !expanded;
+        let header: Option<AnyElement> = if reasoning {
+            let mut title = "思考过程".to_owned();
+            if collapsed {
+                let first = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("");
+                let preview: String = first.chars().take(48).collect();
+                if !preview.is_empty() {
+                    title.push_str(&format!(
+                        " · {preview}{}",
+                        if first.chars().count() > 48 { "…" } else { "" }
+                    ));
+                }
+            }
+            Some(
+                thinking_toggle(entity, block_id, expanded, live, title, animate_motion, t)
+                    .into_any_element(),
+            )
+        } else if matches!(kind, AssistantBlockKind::ToolCall) {
+            Some(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.faint)
+                    .child("工具调用")
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+        let body = if reasoning {
+            Vec::new()
+        } else {
+            crate::markdown::render_blocks(&store.md_cache.get(section, text), section, t, ty, entity)
+        };
+        (expanded, header, body)
     };
-    let blocks = store.md_cache.get(section, text);
-    div()
+
+    let mut container = div()
         .id(("mdsec", section))
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_1p5()
         .max_w_full()
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(t.faint)
-                .child(label),
-        )
-        .children(crate::markdown::render_blocks(&blocks, section, t, ty, entity))
-        .children(live.then(|| div().text_xs().text_color(t.dim).child("▍")))
+        .children(header);
+
+    if reasoning {
+        let entity_for_body = entity.clone();
+        let t_copy = *t;
+        let ty_copy = *ty;
+        let revealed = accordion_reveal(
+            SharedString::from(format!("think-reveal-{}", block_id.0)),
+            expanded,
+            window,
+            cx,
+            move |cx| {
+                let store = entity_for_body.read(cx);
+                let text = assistant_source_text(store, source);
+                let body = crate::markdown::render_blocks(
+                    &store.md_cache.get(section, text),
+                    section,
+                    &t_copy,
+                    &ty_copy,
+                    &entity_for_body,
+                );
+                div()
+                    .ml_2p5()
+                    .pl_3()
+                    .border_l_1()
+                    .border_color(t_copy.border_subtle)
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(body)
+                    .into_any_element()
+            },
+        );
+        container = container.children(revealed);
+    } else {
+        container = container.children(body);
+    }
+
+    container.children((live && !reasoning).then(|| {
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .pt_0p5()
+            .child(live_dot(format!("live-gen-{}", block_id.0), t.accent, true))
+            .child(shimmer_label(
+                format!("live-shimmer-{}", block_id.0),
+                "正在生成…",
+                t,
+            ))
+    }))
 }
 
-/// 通知行:左侧色点 + 标签 + 正文(系统陈述/排队/插话共用,非聊天气泡)。
+/// 通知行:左侧呼吸点/色点 + 标签 + 正文。
 fn notice_line(label: &str, text: &str, color: Hsla, t: &Palette) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
-        .px_3()
-        .py_1p5()
-        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
-        .bg(t.card)
+        .px_3p5()
+        .py_2()
+        .rounded(px(RADIUS_CARD))
+        .bg(t.surface_subtle)
         .border_1()
-        .border_color(t.border)
+        .border_color(t.border_subtle)
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap_1p5()
                 .text_xs()
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(color)
                 .child(div().size_1p5().rounded_full().bg(color))
                 .child(SharedString::from(label.to_owned())),
         )
-        .child(div().text_sm().text_color(t.text).child(SharedString::from(text.to_owned())))
+        .child(
+            div()
+                .text_sm()
+                .text_color(t.text)
+                .child(SharedString::from(text.to_owned())),
+        )
 }
 
-/// 子代理终态通知卡:按 terminal 着色的系统卡,正文是 runtime 摘要。
 fn terminal_notice(
     terminal: &qaqh_ringing_contract::commands::SubagentTerminalNotification,
     text: &str,
@@ -556,44 +1238,55 @@ fn terminal_notice(
     };
     let mut title = format!("{label} · {}", terminal.child_session_id);
     if !terminal.parent_call_id.is_empty() {
-        title.push_str(&format!("(调用 {})", terminal.parent_call_id));
+        title.push_str(&format!(" (调用 {})", terminal.parent_call_id));
     }
     notice_line(&title, text, color, t)
 }
 
-/// 封口块的用量注记:tok 数 + 权威产出速率(completion_tokens / generated_ms,
-/// 内核实测区间为分母;缺 generated_ms 时不给速率,不用到货时间编造)。
-fn usage_note(
-    usage: Option<&qaqh_types::UsageInfo>,
-    generated_ms: Option<u64>,
-    t: &Palette,
-) -> Option<Div> {
-    let usage = usage?;
-    let mut note = format!("{} tok", usage.completion_tokens);
-    if let Some(ms) = generated_ms.filter(|ms| *ms >= 500) {
-        let rate = usage.completion_tokens as f64 / (ms as f64 / 1000.0);
-        note.push_str(&format!(" · {rate:.1} tok/s"));
-    }
-    Some(
-        div()
-            .text_xs()
-            .text_color(t.faint)
-            .child(SharedString::from(note)),
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 fn timeline_entry(
-    cx: &gpui::App,
-    store: &SessionStore,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
     entity: &Entity<SessionStore>,
-    entry: &TimelineEntry,
     index: usize,
     t: &Palette,
     ty: &settings::Typography,
     tail_max: usize,
 ) -> Option<AnyElement> {
+    let assistant_meta = {
+        let store = entity.read(cx);
+        match store.entries.get(index)? {
+            TimelineEntry::AssistantBlock {
+                block_id,
+                block_kind,
+                ..
+            } => Some((block_id.clone(), *block_kind)),
+            _ => None,
+        }
+    };
+    if let Some((block_id, block_kind)) = assistant_meta {
+        return Some(
+            assistant_section(
+                window,
+                cx,
+                &block_kind,
+                AssistantSource::Entry(index),
+                false,
+                index * 2,
+                &block_id,
+                entity,
+                t,
+                ty,
+            )
+            .into_any_element(),
+        );
+    }
+
+    let store = entity.read(cx);
+    let entry = store.entries.get(index)?;
     Some(match entry {
         TimelineEntry::Input {
+            turn_id,
             content,
             images,
             attachments,
@@ -605,14 +1298,13 @@ fn timeline_entry(
         } => {
             let text = content_text(content);
             if let Some(terminal) = subagent_terminal {
-                // 终态通知是运行时陈述,不是子代理说的话:系统卡,不渲染成气泡。
-                terminal_notice(terminal, &text, t).into_any_element()
+                terminal_notice(terminal, text, t).into_any_element()
             } else if actor.kind == ActorKind::System && text.starts_with("<qaqh_goal_continuation") {
-                notice_line("目标续跑", &text, t.warn, t).into_any_element()
+                notice_line("目标续跑", text, t.warn, t).into_any_element()
             } else if let Some(envelope) = inter_agent {
                 notice_line(
                     &format!("跨代理消息 · 来自 {}", envelope.author),
-                    &text,
+                    text,
                     t.accent,
                     t,
                 )
@@ -625,38 +1317,149 @@ fn timeline_entry(
                     ActorKind::Subagent => "子代理消息",
                     ActorKind::User => unreachable!("handled above"),
                 };
-                notice_line(label, &text, t.dim, t).into_any_element()
+                notice_line(label, text, t.dim, t).into_any_element()
             } else {
                 let mut row = match purpose {
-                    InputPurpose::TriggerTurn => div().child(user_bubble(&text, t)),
-                    InputPurpose::QueueOnly => notice_line("排队消息", &text, t.dim, t),
-                    InputPurpose::Steer => notice_line("运行中转向", &text, t.warn, t),
-                    InputPurpose::Interject => notice_line("运行中插话", &text, t.warn, t),
+                    InputPurpose::TriggerTurn => {
+                        div().flex().flex_col().items_end().gap_1p5().child(user_bubble(text, t))
+                    }
+                    InputPurpose::QueueOnly => notice_line("排队消息", text, t.dim, t),
+                    InputPurpose::Steer => notice_line("运行中转向", text, t.warn, t),
+                    InputPurpose::Interject => notice_line("运行中插话", text, t.warn, t),
                 };
-                row = row
-                    .child(div().flex().flex_wrap().gap_2().children(images.iter().map(qaqh_gpui_render::media::preview)))
-                    .children((!attachments.is_empty()).then(|| div().text_xs().child(format!("{} 个文本附件", attachments.len()))));
-                row.into_any_element()
+                if !images.is_empty() {
+                    row = row.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .children(images.iter().map(qaqh_gpui_render::media::preview)),
+                    );
+                }
+                if !attachments.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(t.dim)
+                            .child(format!("{} 个文本附件", attachments.len())),
+                    );
+                }
+                if matches!(purpose, InputPurpose::TriggerTurn)
+                    && !store.is_running()
+                    && let Some(tid) = turn_id
+                {
+                    let tid_str = tid.0.clone();
+                    let confirming =
+                        store.confirm_truncate_turn.as_deref() == Some(tid_str.as_str());
+                    let group_id = SharedString::from(format!("user-turn-{tid_str}"));
+                    let weak_undo = entity.downgrade();
+                    let text_owned = text.to_owned();
+                    let bar = if confirming {
+                        let tid_confirm = tid_str.clone();
+                        let weak_confirm = weak_undo.clone();
+                        let weak_cancel = weak_undo;
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("turn-trunc-ok-{tid_str}")))
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(RADIUS_CHIP))
+                                    .bg(soft(t.bad, 0.12))
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.bad)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft(t.bad, 0.20)))
+                                    .on_click(move |_, window, cx| {
+                                        let tid = tid_confirm.clone();
+                                        let prefill = text_owned.clone();
+                                        let _ = weak_confirm.update(cx, |store, cx| {
+                                            store.truncate_turn(tid, Some(prefill), window, cx);
+                                        });
+                                    })
+                                    .child("确认从此处截断？"),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("turn-trunc-no-{tid_str}")))
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded(px(RADIUS_CHIP))
+                                    .text_xs()
+                                    .text_color(t.dim)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.hover).text_color(t.text))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_cancel.update(cx, |store, cx| {
+                                            store.confirm_truncate_turn = None;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child("取消"),
+                            )
+                    } else {
+                        let tid_arm = tid_str.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .opacity(0.0)
+                            .group_hover(group_id.clone(), |s| s.opacity(1.0))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("turn-trunc-arm-{tid_str}")))
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded(px(RADIUS_CHIP))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_xs()
+                                    .text_color(t.faint)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.hover).text_color(t.text))
+                                    .on_click(move |_, _, cx| {
+                                        let tid = tid_arm.clone();
+                                        let _ = weak_undo.update(cx, |store, cx| {
+                                            store.confirm_truncate_turn = Some(tid);
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child(Icon::new(IconName::Undo2).with_size(Size::XSmall))
+                                    .child("撤回并重编辑"),
+                            )
+                    };
+                    div()
+                        .id(SharedString::from(format!("user-turn-wrap-{}", tid.0)))
+                        .group(group_id)
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap_1()
+                        .child(row)
+                        .child(bar)
+                        .into_any_element()
+                } else {
+                    row.into_any_element()
+                }
             }
         }
-        TimelineEntry::AssistantBlock { block_kind, content, usage, generated_ms, .. } => {
-            let section = assistant_section(block_kind, content_text(content), false, index * 2, store, entity, t, ty);
-            div()
-                .flex()
-                .flex_col()
-                .max_w_full()
-                .child(section)
-                .children(usage_note(usage.as_ref(), *generated_ms, t))
-                .into_any_element()
-        }
+        TimelineEntry::AssistantBlock { .. } => unreachable!("handled above"),
         TimelineEntry::ToolCall { call_id, .. } => {
             let tool = store.tools.iter().find(|tool| &tool.call_id == call_id)?;
             tool_card(cx, store, entity, tool, t, tail_max).into_any_element()
         }
         TimelineEntry::Compaction { .. } => div()
-            .text_xs()
-            .text_color(t.dim)
-            .child("── 已压缩 ──")
+            .flex()
+            .items_center()
+            .gap_3()
+            .py_1()
+            .child(div().flex_1().h(px(1.)).bg(t.border_subtle))
+            .child(div().text_xs().text_color(t.faint).child("上下文已自动整理压缩"))
+            .child(div().flex_1().h(px(1.)).bg(t.border_subtle))
             .into_any_element(),
         TimelineEntry::ToolResult { .. } => return None,
     })
@@ -669,44 +1472,50 @@ fn interaction_card(
     body: Vec<AnyElement>,
     t: &Palette,
 ) -> Div {
-    // 待交互卡:warn 色条 + 软底,和工具卡同一"色条卡"语言。
     div()
-        .flex()
-        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
+        .rounded(px(RADIUS_CARD))
         .border_1()
-        .border_color(t.border)
+        .border_color(soft(t.warn, 0.35))
         .bg(t.warn_bg)
-        .overflow_hidden()
-        .child(div().w(px(3.)).flex_shrink_0().bg(t.warn))
+        .shadow(shadow_card(t))
+        .px_3p5()
+        .py_2p5()
+        .flex()
+        .flex_col()
+        .gap_2()
         .child(
             div()
                 .flex()
-                .flex_col()
+                .items_center()
                 .gap_2()
-                .px_3()
-                .py_2p5()
-                .min_w_0()
-                .flex_1()
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .with_size(Size::XSmall)
+                        .text_color(t.warn),
+                )
                 .child(
                     div()
                         .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(t.warn)
                         .child(SharedString::from(format!("需要确认 · {kind_label}"))),
-                )
-                .child(div().text_sm().child(SharedString::from(request.to_string())))
-                .when(!body.is_empty(), |card| {
-                    card.child(div().flex().flex_col().gap_1().children(body))
-                })
-                .when(!buttons.is_empty(), |card| {
-                    card.child(div().flex().gap_2().children(buttons))
-                }),
+                ),
         )
+        .child(
+            div()
+                .text_sm()
+                .text_color(t.text)
+                .child(SharedString::from(request.to_string())),
+        )
+        .when(!body.is_empty(), |card| {
+            card.child(div().flex().flex_col().gap_1().children(body))
+        })
+        .when(!buttons.is_empty(), |card| {
+            card.child(div().flex().gap_2().children(buttons))
+        })
 }
 
 impl SessionStore {
-    /// ask 应答 Dialog 内容:解析 request 渲染问题/选项/自定义输入;
-    /// 解析失败回退自由文本。提交/跳过成功后收口对话框。
     fn ask_dialog(
         &mut self,
         interaction: &qaqh_ringing_contract::state::InteractionView,
@@ -731,11 +1540,13 @@ impl SessionStore {
                     );
                 }
                 for (index, question) in questions.iter().enumerate() {
-                    let field = self.ask_draft(&iid, questions.len(), window, cx).customs[index].clone();
-                    let mut row = div().flex().flex_col().gap_1();
+                    let field =
+                        self.ask_draft(&iid, questions.len(), window, cx).customs[index].clone();
+                    let mut row = div().flex().flex_col().gap_1p5();
                     row = row.child(
                         div()
                             .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
                             .child(SharedString::from(format!(
                                 "{}. {}",
                                 index + 1,
@@ -743,7 +1554,8 @@ impl SessionStore {
                             ))),
                     );
                     for option in &question.options {
-                        let chosen = self.ask_draft(&iid, questions.len(), window, cx).answers[index]
+                        let chosen = self.ask_draft(&iid, questions.len(), window, cx).answers
+                            [index]
                             .as_deref()
                             == Some(option.as_str());
                         let opt = option.clone();
@@ -752,21 +1564,23 @@ impl SessionStore {
                         row = row.child(
                             div()
                                 .id(SharedString::from(format!("ask-{iid}-{index}-{opt}")))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
+                                .px_3()
+                                .py_1p5()
+                                .rounded(px(RADIUS_CONTROL))
                                 .text_xs()
                                 .cursor_pointer()
                                 .border_1()
-                                .border_color(if chosen { t.accent } else { t.border })
-                                .bg(if chosen { t.accent_bg } else { t.btn })
+                                .border_color(if chosen { t.accent } else { t.border_subtle })
+                                .bg(if chosen { t.accent_soft } else { t.surface_subtle })
                                 .text_color(if chosen { t.accent } else { t.text })
-                                .hover(|style| style.bg(t.btn_hover))
+                                .hover(|style| style.bg(t.hover))
                                 .on_click(cx.listener(
                                     move |store: &mut SessionStore, _, window: &mut Window, cx| {
                                         let draft = store.ask_draft(&iid_click, index + 1, window, cx);
                                         draft.answers[index] = Some(opt_click.clone());
-                                        draft.customs[index].update(cx, |custom, cx| custom.set_value("", window, cx));
+                                        draft.customs[index].update(cx, |custom, cx| {
+                                            custom.set_value("", window, cx)
+                                        });
                                         cx.notify();
                                     },
                                 ))
@@ -807,27 +1621,29 @@ impl SessionStore {
                     .title("会话提问")
                     .children(body)
                     .footer(
-                        div().flex().justify_end().gap_2()
-                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(qaqh_gpui_kit::kit::button(
                                 cx,
                                 qaqh_gpui_kit::kit::BtnKind::Soft,
                                 format!("ask-submit-{iid}"),
                                 "提交回答",
                                 &t,
                                 submit,
-                            )))
-                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+                            ))
+                            .child(qaqh_gpui_kit::kit::button(
                                 cx,
                                 qaqh_gpui_kit::kit::BtnKind::Ghost,
                                 format!("ask-skip-{iid}"),
                                 "跳过",
                                 &t,
                                 skip,
-                            ))),
+                            )),
                     )
             }
             _ => {
-                // 解析失败:回退自由文本(q1),不猜语法。
                 let field = self.ask_draft(&iid, 1, window, cx).customs[0].clone();
                 let submit = {
                     let ids = vec!["q1".to_string()];
@@ -872,36 +1688,38 @@ impl SessionStore {
                     .title("会话提问")
                     .children(body)
                     .footer(
-                        div().flex().justify_end().gap_2()
-                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(qaqh_gpui_kit::kit::button(
                                 cx,
                                 qaqh_gpui_kit::kit::BtnKind::Soft,
                                 format!("ask-submit-{iid}"),
                                 "提交回答",
                                 &t,
                                 submit,
-                            )))
-                            .child(gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
+                            ))
+                            .child(qaqh_gpui_kit::kit::button(
                                 cx,
                                 qaqh_gpui_kit::kit::BtnKind::Ghost,
                                 format!("ask-skip-{iid}"),
                                 "跳过",
                                 &t,
                                 skip,
-                            ))),
+                            )),
                     )
             }
         }
     }
 }
 
-/// 打开 ask 应答 Dialog(模态覆盖层,Root 承载):到达即弹、footer 可重开;
-/// 提问已处理时显示收口态。
+/// 打开 ask 应答 Dialog。
 pub fn open_ask_dialog(
     store: &Entity<SessionStore>,
     interaction_id: qaqh_ringing_contract::fact::InteractionId,
     window: &mut Window,
-    cx: &mut gpui::App,
+    cx: &mut gpui_kit::App,
 ) {
     window.open_dialog(cx, {
         let store = store.clone();
@@ -926,7 +1744,7 @@ pub fn open_ask_dialog(
                                 "ask-dialog-done".into(),
                                 "关闭",
                                 t.dim,
-                                |_, window: &mut Window, cx: &mut gpui::App| window.close_dialog(cx),
+                                |_, window: &mut Window, cx: &mut gpui_kit::App| window.close_dialog(cx),
                                 &t,
                             )),
                         ),
@@ -939,313 +1757,134 @@ pub fn open_ask_dialog(
 impl Render for SessionStore {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.colors();
-        let title = self.title.clone().unwrap_or_else(|| self.session_id.clone());
-
-        // 头部:标题(或重命名输入)+ 流徽标 + 重命名/中断按钮。
-        let mut header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(t.border)
-            .bg(t.panel);
-        if let Some(draft) = self.renaming.clone() {
-            // Enter 提交由 begin_rename 的事件订阅驱动;Escape 关闭重命名
-            // (在祖先层截获,先于输入引擎的 Escape 动作)。
-            let rename_input = div()
-                .id("rename-input")
-                .min_w(px(200.))
-                .on_key_down(cx.listener(
-                    |store: &mut SessionStore, event: &KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "escape" {
-                            store.rename_cancel();
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                    },
-                ))
-                .child(Input::new(&draft).small());
-            header = header
-                .child(rename_input)
-                .child(
-                    action_button(cx, 
-                        "rename-commit".into(),
-                        "✓",
-                        t.ok,
-                        cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            store.rename_commit(cx);
-                            cx.notify();
-                        }),
-                        &t,
-                    ),
-                )
-                .child(
-                    action_button(cx, 
-                        "rename-cancel".into(),
-                        "✕",
-                        t.dim,
-                        cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            store.rename_cancel();
-                            cx.notify();
-                        }),
-                        &t,
-                    ),
-                );
-        } else {
-            header = header
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(title),
-                )
-                .child(stream_badge(&self.stream, &t))
-                .children(self.goal.clone().map(|goal| {
-                    crate::goal::goal_badge(&goal, cx, &t).into_any_element()
-                }))
-                .children(self.handoff_seal.as_ref().map(|seal| {
-                    // ADR-0016 投影:标记旧线已封箱;点击经 Select 跳后继会话。
-                    qaqh_gpui_kit::kit::pill(&format!("已封箱 → {}", seal.work_summary), t.dim, &t)
-                        .id("handoff-seal")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            store.open_handoff_successor();
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                }))
-                .children((self.activity == Some(ActivityState::Running))
-                    .then(|| self.tok_rate())
-                    .flatten()
-                    .map(|rate| {
-                        qaqh_gpui_kit::kit::pill(&format!("≈ {:.0} tok/s", rate.max(1.)), t.accent, &t)
-                            .into_any_element()
-                    }))
-                .child(
-                    div()
-                        .id("model-chip")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
-                        .text_color(t.dim)
-                        .hover(|style| style.bg(t.hover))
-                        .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            let current = store.settings.as_ref().and_then(|s| s.meta.model_selection.as_ref());
-                            if let Some(catalog) = &store.catalog {
-                                let options = crate::store::model_options_from(catalog);
-                                if let Some(next) = next_model(&options, current).cloned() {
-                                    store.patch_model(next);
-                                    cx.notify();
-                                }
-                            }
-                        }))
-                        .child(format!(
-                            "模型:{}",
-                            self.settings.as_ref().and_then(|s| s.meta.model_selection.as_ref())
-                                .map(|model| format!("{}/{}", model.provider_id, model.model_id))
-                                .unwrap_or_else(|| "未选择".into()),
-                        )),
-                )
-                .child(
-                    div()
-                        .id("effort-chip")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
-                        .text_color(t.dim)
-                        .hover(|style| style.bg(t.hover))
-                        .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            let model = store.settings.as_ref().and_then(|settings| settings.meta.model_selection.as_ref());
-                            if let Some((catalog, model)) = store.catalog.as_deref().zip(model) {
-                                let levels = model_effort_levels(catalog, model);
-                                let current = model.options.reasoning_effort.as_ref();
-                                let next = match current {
-                                    Some(current) => levels.iter().position(|level| level == current)
-                                        .and_then(|index| levels.get(index + 1)),
-                                    None => levels.first(),
-                                };
-                                store.patch_effort(next.cloned());
-                                cx.notify();
-                            }
-                        }))
-                        .child(format!("强度:{}", self.settings.as_ref()
-                            .and_then(|s| s.meta.model_selection.as_ref())
-                            .and_then(|model| model.options.reasoning_effort.as_deref())
-                            .unwrap_or("默认"))),
-                )
-                .child(
-                    div()
-                        .id("tools-chip")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
-                        .text_color(t.dim)
-                        .hover(|style| style.bg(t.hover))
-                        .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            let current = store.settings.as_ref().map(|s| s.meta.tool_mode.as_str());
-                            let presets = [qaqh_types::STANDARD, qaqh_types::MINIMAL, qaqh_types::MINIMAL_B, qaqh_types::MINIMAL_C];
-                            if let Some(next) = next_option(&presets, current.as_ref()) {
-                                store.patch_tools_mode((*next).to_string());
-                                cx.notify();
-                            }
-                        }))
-                        .child(format!("工具:{}", self.settings.as_ref()
-                            .map(|s| s.meta.tool_mode.as_str()).filter(|mode| !mode.is_empty())
-                            .unwrap_or(qaqh_types::STANDARD))),
-                )
-                .child(
-                    div()
-                        .id("detach-chip")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .rounded(px(qaqh_gpui_kit::kit::RADIUS_CONTROL))
-                        .text_color(t.dim)
-                        .hover(|style| style.bg(t.hover))
-                        .on_click(cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            store.detach_from_workspace();
-                            cx.notify();
-                        }))
-                        .child("脱离"),
-                )
-                .child(
-                    action_button(cx, 
-                        format!("rename-{}", self.session_id),
-                        "重命名",
-                        t.dim,
-                        cx.listener(|store: &mut SessionStore, _, window, cx| {
-                            store.begin_rename(window, cx);
-                            cx.notify();
-                        }),
-                        &t,
-                    ),
-                )
-                .child(
-                    gpui::AnyElement::from(qaqh_gpui_kit::kit::button(
-                        cx,
-                        qaqh_gpui_kit::kit::BtnKind::Danger,
-                        format!("delete-{}", self.session_id),
-                        if self.confirm_delete { "确认删除" } else { "删除" },
-                        &t,
-                        cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            if store.confirm_delete {
-                                store.delete_self();
-                            }
-                            store.confirm_delete = !store.confirm_delete;
-                            cx.notify();
-                        }),
-                    )),
-                );
-        }
-        if self.activity == Some(ActivityState::Running) {
-            header = header.child(
-                div().flex_1().child(div()).child(
-                    action_button(cx, 
-                        format!("cancel-{}", self.session_id),
-                        "中断",
-                        t.bad,
-                        cx.listener(|store: &mut SessionStore, _, _, cx| {
-                            store.cancel_turn();
-                            // 看门狗:5s 无终态则本地收口 + 重灌快照。
-                            store.arm_cancel_watchdog(5000);
-                            cx.notify();
-                        }),
-                        &t,
-                    ),
-                ),
-            );
-        } else if let Some(activity) = self.activity {
-            header = header.child(
-                div()
-                    .flex_1()
-                    .child(div())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.dim)
-                            .child(activity_label(activity)),
-                    ),
-            );
-        }
+        crate::terminal_panel::sync(self, cx);
 
         let settings = settings::get(cx).clone();
         let ty = settings.typography();
         let tail_max = settings.behavior.output_tail_max;
         self.output_budget = tail_max;
 
+        let display_items = Arc::new(build_timeline_items(self));
         let list_state = self.timeline_list.clone();
-        let old_history_len = list_state.item_count() - 1;
-        if old_history_len != self.entries.len() {
-            let start = old_history_len.min(self.entries.len());
-            list_state.splice(start..old_history_len, self.entries.len() - start);
+        let target_count = display_items.len() + 1;
+        let current_count = list_state.item_count();
+        if current_count != target_count {
+            let old_history = current_count.saturating_sub(1);
+            let new_history = display_items.len();
+            let start = old_history.min(new_history);
+            list_state.splice(start..old_history, new_history - start);
         }
+
         let follow = settings.behavior.stream_follow;
         if self.timeline_follow_setting != Some(follow) {
-            list_state.set_follow_mode(if follow { FollowMode::Tail } else { FollowMode::Normal });
+            list_state.set_follow_mode(if follow {
+                FollowMode::Tail
+            } else {
+                FollowMode::Normal
+            });
             self.timeline_follow_setting = Some(follow);
         }
+
         let entity = cx.entity();
-        // 行 padding 挂在行上而非 list 上:gpui list 的滚动范围只从 items 高度
-        // 算,list 自带 padding 会让滚动条 thumb 永远到不了底(gpui-component
-        // MessageScroller 注释同口径)。
-        let timeline = list(list_state, move |index, _, cx| {
-            let store = entity.read(cx);
-            let row = div().w_full().px_3().when(index == 0, |row| row.pt_3());
-            let gap = px((8.0 + ty.density_shift).max(2.));
-            if let Some(entry) = store.entries.get(index) {
-                if hidden_timeline_entry(entry) {
-                    return row.into_any_element();
-                }
-                let adjacent_tools = matches!(entry, TimelineEntry::ToolCall { .. })
-                    && matches!(
-                        store.entries.iter().skip(index + 1)
-                            .find(|entry| !hidden_timeline_entry(entry)),
-                        Some(TimelineEntry::ToolCall { .. })
-                    );
-                return match timeline_entry(cx, store, &entity, entry, index, &t, &ty, tail_max) {
-                    Some(content) => row.pb(if adjacent_tools { px(0.) } else { gap })
-                        .child(content).into_any_element(),
-                    None => row.into_any_element(),
+        let items_for_list = display_items.clone();
+        let timeline_list_el = list(list_state, move |index, window, cx| {
+            let row = div().w_full().px_4().when(index == 0, |row| row.pt_4());
+            let gap = px((10.0 + ty.density_shift).max(4.));
+
+            if let Some(item) = items_for_list.get(index) {
+                return match item {
+                    TimelineItem::Single(entry_idx) => {
+                        let last_assistant = entity
+                            .read(cx)
+                            .entries
+                            .iter()
+                            .rposition(|entry| matches!(entry, TimelineEntry::AssistantBlock { .. }));
+                        match timeline_entry(window, cx, &entity, *entry_idx, &t, &ty, tail_max) {
+                            Some(content) => {
+                                let row = row.pb(gap).child(content);
+                                if last_assistant == Some(*entry_idx) {
+                                    row.child(copy_conversation_chip(&entity, &t))
+                                        .into_any_element()
+                                } else {
+                                    row.into_any_element()
+                                }
+                            }
+                            None => row.into_any_element(),
+                        }
+                    }
+                    TimelineItem::ToolBurst { group_id, indices } => row
+                        .pb(gap)
+                        .child(tool_burst_card(
+                            window, cx, &entity, *group_id, indices, &t, tail_max,
+                        ))
+                        .into_any_element(),
                 };
             }
 
-            let referenced_tools: HashSet<_> = store.entries.iter().filter_map(|entry| {
-                match entry {
+            let streaming_meta: Vec<(usize, BlockId, AssistantBlockKind)> = {
+                let store = entity.read(cx);
+                store
+                    .streaming
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, kind, text))| has_assistant_text(*kind, text))
+                    .map(|(i, (block_id, kind, _))| (i, block_id.clone(), *kind))
+                    .collect()
+            };
+            let streaming_els: Vec<AnyElement> = streaming_meta
+                .into_iter()
+                .map(|(i, block_id, kind)| {
+                    assistant_section(
+                        window,
+                        cx,
+                        &kind,
+                        AssistantSource::Streaming(i),
+                        true,
+                        i * 2 + 1,
+                        &block_id,
+                        &entity,
+                        &t,
+                        &ty,
+                    )
+                    .into_any_element()
+                })
+                .collect();
+
+            let animate_motion = effective_motion(cx) != MotionLevel::Off;
+            let store = entity.read(cx);
+            let referenced_tools: HashSet<_> = store
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
                     TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
                     _ => None,
-                }
-            }).collect();
-            let footer = row.pb_3().flex().flex_col().gap(gap)
-                .children(
-                    store.streaming.iter().enumerate()
-                        .filter(|(_, (_, kind, text))| has_assistant_text(*kind, text))
-                        .map(|(i, (_, kind, text))| {
-                            assistant_section(kind, text, true, i * 2 + 1, store, &entity, &t, &ty)
-                                .into_any_element()
-                        }),
-                )
+                })
+                .collect();
+
+            div()
+                .w_full()
+                .px_4()
+                .when(index == 0, |row| row.pt_4())
+                .pb_6()
+                .flex()
+                .flex_col()
+                .gap(gap)
+                .children(streaming_els)
                 .children(store.arg_stream.iter().map(|stream| {
-                    let ArgStream { call_id, tool_name, text, lines, target_files, args_complete } = stream;
+                    let ArgStream {
+                        call_id,
+                        tool_name,
+                        text,
+                        lines,
+                        target_files,
+                        args_complete,
+                    } = stream;
                     if tool_status_only(tool_name) {
                         let title = tool_summary(tool_name, &ToolCallState::Declared)
                             .map_or_else(|| format!("正在准备 {tool_name}"), str::to_owned);
-                        return tool_status_line(title, &t).into_any_element();
+                        return tool_status_line(tool_name, title, &ToolCallState::Declared, &t)
+                            .into_any_element();
                     }
-                    // 流式参数行:标题带进度注记(行数估算/目标文件/参数完整),
-                    // 与 electron 的 ToolArgumentsDelta 注记同口径。
                     let mut title = format!("正在准备 {tool_name}");
                     if let Some((added, removed)) = lines {
                         title.push_str(&format!("  +{added} −{removed}"));
@@ -1254,13 +1893,33 @@ impl Render for SessionStore {
                         title.push_str(&format!("  · {}", target_files.join(", ")));
                     }
                     if *args_complete {
-                        title.push_str("  · 参数已完整");
+                        title.push_str("  · 参数已就绪");
                     }
                     let expanded = store.expanded_tools.contains(call_id);
                     div()
-                        .child(tool_toggle(&entity, call_id, expanded, title, &t))
+                        .child(tool_toggle(
+                            &entity,
+                            call_id,
+                            expanded,
+                            tool_status_icon(call_id, &ToolCallState::Running, &t),
+                            tool_category_icon(tool_name, tool_name == "exec_command"),
+                            title,
+                            None,
+                            animate_motion,
+                            &t,
+                        ))
                         .children(expanded.then(|| {
-                            div().px_2().text_xs().text_color(t.dim)
+                            div()
+                                .px_3()
+                                .py_1p5()
+                                .rounded(px(RADIUS_CHIP))
+                                .bg(t.code_bg)
+                                .font_family("monospace")
+                                .text_xs()
+                                .text_color(t.dim)
+                                .max_h(px(240.))
+                                .id(SharedString::from(format!("arg-stream-{}", call_id.0)))
+                                .overflow_y_scroll()
                                 .child(SharedString::from(text.clone()))
                         }))
                         .into_any_element()
@@ -1278,70 +1937,55 @@ impl Render for SessionStore {
                         .map(|status| format!("{status:?}"))
                         .unwrap_or_else(|| "进行中".into());
                     let mut row = div()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(RADIUS_CONTROL))
+                        .bg(t.surface_subtle)
+                        .border_1()
+                        .border_color(t.border_subtle)
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .text_xs()
                         .text_color(t.dim)
+                        .child(Icon::new(IconName::Bot).with_size(Size::XSmall).text_color(t.accent))
                         .child(SharedString::from(format!(
-                            "🤖 子代理 {} · {status}",
+                            "子代理 {} · {status}",
                             subagent.child_session_id.0,
                         )));
                     if let Some(result) = &subagent.result {
                         let head: String = content_text(result).chars().take(160).collect();
-                        row = row.child(div().text_xs().text_color(t.dim).child(head));
+                        row = row.child(div().text_xs().text_color(t.dim).truncate().child(head));
                     }
                     row.into_any_element()
-                }));
-            footer.into_any_element()
+                }))
+                .into_any_element()
         })
         .flex_1()
         .min_h_0()
         .w_full()
-        .max_w(px(ty.content_width + 24.))
+        .max_w(px(ty.content_width + 48.))
         .mx_auto();
 
-        // 消息浮面(Codex MainContentSurface 口径):圆角 16 的浮层托住时间线,
-        // 与四周留 8px 呼吸边;面板色比 bg 提一级,不再通铺到底。
-        // 必须显式 .flex().flex_col():gpui div 默认 display 是 Block,
-        // Block 流里 list 的 flex_1 失效,高度塌缩为 0 → 正文全空。
-        // vertical_scrollbar:滚动条叠在 viewport 右缘,拖拽/滚轮共用 ListState。
         let timeline = div()
             .id("timeline-panel")
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .mx_2()
-            .mt_2()
-            .rounded(px(16.))
-            .bg(t.panel)
-            .border_1()
-            .border_color(t.border)
             .overflow_hidden()
             .vertical_scrollbar(&self.timeline_list)
-            .child(timeline);
+            .child(timeline_list_el)
+            .child(
+                bottom_fade_mask(t.stage, 20.)
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0(),
+            );
 
-        // composer:组件库 Textarea(auto_grow,Enter 提交);受阻原因降为
-        // 输入框下方常驻提示行(占位符固定为输入引导)。
-        let blocked = self.send_block_reason();
-        let composer = div()
-            .mx_3()
-            .mb_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(Textarea::new(&self.composer))
-            .children(blocked.map(|reason| {
-                div().text_xs().text_color(t.warn).child(SharedString::from(reason))
-            }));
-
-        let mut footer = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .border_t_1()
-            .border_color(t.border)
-            .bg(t.panel)
-            .px_3()
-            .py_2();
+        let mut pending_interactions = Vec::new();
         for interaction in self.interactions.clone().iter() {
             if interaction.resolution.is_some() {
                 continue;
@@ -1356,7 +2000,24 @@ impl Render for SessionStore {
                         let call = call.clone();
                         cx.listener(
                             move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(call.clone(), true, false);
+                                store.respond_permission(
+                                    call.clone(),
+                                    true,
+                                    Some(PermissionGrantScope::Once),
+                                );
+                                cx.notify();
+                            },
+                        )
+                    };
+                    let allow_session = {
+                        let call = call.clone();
+                        cx.listener(
+                            move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
+                                store.respond_permission(
+                                    call.clone(),
+                                    true,
+                                    Some(PermissionGrantScope::Session),
+                                );
                                 cx.notify();
                             },
                         )
@@ -1365,7 +2026,11 @@ impl Render for SessionStore {
                         let call = call.clone();
                         cx.listener(
                             move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(call.clone(), true, true);
+                                store.respond_permission(
+                                    call.clone(),
+                                    true,
+                                    Some(PermissionGrantScope::Persistent),
+                                );
                                 cx.notify();
                             },
                         )
@@ -1374,61 +2039,144 @@ impl Render for SessionStore {
                         let call = call.clone();
                         cx.listener(
                             move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(call.clone(), false, false);
+                                store.respond_permission(call.clone(), false, None);
                                 cx.notify();
                             },
                         )
                     };
                     let uid = interaction.interaction_id.0.clone();
-                    footer = footer.child(interaction_card(
-                        "工具权限",
-                        content_text(&interaction.request),
-                        vec![
-                            action_button(cx, format!("{uid}-allow"), "允许一次", t.ok, allow, &t)
+                    pending_interactions.push(
+                        interaction_card(
+                            "工具权限",
+                            content_text(&interaction.request),
+                            vec![
+                                action_button(
+                                    cx,
+                                    format!("{uid}-allow"),
+                                    "允许一次",
+                                    t.ok,
+                                    allow,
+                                    &t,
+                                )
                                 .into_any_element(),
-                            action_button(cx, format!("{uid}-trust"), "始终允许", t.ok, trust, &t)
+                                action_button(
+                                    cx,
+                                    format!("{uid}-session"),
+                                    "本会话允许",
+                                    t.accent,
+                                    allow_session,
+                                    &t,
+                                )
                                 .into_any_element(),
-                            action_button(cx, format!("{uid}-deny"), "拒绝", t.bad, deny, &t)
+                                action_button(
+                                    cx,
+                                    format!("{uid}-trust"),
+                                    "始终允许",
+                                    t.ok,
+                                    trust,
+                                    &t,
+                                )
                                 .into_any_element(),
-                        ],
-                        Vec::new(),
-                        &t,
-                    ));
-                }
-                InteractionKind::Ask => {
-                    // 应答内容在模态 Dialog 里;footer 只留重开入口。
-                    let entity = cx.entity();
-                    let iid = interaction.interaction_id.clone();
-                    footer = footer.child(
-                        action_button(cx,
-                            format!("ask-open-{}", iid.0),
-                            "回答提问",
-                            t.warn,
-                            move |_, window: &mut Window, cx: &mut gpui::App| {
-                                open_ask_dialog(&entity, iid.clone(), window, cx);
-                            },
+                                action_button(
+                                    cx,
+                                    format!("{uid}-deny"),
+                                    "拒绝",
+                                    t.bad,
+                                    deny,
+                                    &t,
+                                )
+                                .into_any_element(),
+                            ],
+                            Vec::new(),
                             &t,
                         )
                         .into_any_element(),
                     );
                 }
+                InteractionKind::Ask => {
+                    let entity = cx.entity();
+                    let iid = interaction.interaction_id.clone();
+                    pending_interactions.push(
+                        div()
+                            .rounded(px(RADIUS_CARD))
+                            .border_1()
+                            .border_color(soft(t.warn, 0.35))
+                            .bg(t.warn_bg)
+                            .px_3p5()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.warn)
+                                    .child(
+                                        Icon::new(IconName::CircleAlert)
+                                            .with_size(Size::XSmall)
+                                            .text_color(t.warn),
+                                    )
+                                    .child("代理正在等待你回答提问"),
+                            )
+                            .child(
+                                action_button(
+                                    cx,
+                                    format!("ask-open-{}", iid.0),
+                                    "打开提问弹窗",
+                                    t.accent,
+                                    move |_, window: &mut Window, cx: &mut gpui_kit::App| {
+                                        open_ask_dialog(&entity, iid.clone(), window, cx);
+                                    },
+                                    &t,
+                                )
+                                .into_any_element(),
+                            )
+                            .into_any_element(),
+                    );
+                }
             }
         }
-        let conversation = div()
+
+        let interactions_box = (!pending_interactions.is_empty()).then(|| {
+            div()
+                .w_full()
+                .max_w(px(ty.content_width + 48.))
+                .mx_auto()
+                .px_4()
+                .pb_2()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(pending_interactions)
+        });
+
+        let composer = crate::composer::render(self, cx, &t, ty.content_width);
+
+        let conversation = qaqh_gpui_kit::kit::stage_surface(&t)
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
-            .child(header)
-            .child(crate::controls::session_controls(self, cx, &t))
             .children(crate::controls::search(self, cx))
             .child(timeline)
+            .children(provider_retry_banner(self, &t))
             .children(crate::code_panel::review_button(self, &t, cx))
-            .child(composer)
-            .child(crate::controls::composer_tools(self, cx, &t))
-            .child(footer);
-        div().flex().flex_1().min_w_0()
+            .children(interactions_box)
+            .child(composer);
+
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
             .child(conversation)
             .children(crate::code_panel::render(self, &t, &ty, cx))
+            .children(crate::terminal_panel::render(self, &t, &ty, cx))
     }
 }

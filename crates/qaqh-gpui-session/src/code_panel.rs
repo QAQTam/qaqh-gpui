@@ -1,8 +1,13 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use gpui::prelude::*;
-use gpui::{Context, Div, PathPromptOptions, SharedString, div, px};
+use gpui_kit::prelude::*;
+use gpui_kit::{Context, Div, PathPromptOptions, SharedString, div, px};
+use gpui_kit::component::{Icon, Sizable, Size};
+use gpui_kit::assets::IconName;
+use qaqh_gpui_kit::kit::{
+    RADIUS_CHIP, RADIUS_CONTROL, RADIUS_STAGE, shadow_stage, soft,
+};
 use qaqh_ringing_contract::fact::{ContentValue, TurnId};
 use qaqh_ringing_contract::state::ToolCallView;
 
@@ -188,10 +193,11 @@ fn load_location(
 }
 
 fn is_edit(tool: &ToolCallView) -> bool {
-    tool.code_delta.is_some()
+    tool.diff.is_some()
+        || tool.code_delta.is_some()
         || matches!(
             tool.tool_name.as_deref(),
-            Some("write" | "edit" | "apply_patch")
+            Some("write" | "edit" | "apply_patch" | "delete" | "copy_range")
         )
 }
 
@@ -226,13 +232,14 @@ fn parse_diff(text: &str) -> Vec<Patch> {
         else {
             continue;
         };
-        let deleted = new == "/dev/null";
-        let path = if deleted {
+        let deleted_header = new == "/dev/null";
+        let path = if deleted_header {
             old.strip_prefix("a/").unwrap_or(old)
         } else {
             new.strip_prefix("b/").unwrap_or(new)
         };
         let mut rows = Vec::new();
+        let mut saw_new_lines = false;
         while let Some(header) = lines.next_if(|line| line.starts_with("@@ ")) {
             let mut parts = header.split_whitespace().skip(1);
             let Some((mut old, mut old_count)) = parts.next().and_then(|part| range(part, '-'))
@@ -243,6 +250,9 @@ fn parse_diff(text: &str) -> Vec<Patch> {
             else {
                 break;
             };
+            if new_count > 0 {
+                saw_new_lines = true;
+            }
             rows.push(DiffRow {
                 text: header.into(),
                 old: None,
@@ -275,7 +285,7 @@ fn parse_diff(text: &str) -> Vec<Patch> {
         if !rows.is_empty() {
             files.push(Patch {
                 path: path.into(),
-                deleted,
+                deleted: deleted_header || !saw_new_lines,
                 rows,
             });
         }
@@ -300,6 +310,26 @@ mod tests {
         assert_eq!(patches[1].path, "second.rs");
         assert_eq!(patches[1].rows[1].new, Some(1));
     }
+
+    #[test]
+    fn parses_windows_absolute_and_similar_added_deleted_diffs() {
+        let diff = concat!(
+            "--- D:\\Projects\\foo\\a.rs\n",
+            "+++ D:\\Projects\\foo\\a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n+new\n",
+            "--- a/added.rs\n+++ b/added.rs\n@@ -0,0 +1,2 @@\n+one\n+two\n",
+            "--- a/gone.rs\n+++ b/gone.rs\n@@ -1,2 +0,0 @@\n-x\n-y\n",
+        );
+        let patches = parse_diff(diff);
+        assert_eq!(patches.len(), 3);
+        assert_eq!(patches[0].path, "D:\\Projects\\foo\\a.rs");
+        assert!(!patches[0].deleted);
+        assert_eq!(patches[1].path, "added.rs");
+        assert!(!patches[1].deleted);
+        assert_eq!(patches[2].path, "gone.rs");
+        assert!(patches[2].deleted);
+    }
 }
 
 pub fn auto_review(store: &mut SessionStore, turn: TurnId) {
@@ -314,10 +344,18 @@ fn open_review(store: &mut SessionStore, turn: TurnId, explicit: bool) {
         .iter()
         .filter(|tool| tool.turn_id.as_ref() == Some(&turn) && is_edit(tool))
     {
-        match &tool.output {
-            Some(ContentValue::Inline { text }) => patches.extend(patches_from_output(text)),
-            Some(ContentValue::Ref { content_ref }) => references.push(content_ref.clone()),
-            _ => {}
+        if let Some(diff_val) = &tool.diff {
+            match diff_val {
+                ContentValue::Inline { text } => patches.extend(parse_diff(text)),
+                ContentValue::Ref { content_ref } => references.push(content_ref.clone()),
+                ContentValue::Unavailable(_) => {}
+            }
+        } else {
+            match &tool.output {
+                Some(ContentValue::Inline { text }) => patches.extend(patches_from_output(text)),
+                Some(ContentValue::Ref { content_ref }) => references.push(content_ref.clone()),
+                _ => {}
+            }
         }
     }
     if !explicit && patches.is_empty() && references.is_empty() {
@@ -386,17 +424,50 @@ pub fn review_button(
                 removed.saturating_add(delta.lines_removed),
             )
         });
+    // git-compare icon 前缀 + 居中悬浮胶囊,置于 Composer 上方。
     Some(
         div()
-            .id("review-latest-turn")
-            .text_xs()
-            .text_color(t.accent)
-            .cursor_pointer()
-            .child(format!("最近一轮改动 · +{added} −{removed}"))
-            .on_click(cx.listener(move |store, _, _, cx| {
-                open_review(store, turn.clone(), true);
-                cx.notify();
-            })),
+            .flex()
+            .justify_center()
+            .pb_1p5()
+            .child(
+                div()
+                    .id("review-latest-turn")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_full()
+                    .bg(t.surface_subtle)
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(t.hover))
+                    .child(
+                        Icon::new(IconName::GitCompare)
+                            .with_size(Size::XSmall)
+                            .text_color(t.accent),
+                    )
+                    .child(div().text_color(t.text).child("查看本轮代码改动"))
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_color(t.ok)
+                            .child(SharedString::from(format!("+{added}"))),
+                    )
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_color(t.bad)
+                            .child(SharedString::from(format!("−{removed}"))),
+                    )
+                    .on_click(cx.listener(move |store, _, _, cx| {
+                        open_review(store, turn.clone(), true);
+                        cx.notify();
+                    })),
+            ),
     )
 }
 
@@ -453,12 +524,28 @@ pub fn render(
             let files = div()
                 .flex()
                 .flex_wrap()
-                .gap_2()
+                .gap_1p5()
+                .pb_2p5()
                 .children(patches.iter().enumerate().map(|(index, patch)| {
+                    let active = index == *selected;
                     div()
                         .id(("diff-file", index))
+                        .px_2()
+                        .py_1()
+                        .rounded(px(RADIUS_CHIP))
+                        .text_xs()
                         .cursor_pointer()
-                        .text_color(if index == *selected { t.accent } else { t.dim })
+                        .when(active, |el| {
+                            el.bg(t.accent_soft)
+                                .text_color(t.accent)
+                                .border_1()
+                                .border_color(soft(t.accent, 0.28))
+                        })
+                        .when(!active, |el| {
+                            el.bg(t.surface_subtle)
+                                .text_color(t.dim)
+                                .hover(|style| style.bg(t.hover).text_color(t.text))
+                        })
                         .child(patch.path.clone())
                         .on_click(cx.listener(move |store, _, _, cx| {
                             if let Some(View::Diff(review)) = &mut store.code_panel.view {
@@ -471,11 +558,11 @@ pub fn render(
             if let Some(patch) = patches.get(*selected) {
                 body =
                     body.children(patch.rows.iter().enumerate().map(|(index, row)| {
-                        let color = match row.text.as_bytes().first() {
-                            Some(b'+') => t.ok,
-                            Some(b'-') => t.bad,
-                            Some(b'@') => t.accent,
-                            _ => t.text,
+                        let (color, row_bg) = match row.text.as_bytes().first() {
+                            Some(b'+') => (t.ok, Some(soft(t.ok, 0.08))),
+                            Some(b'-') => (t.bad, Some(soft(t.bad, 0.08))),
+                            Some(b'@') => (t.accent, Some(soft(t.accent, 0.07))),
+                            _ => (t.text, None),
                         };
                         let path = PathBuf::from(&patch.path);
                         let line = row.new;
@@ -483,8 +570,11 @@ pub fn render(
                             .id(("diff-line", index))
                             .flex()
                             .gap_2()
+                            .px_1p5()
+                            .rounded(px(4.))
                             .whitespace_nowrap()
                             .text_color(color)
+                            .when_some(row_bg, |el, bg| el.bg(bg))
                             .child(div().w(px(82.)).flex_shrink_0().text_color(t.dim).child(
                                 format!(
                                     "{:>4} {:>4}",
@@ -523,50 +613,100 @@ pub fn render(
     };
     Some(
         div()
-            .w(px(420.))
-            .max_w(gpui::relative(0.55))
+            .ml_2()
+            .w(px(440.))
+            .max_w(gpui_kit::relative(0.50))
+            .h_full()
             .min_h_0()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(t.border)
-            .bg(t.panel)
+            .rounded(px(RADIUS_STAGE))
+            .bg(t.stage)
+            .border_1()
+            .border_color(t.border_subtle)
+            .shadow(shadow_stage(t))
+            .overflow_hidden()
             .child(
                 div()
+                    .h(px(42.))
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .child(div().min_w_0().child(title))
-                    .children(
-                        match view {
-                            View::Source(location, _) => Some(location.clone()),
-                            _ => None,
-                        }
-                        .map(|location| {
-                            div()
-                                .id("choose-source-root")
-                                .cursor_pointer()
-                                .text_color(t.accent)
-                                .child("更换目录")
-                                .on_click(cx.listener(move |store, _, _, cx| {
-                                    load_location(store, location.clone(), true, cx);
-                                }))
-                        }),
+                    .px_3p5()
+                    .bg(t.surface_subtle)
+                    .border_b_1()
+                    .border_color(t.border_subtle)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                Icon::new(IconName::FileCode)
+                                    .with_size(Size::XSmall)
+                                    .text_color(t.accent),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(t.text)
+                                    .child(title),
+                            ),
                     )
                     .child(
                         div()
-                            .id("close-code-panel")
-                            .cursor_pointer()
-                            .child("关闭")
-                            .on_click(cx.listener(|store, _, _, cx| {
-                                store.code_panel.request += 1;
-                                store.code_panel.view = None;
-                                cx.notify();
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .flex_shrink_0()
+                            .children(
+                                match view {
+                                    View::Source(location, _) => Some(location.clone()),
+                                    _ => None,
+                                }
+                                .map(|location| {
+                                    div()
+                                        .id("choose-source-root")
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .bg(t.btn)
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .text_color(t.accent)
+                                        .hover(|style| style.bg(t.btn_hover))
+                                        .child("更换目录")
+                                        .on_click(cx.listener(move |store, _, _, cx| {
+                                            load_location(store, location.clone(), true, cx);
+                                        }))
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .id("close-code-panel")
+                                    .size(px(24.))
+                                    .rounded(px(RADIUS_CHIP))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(t.hover))
+                                    .child(
+                                        Icon::new(IconName::X)
+                                            .with_size(Size::XSmall)
+                                            .text_color(t.dim),
+                                    )
+                                    .on_click(cx.listener(|store, _, _, cx| {
+                                        store.code_panel.request += 1;
+                                        store.code_panel.view = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -580,7 +720,7 @@ pub fn render(
                     .min_h_0()
                     .flex_1()
                     .overflow_scroll()
-                    .p_3()
+                    .p_3p5()
                     .font_family("monospace")
                     .text_size(px(ty.code_font_size))
                     .child(body),

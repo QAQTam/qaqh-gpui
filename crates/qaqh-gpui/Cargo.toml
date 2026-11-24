@@ -44,10 +44,7 @@ qaqh-gpui-kit = { workspace = true }
 qaqh-gpui-session = { workspace = true }
 qaqh-gpui-shell = { workspace = true }
 futures = { workspace = true }
-gpui = { workspace = true }
-gpui_platform = { workspace = true }
-gpui-component = { workspace = true }
-gpui-kit-assets = { workspace = true }
+gpui-kit = { workspace = true }
 qaqh-ringing-contract = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

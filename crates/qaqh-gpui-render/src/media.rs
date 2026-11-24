@@ -1,5 +1,5 @@
 //! Bounded native previews for canonical multimodal image blocks.
-use gpui::{AnyElement, Image, ImageFormat, div, img, prelude::*, px};
+use gpui_kit::{AnyElement, Image, ImageFormat, div, img, prelude::*, px};
 use qaqh_client::ImageBlock;
 use std::{
     cell::RefCell,
@@ -9,8 +9,8 @@ use std::{
 };
 thread_local! { static IMAGES: RefCell<HashMap<u64, Arc<Image>>> = RefCell::default(); }
 
-pub fn preview(block: &ImageBlock) -> AnyElement {
-    let result = IMAGES.with(|images| -> Result<Arc<Image>, String> {
+fn cached_image(block: &ImageBlock) -> Result<Arc<Image>, String> {
+    IMAGES.with(|images| {
         let mut key = std::hash::DefaultHasher::new();
         block.mime_type.hash(&mut key);
         block.data.hash(&mut key);
@@ -36,9 +36,26 @@ pub fn preview(block: &ImageBlock) -> AnyElement {
         }
         images.insert(key, image.clone());
         Ok(image)
-    });
+    })
+}
+
+pub fn preview(block: &ImageBlock) -> AnyElement {
+    let result = cached_image(block);
     match result {
         Ok(image) => img(image).w(px(160.)).h(px(100.)).into_any_element(),
+        Err(error) => div().text_xs().child(error).into_any_element(),
+    }
+}
+
+/// composer 附件缩略:52px 方图裁切;移除交互由调用方包层挂 on_click。
+pub fn thumb(block: &ImageBlock) -> AnyElement {
+    match cached_image(block) {
+        Ok(image) => img(image)
+            .w(px(52.))
+            .h(px(52.))
+            .rounded(px(8.))
+            .object_fit(gpui_kit::ObjectFit::Cover)
+            .into_any_element(),
         Err(error) => div().text_xs().child(error).into_any_element(),
     }
 }

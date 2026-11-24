@@ -11,23 +11,23 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui::prelude::*;
-use gpui::AnyElement;
-use gpui::App;
-use gpui::ClipboardItem;
-use gpui::ElementId;
-use gpui::FontStyle;
-use gpui::FontWeight;
-use gpui::HighlightStyle;
-use gpui::InteractiveElement;
-use gpui::SharedString;
-use gpui::StrikethroughStyle;
-use gpui::Styled;
-use gpui::StyledText;
-use gpui::UnderlineStyle;
-use gpui::div;
-use gpui::px;
-use gpui::relative;
+use gpui_kit::prelude::*;
+use gpui_kit::AnyElement;
+use gpui_kit::App;
+use gpui_kit::ClipboardItem;
+use gpui_kit::ElementId;
+use gpui_kit::FontStyle;
+use gpui_kit::FontWeight;
+use gpui_kit::HighlightStyle;
+use gpui_kit::InteractiveElement;
+use gpui_kit::SharedString;
+use gpui_kit::StrikethroughStyle;
+use gpui_kit::Styled;
+use gpui_kit::StyledText;
+use gpui_kit::UnderlineStyle;
+use gpui_kit::div;
+use gpui_kit::px;
+use gpui_kit::relative;
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
@@ -36,6 +36,9 @@ use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
 
+use gpui_kit::component::{Icon, Sizable, Size};
+use gpui_kit::assets::IconName;
+use qaqh_gpui_kit::kit::{RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, soft};
 use qaqh_gpui_kit::settings::Typography;
 use qaqh_gpui_kit::theme::Palette;
 
@@ -543,7 +546,7 @@ pub fn render_blocks(
     section: usize,
     t: &Palette,
     ty: &Typography,
-    session: &gpui::Entity<crate::store::SessionStore>,
+    session: &gpui_kit::Entity<crate::store::SessionStore>,
 ) -> Vec<AnyElement> {
     blocks
         .iter()
@@ -556,7 +559,7 @@ fn render_block(
     section: usize,
     t: &Palette,
     ty: &Typography,
-    session: &gpui::Entity<crate::store::SessionStore>,
+    session: &gpui_kit::Entity<crate::store::SessionStore>,
 ) -> AnyElement {
     let mut inline_index = 0usize;
     let mut styled = |runs: &[MdRun], text: &str, t: &Palette| {
@@ -591,7 +594,7 @@ fn render_block(
             }),
         );
         let session = session.downgrade();
-        gpui::InteractiveText::new(("source-link", inline_index), text)
+        gpui_kit::InteractiveText::new(("source-link", inline_index), text)
             .on_click(ranges, move |index, _, cx| {
                 let _ = session.update(cx, |store, cx| {
                     crate::code_panel::open_source(store, targets[index].clone(), cx);
@@ -602,50 +605,67 @@ fn render_block(
     match &block.kind {
         MdBlockKind::Rule => div()
             .id(block_id(section, block.offset))
-            .my_2()
+            .my_3()
             .h(px(1.))
             .w_full()
-            .bg(t.border)
+            .bg(t.border_subtle)
             .into_any_element(),
         MdBlockKind::Heading { level, text, runs } => {
             let mut heading = div()
                 .id(block_id(section, block.offset))
-                .mt_2()
-                .mb_1()
-                .font_weight(FontWeight::BOLD)
+                .text_color(t.text)
                 .line_height(relative(ty.prose_line_height));
             if *level == 1 {
-                heading = heading.text_base();
+                heading = heading.mt_4().mb_1p5().text_xl().font_weight(FontWeight::BOLD);
             } else if *level == 2 {
-                heading = heading.text_lg();
+                heading = heading.mt_3().mb_1().text_lg().font_weight(FontWeight::SEMIBOLD);
+            } else if *level == 3 {
+                heading = heading.mt_2p5().mb_1().text_base().font_weight(FontWeight::SEMIBOLD);
             } else {
-                heading = heading.text_sm();
+                heading = heading.mt_2().mb_0p5().text_sm().font_weight(FontWeight::MEDIUM);
             }
             heading.child(styled(runs, text, t)).into_any_element()
         }
         MdBlockKind::Paragraph { text, runs } => div()
             .id(block_id(section, block.offset))
             .text_sm()
+            .text_color(t.text)
             .line_height(relative(ty.prose_line_height))
             .child(styled(runs, text, t))
             .into_any_element(),
         MdBlockKind::Quote { text, runs } => div()
             .id(block_id(section, block.offset))
-            .my_1p5()
-            .pl_3()
-            .py_1()
-            .border_l_2()
-            .border_color(t.border)
-            .text_sm()
-            .text_color(t.dim)
-            .line_height(relative(ty.prose_line_height))
-            .child(styled(runs, text, t))
+            .my_2()
+            .flex()
+            .gap_2p5()
+            .px_3()
+            .py_2()
+            .rounded(px(RADIUS_CONTROL))
+            .bg(t.surface_subtle)
+            .border_1()
+            .border_color(t.border_subtle)
+            .child(
+                div()
+                    .w(px(3.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(soft(t.accent, 0.55)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(t.dim)
+                    .line_height(relative(ty.prose_line_height))
+                    .child(styled(runs, text, t)),
+            )
             .into_any_element(),
         MdBlockKind::List { items } => div()
             .id(block_id(section, block.offset))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_1p5()
             .children(items.iter().map(|(number, text, runs)| {
                 let marker = number
                     .map(|n| SharedString::from(format!("{n}.")))
@@ -654,14 +674,20 @@ fn render_block(
                     .flex()
                     .gap_2()
                     .text_sm()
+                    .text_color(t.text)
                     .line_height(relative(ty.prose_line_height))
-                    .child(div().text_color(t.dim).child(marker))
-                    .child(div().flex_1().child(styled(runs, text, t)))
+                    .child(
+                        div()
+                            .min_w(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.dim)
+                            .child(marker),
+                    )
+                    .child(div().flex_1().min_w_0().child(styled(runs, text, t)))
             }))
             .into_any_element(),
         MdBlockKind::Table { columns, rows } => {
-            // 行包进横向滚动容器(与代码块同法):宽表不裁切,可横向滚动;
-            // 单元格去掉 min_w_0,列宽随内容下限扩张,超出容器即触发滚动。
+            // 行包进横向滚动容器(与代码块同法):宽表不裁切,可横向滚动。
             let mut body = div()
                 .id(("mdtable-content", section * 1_000_003 + block.offset))
                 .overflow_x_scroll()
@@ -670,20 +696,26 @@ fn render_block(
             for (index, row) in rows.iter().enumerate() {
                 let mut row_div = div().grid().grid_cols(columns.len() as u16).text_xs();
                 if index == 0 {
-                    row_div = row_div.font_weight(FontWeight::BOLD).bg(t.code_bg);
+                    row_div = row_div
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.text)
+                        .bg(t.surface_subtle);
                 } else {
-                    row_div = row_div.border_t_1().border_color(t.border);
+                    row_div = row_div
+                        .text_color(t.text)
+                        .border_t_1()
+                        .border_color(t.border_subtle);
                 }
                 body = body.child(row_div.children(row.iter().zip(columns).enumerate().map(
                     |(column, ((text, runs), alignment))| {
-                        let cell = div().px_2().py_1();
+                        let cell = div().px_3().py_1p5();
                         let cell = match alignment {
                             Alignment::Center => cell.text_center(),
                             Alignment::Right => cell.text_right(),
                             _ => cell.text_left(),
                         };
                         let cell = if column > 0 {
-                            cell.border_l_1().border_color(t.border)
+                            cell.border_l_1().border_color(t.border_subtle)
                         } else {
                             cell
                         };
@@ -693,12 +725,13 @@ fn render_block(
             }
             div()
                 .id(block_id(section, block.offset))
-                .my_1p5()
+                .my_2()
                 .flex()
                 .flex_col()
-                .rounded_md()
+                .rounded(px(RADIUS_CARD))
                 .border_1()
-                .border_color(t.border)
+                .border_color(t.border_subtle)
+                .bg(t.card)
                 .overflow_hidden()
                 .child(body)
                 .into_any_element()
@@ -706,61 +739,70 @@ fn render_block(
         MdBlockKind::Code { lang, code } => {
             let mut card = div()
                 .id(block_id(section, block.offset))
-                .my_1p5()
+                .my_2()
                 .flex()
                 .flex_col()
-                .rounded_md()
+                .rounded(px(RADIUS_CARD))
                 .border_1()
-                .border_color(t.border)
+                .border_color(t.border_subtle)
                 .bg(t.code_bg)
                 .overflow_hidden();
-            // 头部栏:语言标签 + 复制(electron md-code-block 头栏模式)。
             let copy_code: SharedString = code.clone().into();
-            let mut header = div()
+            let header = div()
                 .flex()
                 .items_center()
                 .justify_between()
                 .px_3()
-                .pt_1p5();
-            header = match lang {
-                Some(lang) => header.child(
+                .py_1p5()
+                .bg(t.surface_subtle)
+                .border_b_1()
+                .border_color(t.border_subtle)
+                .child(
                     div()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded(px(RADIUS_CHIP))
+                        .bg(t.btn)
+                        .font_family("monospace")
                         .text_xs()
                         .text_color(t.dim)
-                        .child(lang.clone()),
-                ),
-                None => header.child(div()),
-            };
-            card = card
-                .child(header.child(
+                        .child(lang.clone().unwrap_or_else(|| "text".into())),
+                )
+                .child(
                     div()
                         .id(("mdcopy", section * 1_000_003 + block.offset))
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .px_2()
                         .py_0p5()
-                        .rounded_sm()
+                        .rounded(px(RADIUS_CHIP))
                         .text_xs()
                         .cursor_pointer()
-                        .bg(t.btn)
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.border_subtle)
                         .text_color(t.dim)
-                        .hover(|style| style.bg(t.btn_hover))
+                        .hover(|style| style.bg(t.hover).text_color(t.text))
                         .on_click(move |_, _, cx: &mut App| {
                             cx.write_to_clipboard(ClipboardItem::new_string(
                                 copy_code.clone().into(),
                             ));
                         })
+                        .child(Icon::new(IconName::Copy).with_size(Size::XSmall).text_color(t.dim))
                         .child("复制"),
-                ))
-                .child(
-                    div()
-                        .id(("mdcode-content", section * 1_000_003 + block.offset))
-                        .px_3()
-                        .py_2()
-                        .font_family("monospace")
-                        .text_size(px(ty.code_font_size))
-                        .line_height(relative(ty.prose_line_height))
-                        .overflow_x_scroll()
-                        .child(qaqh_gpui_render::highlight::code_text(code, lang.as_deref(), t)),
                 );
+            card = card.child(header).child(
+                div()
+                    .id(("mdcode-content", section * 1_000_003 + block.offset))
+                    .px_3p5()
+                    .py_2p5()
+                    .font_family("monospace")
+                    .text_size(px(ty.code_font_size))
+                    .line_height(relative(ty.prose_line_height))
+                    .overflow_x_scroll()
+                    .child(qaqh_gpui_render::highlight::code_text(code, lang.as_deref(), t)),
+            );
             card.into_any_element()
         }
         MdBlockKind::Widget { path, title } => {
@@ -772,26 +814,41 @@ fn render_block(
             });
             let mut card = div()
                 .id(block_id(section, block.offset))
-                .my_1p5()
+                .my_2()
                 .flex()
                 .flex_col()
-                .gap_1p5()
-                .px_3()
-                .py_2p5()
-                .rounded(px(qaqh_gpui_kit::kit::RADIUS_CARD))
+                .gap_2()
+                .px_3p5()
+                .py_3()
+                .rounded(px(RADIUS_CARD))
                 .border_1()
-                .border_color(t.border)
+                .border_color(t.border_subtle)
                 .bg(t.card)
+                .shadow(shadow_card(t))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap_1p5()
-                        .child(div().text_sm().text_color(t.accent).child("◈"))
+                        .gap_2()
+                        .child(
+                            div()
+                                .size(px(24.))
+                                .rounded(px(RADIUS_CHIP))
+                                .bg(t.accent_soft)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::Sparkles)
+                                        .with_size(Size::XSmall)
+                                        .text_color(t.accent),
+                                ),
+                        )
                         .child(
                             div()
                                 .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text)
                                 .truncate()
                                 .child(SharedString::from(label)),
                         ),
@@ -812,15 +869,20 @@ fn render_block(
                 card = card.child(
                     div()
                         .id(("widget-open", section * 1_000_003 + block.offset))
+                        .self_start()
+                        .px_2p5()
+                        .py_1()
+                        .rounded(px(RADIUS_CHIP))
+                        .bg(t.accent_soft)
                         .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(t.accent)
                         .cursor_pointer()
-                        .hover(|style| style.bg(t.hover))
-                        .rounded_sm()
+                        .hover(|style| style.bg(t.accent_bg))
                         .on_click(move |_, _, cx: &mut App| {
                             cx.open_url(&url);
                         })
-                        .child("在浏览器打开 →"),
+                        .child("在浏览器中打开 →"),
                 );
             }
             card.into_any_element()

@@ -5,6 +5,9 @@
 
 pub mod daemon;
 pub mod desktop;
+pub mod pages;
 pub mod settings_ui;
+pub mod shell_panel;
 pub mod sidebar;
+pub mod titlebar;
 pub mod views;

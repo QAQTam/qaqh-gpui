@@ -3,19 +3,18 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use gpui::App;
-use gpui::AppContext as _;
-use gpui::Bounds;
-use gpui::Entity;
-use gpui::Render;
-use gpui::TitlebarOptions;
-use gpui::Window;
-use gpui::WindowBounds;
-use gpui::WindowOptions;
-use gpui::div;
-use gpui::prelude::*;
-use gpui::px;
-use gpui::size;
+use gpui_kit::App;
+use gpui_kit::AppContext as _;
+use gpui_kit::Bounds;
+use gpui_kit::Entity;
+use gpui_kit::Render;
+use gpui_kit::Window;
+use gpui_kit::WindowBackgroundAppearance;
+use gpui_kit::WindowBounds;
+use gpui_kit::div;
+use gpui_kit::prelude::*;
+use gpui_kit::px;
+use gpui_kit::size;
 
 use qaqh_gpui_wire::bridge;
 use qaqh_gpui_wire::bridge::BridgeMsg;
@@ -27,7 +26,7 @@ struct RootShell {
 }
 
 impl Render for RootShell {
-    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
         let bounds = window.bounds();
         self.daemon.update(cx, |daemon, _| {
             daemon.workbench.window = Some([f32::from(bounds.origin.x), f32::from(bounds.origin.y), f32::from(bounds.size.width), f32::from(bounds.size.height)]);
@@ -38,14 +37,16 @@ impl Render for RootShell {
 }
 
 pub fn launch() {
-    gpui_platform::application()
-        .with_assets(gpui_kit_assets::Assets)
+    gpui_kit::application()
+        // Assets 仅含组件库最小子集(约 60 个),会导致业务侧图标静默空白;
+        // AllAssets 内嵌全部 1,831 个 Lucide SVG(~749 KB),保证全仓 IconName 完整渲染。
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
         cx.set_app_identity("io.github.QAQTam.QAQHarness", "QAQHarness");
         // 顺序:settings 先于 theme(theme::init 读设置的主题模式);
-        // gpui_component::init 建组件库全局(Theme/输入法/弹出层),theme::init 随后映射品牌色。
+        // gpui_kit::init 建组件库全局(Theme/输入法/弹出层),theme::init 随后映射品牌色。
         qaqh_gpui_kit::settings::init(cx);
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         qaqh_gpui_kit::theme::init(cx);
         let (to_ui, mut from_bridge) = futures::channel::mpsc::unbounded::<BridgeMsg>();
         let (request_tx, request_rx) = futures::channel::mpsc::unbounded::<BridgeRequest>();
@@ -56,19 +57,23 @@ pub fn launch() {
             Err(error) => (Default::default(), Some(format!("工作状态读取失败：{error}"))),
         };
         let bounds = workbench.window.map(|b| Bounds {
-            origin: gpui::point(px(b[0]), px(b[1])), size: size(px(b[2]), px(b[3])),
-        }).unwrap_or_else(|| Bounds::centered(None, size(px(1100.), px(720.)), cx));
+            origin: gpui_kit::point(px(b[0]), px(b[1])), size: size(px(b[2]), px(b[3])),
+        }).unwrap_or_else(|| Bounds::centered(None, size(px(1240.), px(780.)), cx));
         let maximized = workbench.maximized;
+        let mut window_options = gpui_kit::component::TitleBar::window_options();
+        window_options.window_bounds = Some(if maximized {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        });
+        window_options.window_min_size = Some(size(px(860.), px(560.)));
+        window_options.window_background = WindowBackgroundAppearance::MicaBackdrop;
+        if let Some(titlebar) = window_options.titlebar.as_mut() {
+            titlebar.title = Some("QAQ Harness".into());
+        }
         let daemon_slot = std::cell::RefCell::new(None);
         let window_handle = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(if maximized { WindowBounds::Maximized(bounds) } else { WindowBounds::Windowed(bounds) }),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("QAQ Harness".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            window_options,
             |window, cx| {
                 window.set_app_id("io.github.QAQTam.QAQHarness");
                 let daemon = cx.new(|cx| DaemonStore::new(request_tx, workbench, load_error, window, cx));
@@ -94,7 +99,7 @@ pub fn launch() {
                     // Root(gpui-base)承载组件库的 popover/menu/notification 窗口级层;
                     // RootShell 作为内容视图,保留原有的窗口几何记账。
                     let shell: Entity<RootShell> = cx.new(|_cx| RootShell { daemon: daemon.clone() });
-                    gpui_component::Root::new(shell, window, cx)
+                    gpui_kit::base::Root::new(shell, window, cx)
                 })
             },
         )
@@ -112,7 +117,9 @@ pub fn launch() {
                 let seed = seed.to_string();
                 let _ = notify_window.update(cx, |_, window, cx| {
                     notifications.update(cx, |daemon, cx| {
-                        daemon.settings_open = false; daemon.new_session_open = false;
+                        daemon.section = qaqh_gpui_shell::daemon::PrimarySection::Home;
+                        daemon.settings_open = false;
+                        daemon.new_session_open = false;
                         daemon.select(seed, window, cx);
                     });
                     cx.activate(true);
@@ -132,8 +139,9 @@ pub fn launch() {
                         #[cfg(feature = "acceptance")]
                         crate::acceptance::poll(daemon, _window, cx);
                         daemon.persist(cx);
-                        // 浏览器登录流程:2s 轮询 sign_in.status 至终态。
+                        // 浏览器登录流程:2s 轮询 sign_in.status 至终态;团队页可见时低频轮询。
                         daemon.poll_sign_in();
+                        daemon.poll_team_page();
                         for store in &daemon.stores {
                             let store = store.read(cx);
                             if store.snapshot_pending && matches!(store.stream, qaqh_gpui_session::store::StreamState::Open) {

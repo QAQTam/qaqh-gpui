@@ -1,68 +1,123 @@
-//! 视觉原语层(设计系统 M1):圆角/卡片/按钮分级/状态 pill/分段控件/键帽。
-//! 全部 UI 经此拼装,不再就地手搓 div 样式——半径、面层、悬停态在这里收口。
-//! 语言参照 zed:面层对比撑层级,hairline 只做收口,accent 只给主操作。
+//! 视觉原语层(DESIGN LAW v2.0):七档圆角梯级 / 四级光学阴影 / 舞台岛 / 卡片 / 胶囊 / 分段控件。
 
-use gpui::prelude::*;
-use gpui::AnyElement;
-use gpui::ClickEvent;
-use gpui::Div;
-use gpui::Hsla;
-use gpui::InteractiveElement;
-use gpui::IntoElement;
-use gpui::SharedString;
-use gpui::StatefulInteractiveElement;
-use gpui::Styled;
-use gpui::Window;
-use gpui::div;
-use gpui::px;
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_component::{Sizable, Size};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, BoxShadow, ClickEvent, Div, FontWeight, Hsla, InteractiveElement, IntoElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants};
+use gpui_kit::component::{Sizable, Size};
 
 use crate::theme::Palette;
 
-/// 半径 token:控件 < 卡片 < 气泡;pill 用全圆。
-pub const RADIUS_CONTROL: f32 = 7.0;
-pub const RADIUS_CARD: f32 = 10.0;
-pub const RADIUS_BUBBLE: f32 = 12.0;
+/// 圆角体系(v2.0):温润连续圆角梯级。
+pub const RADIUS_STAGE: f32 = 18.0;
+pub const RADIUS_COMPOSER: f32 = 18.0;
+pub const RADIUS_BUBBLE: f32 = 16.0;
+pub const RADIUS_CARD: f32 = 14.0;
+pub const RADIUS_POPOVER: f32 = 12.0;
+pub const RADIUS_CONTROL: f32 = 10.0;
+pub const RADIUS_CHIP: f32 = 8.0;
 
-/// 同色相透明变体:选中软底/悬停软底/危险软底共用。
+/// 同色相透明变体。
 pub fn soft(color: Hsla, alpha: f32) -> Hsla {
-    Hsla {
-        a: alpha,
-        ..color
-    }
+    Hsla { a: alpha, ..color }
 }
 
-/// 卡片容器:中圆角 + card 面层 + hairline 收口。层级交给面层,不叠阴影。
+/// L1 悬浮舞台岛投影(轻柔层次影 + 顶部镜面内高光线)。
+pub fn shadow_stage(t: &Palette) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow::new(px(0.), px(4.), t.shadow_ink)
+            .blur_radius(px(14.))
+            .spread_radius(px(-4.)),
+        BoxShadow::new(px(0.), px(1.), soft(t.shadow_ink, t.shadow_ink.a * 0.7))
+            .blur_radius(px(3.)),
+        BoxShadow::new(px(0.), px(1.), t.specular).inset(),
+    ]
+}
+
+/// 悬浮 Composer 投影;active(运行中/聚焦态)时叠加柔和中性外环。
+pub fn shadow_composer(t: &Palette, active: bool) -> Vec<BoxShadow> {
+    let mut shadows = vec![
+        BoxShadow::new(px(0.), px(6.), t.shadow_ink)
+            .blur_radius(px(16.))
+            .spread_radius(px(-6.)),
+        BoxShadow::new(px(0.), px(1.), soft(t.shadow_ink, t.shadow_ink.a * 0.6))
+            .blur_radius(px(4.)),
+    ];
+    if active {
+        shadows.push(
+            BoxShadow::new(px(0.), px(0.), soft(t.accent, 0.22))
+                .blur_radius(px(0.))
+                .spread_radius(px(1.5)),
+        );
+    }
+    shadows
+}
+
+/// L2 卡片/选中胶囊微抬升投影。
+pub fn shadow_card(t: &Palette) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow::new(px(0.), px(1.), soft(t.shadow_ink, t.shadow_ink.a * 0.75))
+            .blur_radius(px(5.))
+            .spread_radius(px(-2.)),
+        BoxShadow::new(px(0.), px(1.), t.specular).inset(),
+    ]
+}
+
+/// L3 浮层 Popover / 模态窗 / 右键菜单投影。
+pub fn shadow_popover(t: &Palette) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow::new(px(0.), px(10.), t.shadow_ink)
+            .blur_radius(px(22.))
+            .spread_radius(px(-4.)),
+        BoxShadow::new(px(0.), px(2.), soft(t.shadow_ink, t.shadow_ink.a * 0.8))
+            .blur_radius(px(6.)),
+    ]
+}
+
+/// L1 悬浮圆角舞台岛(主对话 / Inspector / 代码 / 终端岛共用)。
+pub fn stage_surface(t: &Palette) -> Div {
+    div()
+        .rounded(px(RADIUS_STAGE))
+        .bg(t.stage)
+        .border_1()
+        .border_color(t.border_subtle)
+        .shadow(shadow_stage(t))
+        .overflow_hidden()
+}
+
+/// L2 圆角卡片容器。
 pub fn card(t: &Palette) -> Div {
     div()
         .rounded(px(RADIUS_CARD))
         .bg(t.card)
         .border_1()
-        .border_color(t.border)
+        .border_color(t.border_subtle)
+        .shadow(shadow_card(t))
 }
 
-/// 带 padding 的内容卡。
+/// 带舒适内边距的内容卡。
 pub fn card_padded(t: &Palette) -> Div {
-    card(t).p_3()
+    card(t).p_4()
 }
 
-/// 小节标题:大写感由字重与色阶承担(dim,medium)。
+/// 小节标题:清晰可读的字重与次级色阶。
 pub fn section_label(label: &str, t: &Palette) -> Div {
     div()
         .text_xs()
-        .font_weight(gpui::FontWeight::MEDIUM)
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.dim)
         .child(SharedString::from(label.to_owned()))
 }
 
-/// 状态 pill:彩点 + 文字 + 软底全圆。连接态/流态/活动态共用。
+/// 状态 pill:彩点 + 文字 + 柔和全圆胶囊。
 pub fn pill(label: &str, color: Hsla, _t: &Palette) -> Div {
     div()
         .flex()
         .items_center()
         .gap_1p5()
-        .px_2()
+        .px_2p5()
         .py_0p5()
         .rounded_full()
         .bg(soft(color, 0.12))
@@ -70,29 +125,33 @@ pub fn pill(label: &str, color: Hsla, _t: &Palette) -> Div {
         .child(
             div()
                 .text_xs()
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(color)
                 .child(SharedString::from(label.to_owned())),
         )
 }
 
-/// 幽灵 chip:透明底,hover 面层浮现;active 态软底 accent。次级动作/头部胶囊统一走它。
+/// 幽灵 chip:透明底,hover 面层浮现;active 态软底 accent。
 pub fn ghost_chip(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     active: bool,
     tone: Hsla,
     t: &Palette,
-    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> gpui::Stateful<Div> {
+    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> gpui_kit::Stateful<Div> {
     div()
         .id(id.into())
-        .px_2()
-        .py_0p5()
-        .rounded(px(RADIUS_CONTROL))
+        .px_2p5()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
         .text_xs()
+        .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .when(active, |chip| chip.bg(t.accent_bg).text_color(t.accent))
-        .when(!active, |chip| chip.text_color(tone).hover(|style| style.bg(t.hover)))
+        .when(active, |chip| chip.bg(t.accent_soft).text_color(t.accent))
+        .when(!active, |chip| {
+            chip.text_color(tone).hover(|style| style.bg(t.hover))
+        })
         .on_click(listener)
         .child(label.into())
 }
@@ -106,31 +165,38 @@ pub enum BtnKind {
     Danger,
 }
 
-/// 统一按钮入口(gpui-component Button 承担焦点/按压/禁用态)。
-/// Primary/Danger 用库内建实底变体(色值经 theme::sync_component_theme 映射);
-/// Custom 变体背景被库按 20% 淡化,只适合 Ghost/Soft 这类"软底"语义。
+/// 统一圆角按钮入口(gpui-component Button 承担焦点/按压/禁用态)。
 pub fn button(
-    cx: &gpui::App,
+    cx: &gpui_kit::App,
     kind: BtnKind,
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     t: &Palette,
-    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
-    let button = Button::new(id.into()).with_size(Size::Small).label(label);
+    let button = Button::new(id.into())
+        .with_size(Size::Small)
+        .rounded(ButtonRounded::Size(px(RADIUS_CONTROL)))
+        .label(label);
     let button = match kind {
         BtnKind::Primary => button.primary(),
-        BtnKind::Danger => button.danger(),
+        BtnKind::Danger => button.custom(
+            ButtonCustomVariant::new(cx)
+                .color(soft(t.bad, 0.08))
+                .foreground(t.bad)
+                .hover(soft(t.bad, 0.14))
+                .active(soft(t.bad, 0.18)),
+        ),
         BtnKind::Soft => button.custom(
             ButtonCustomVariant::new(cx)
-                .color(t.accent_bg)
-                .foreground(t.accent)
+                .color(t.btn)
+                .foreground(t.text)
                 .hover(t.btn_hover)
                 .active(t.btn_hover),
         ),
         BtnKind::Ghost => button.custom(
             ButtonCustomVariant::new(cx)
-                .color(gpui::transparent_black())
+                .color(gpui_kit::transparent_black())
                 .foreground(t.dim)
                 .hover(t.hover)
                 .active(t.hover),
@@ -143,61 +209,91 @@ pub fn button(
 pub fn kbd(key: &str, t: &Palette) -> Div {
     div()
         .px_1p5()
-        .py(px(1.))
-        .rounded(px(5.0))
-        .bg(t.btn)
+        .py(px(2.))
+        .rounded(px(RADIUS_CHIP))
+        .bg(t.surface_subtle)
         .border_1()
-        .border_color(t.border)
+        .border_color(t.border_subtle)
         .text_xs()
         .text_color(t.dim)
         .child(SharedString::from(key.to_owned()))
 }
 
-/// 空状态/欢迎 hero:居中卡片,glyph + 标题 + 描述 + 内容由调用方追加。
+/// 空状态/欢迎 hero:居中圆角舞台卡。
 pub fn hero(t: &Palette) -> Div {
-    card_padded(t)
-        .w(px(460.))
-        .py(px(36.))
+    card(t)
+        .w(px(520.))
+        .p(px(32.))
         .flex()
         .flex_col()
         .items_center()
-        .gap_3()
+        .gap_4()
 }
 
-/// 分段控件容器:整体一块圆角面层,选中项浮起为 card 面 + accent 文字。
-/// 子项用 [`segmented_item`] 构造。
+/// 相对时间(≤3 字档)。输入为 Unix 秒。
+pub fn relative_time(updated_secs: u64) -> SharedString {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let delta = now.saturating_sub(updated_secs);
+    if delta < 60 {
+        "刚刚".into()
+    } else if delta < 3600 {
+        SharedString::from(format!("{}分", delta / 60))
+    } else if delta < 86_400 {
+        SharedString::from(format!("{}时", delta / 3600))
+    } else if delta < 30 * 86_400 {
+        SharedString::from(format!("{}天", delta / 86_400))
+    } else if delta < 365 * 86_400 {
+        SharedString::from(format!("{}月", delta / (30 * 86_400)))
+    } else {
+        SharedString::from(format!("{}年+", delta / (365 * 86_400)))
+    }
+}
+
+/// 分段控件容器:柔和中性底槽 + 选中项白卡微抬起。
 pub fn segmented_strip(items: Vec<AnyElement>, t: &Palette) -> Div {
     div()
         .flex()
         .flex_wrap()
-        .gap_0p5()
-        .p(px(3.))
-        .rounded(px(RADIUS_CONTROL + 2.))
-        .bg(soft(t.faint, if t.bg.l > 0.5 { 0.14 } else { 0.10 }))
+        .gap(px(2.))
+        .p(px(2.))
+        .rounded(px(RADIUS_CONTROL))
+        .bg(t.surface_subtle)
+        .border_1()
+        .border_color(t.border_subtle)
         .children(items)
 }
 
-/// 分段控件子项:active = card 面浮起 + accent 文字;inactive = 透明 + dim。
+/// 分段控件子项:active = card 面浮起 + 微影 + 中性正文色;inactive = 透明 + dim。
 pub fn segmented_item(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     active: bool,
     t: &Palette,
-    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
     div()
         .id(id.into())
         .px_2p5()
         .py_1()
-        .rounded(px(RADIUS_CONTROL))
+        .rounded(px(RADIUS_CHIP))
         .text_xs()
+        .font_weight(if active {
+            FontWeight::MEDIUM
+        } else {
+            FontWeight::NORMAL
+        })
         .cursor_pointer()
         .when(active, |item| {
-            item.bg(t.card).text_color(t.accent)
+            item.bg(t.card)
+                .text_color(t.text)
+                .shadow(shadow_card(t))
         })
         .when(!active, |item| {
             item.text_color(t.dim)
-                .hover(|style| style.bg(t.card_hover).text_color(t.text))
+                .hover(|style| style.bg(t.hover).text_color(t.text))
         })
         .on_click(listener)
         .child(label.into())

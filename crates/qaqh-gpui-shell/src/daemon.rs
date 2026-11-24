@@ -3,27 +3,29 @@
 //! gpui-component 的 InputState/TextareaState(InputState::new 需要
 //! &mut Window,故实体构造一律在窗口上下文内完成)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
-use gpui::AppContext as _;
-use gpui::Context;
-use gpui::Entity;
-use gpui::Window;
+use gpui_kit::AppContext as _;
+use gpui_kit::Context;
+use gpui_kit::Entity;
+use gpui_kit::Window;
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::fact::ActivityState;
 use qaqh_ringing_contract::fact::InteractionKind;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
-use qaqh_gpui_wire::bridge::BridgeMsg;
-use qaqh_gpui_wire::bridge::BridgeRequest;
-use gpui_component::input::{InputEvent, InputState};
-use gpui_component::WindowExt;
+use qaqh_gpui_wire::bridge::{
+    BridgeMsg, BridgeRequest, ProviderPresetView, ShellInfo, SkillsScanReport,
+};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::WindowExt;
 use qaqh_config_api::ConfigDto;
 use qaqh_profile::ProfilesDocument;
 use qaqh_types::ModelSelection;
 use qaqh_gpui_session::store::{SessionStore, SessionRow, TodoRow, SettingsEditor, AccountService, AccountSignIn, StreamState, rows_from, todos_from, model_options_from};
+use crate::shell_panel::ShellTabState;
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -39,6 +41,51 @@ fn decode<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|error| format!("{method} 响应解析失败:{error}"))
 }
 
+/// 右侧 Inspector 页签(会话概览 / 任务清单 / 团队协作板)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InspectorTab {
+    #[default]
+    Overview,
+    Tasks,
+    Team,
+}
+
+/// 主导航分区(对齐 Overcoder v5.0: 主页 / 工具 / 团队 / 接入)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrimarySection {
+    #[default]
+    Home,
+    Tools,
+    Team,
+    Access,
+}
+
+/// 「工具」页子分栏(Skills / MCP & LSP)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolsTab {
+    #[default]
+    Skills,
+    Mcp,
+}
+
+/// 全局策略页行内输入框实体集合:改完回车或点应用即写 daemon,告别整页切表单。
+pub struct GlobalConfigInputs {
+    pub tool_allowlist: Entity<InputState>,
+    pub auto_compact: Entity<InputState>,
+    pub idle_unload: Entity<InputState>,
+    pub default_shell: Entity<InputState>,
+    pub goal_budget: Entity<InputState>,
+    pub seeded: bool,
+}
+
+/// 会话右键菜单状态:目标会话 + 打开位置;删除走二段确认。
+pub struct SessionCtxMenu {
+    pub session_id: String,
+    pub archived: bool,
+    pub position: gpui_kit::Point<gpui_kit::Pixels>,
+    pub confirm_delete: bool,
+}
+
 pub struct DaemonStore {
     pub last_operation: Option<String>,
     pub connection: qaqh_gpui_wire::bridge::ConnectionState,
@@ -50,13 +97,32 @@ pub struct DaemonStore {
     pub workspaces: Vec<WorkspaceEntry>,
     /// 侧栏分组折叠状态(组标题)。
     pub collapsed: HashSet<String>,
+    /// 会话右键菜单(侧栏行右键打开;None = 关闭)。
+    pub ctx_menu: Option<SessionCtxMenu>,
+    /// 侧栏行内重命名草稿(session_id, 输入框实体)。
+    pub rename_draft: Option<(String, Entity<InputState>)>,
     /// 设置页打开状态(占用主区,侧栏常驻)。
     pub settings_open: bool,
-    /// 设置页 daemon 侧数据:config.load 快照 + provider.list 结果。
+    /// 设置页 daemon 侧数据:config.load 快照 + provider.list + 官方预设表。
     pub config: Option<ConfigDto>,
     pub providers: Option<Arc<ProfilesDocument>>,
+    pub provider_presets: Vec<ProviderPresetView>,
     pub new_model: Option<ModelSelection>,
-    /// 新建会话面板打开状态 + 选择(workspace 下标/effort)。
+    /// 主导航当前分区与页内状态(Overcoder v5.0: 主页/工具/团队/接入)。
+    pub section: PrimarySection,
+    pub page_epoch: u64,
+    pub tools_tab: ToolsTab,
+    pub skills_scanning: bool,
+    pub skills_report: Option<SkillsScanReport>,
+    pub expanded_skills: HashSet<String>,
+    pub team_page_seed: Option<String>,
+    pub team_page_snapshot: Option<(String, qaqh_client::v2::TeamResponse)>,
+    pub team_page_loading: bool,
+    pub team_poll_tick: u8,
+    /// 内联启动页(StartupView)双层 Composer 输入状态与预检工具档位。
+    pub startup_input: Entity<TextareaState>,
+    pub startup_tool_mode: Option<String>,
+    /// 新建会话/内联启动页激活状态 + 选择(workspace 下标)。
     pub new_session_open: bool,
     pub creating_session: bool,
     pub new_workspace: usize,
@@ -79,6 +145,24 @@ pub struct DaemonStore {
     pub todos: Option<(String, Vec<TodoRow>)>,
     /// 当前会话的 team 快照(ADR-0014):Some((seed, response));无推送,选中/轮询刷新。
     pub team: Option<(String, qaqh_client::v2::TeamResponse)>,
+    /// 用户 shell 终端坞(ADR-0028):标签/进程生命周期归 store,不归 DOM;
+    /// 隐藏坞/切会话不断流,只有显式关标签才 shell.close(§D5 断联不 kill)。
+    pub shell_dock_open: bool,
+    pub shells: Vec<ShellInfo>,
+    pub shell_active: Option<String>,
+    pub shell_tabs: HashMap<String, ShellTabState>,
+    /// 上次用的档位(「+」直开沿用;Windows Terminal 同律)。
+    pub shell_last_kind: &'static str,
+    pub shell_opening: Option<&'static str>,
+    pub shell_error: Option<String>,
+    /// 工作台面板收折态(弹簧动画驱动)。
+    pub sidebar_open: bool,
+    pub inspector_open: bool,
+    pub inspector_tab: InspectorTab,
+    /// 工作区页行内路径输入框。
+    pub workspace_path_input: Entity<InputState>,
+    /// 全局策略页行内输入框。
+    pub global_inputs: GlobalConfigInputs,
     pub requests: UnboundedSender<BridgeRequest>,
 }
 
@@ -102,6 +186,29 @@ impl DaemonStore {
             }
         })
         .detach();
+        let workspace_path_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("输入或浏览 daemon 所在机器的工作区目录…"));
+        let global_inputs = GlobalConfigInputs {
+            tool_allowlist: cx.new(|cx| InputState::new(window, cx).placeholder("逗号分隔工具名…")),
+            auto_compact: cx.new(|cx| InputState::new(window, cx).placeholder("0.75")),
+            idle_unload: cx.new(|cx| InputState::new(window, cx).placeholder("秒，0 为关闭")),
+            default_shell: cx.new(|cx| InputState::new(window, cx).placeholder("auto")),
+            goal_budget: cx.new(|cx| InputState::new(window, cx).placeholder("留空 = 不限")),
+            seeded: false,
+        };
+        let startup_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 7)
+                .submit_on_enter(true)
+                .placeholder("输入你的任务需求，或直接提问…")
+        });
+        cx.subscribe(&startup_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.submit_startup(cx);
+            }
+            cx.notify();
+        })
+        .detach();
         Self {
             last_operation: None,
             connection: qaqh_gpui_wire::bridge::ConnectionState::Connecting,
@@ -109,13 +216,28 @@ impl DaemonStore {
             workbench,
             session_search,
             show_archived: false,
+            ctx_menu: None,
+            rename_draft: None,
             lines: vec![load_error.unwrap_or_else(|| "qaqh-gpui 启动…".into())],
             sessions: Vec::new(),
             workspaces: Vec::new(),
             settings_open: false,
             config: None,
             providers: None,
+            provider_presets: Vec::new(),
             new_model: None,
+            section: PrimarySection::Home,
+            page_epoch: 0,
+            tools_tab: ToolsTab::Skills,
+            skills_scanning: false,
+            skills_report: None,
+            expanded_skills: HashSet::new(),
+            team_page_seed: None,
+            team_page_snapshot: None,
+            team_page_loading: false,
+            team_poll_tick: 0,
+            startup_input,
+            startup_tool_mode: None,
             new_session_open: false,
             creating_session: false,
             new_workspace: 0,
@@ -131,8 +253,191 @@ impl DaemonStore {
             current: None,
             todos: None,
             team: None,
+            shell_dock_open: false,
+            shells: Vec::new(),
+            shell_active: None,
+            shell_tabs: HashMap::new(),
+            shell_last_kind: "pwsh",
+            shell_opening: None,
+            shell_error: None,
+            sidebar_open: true,
+            inspector_open: false,
+            inspector_tab: InspectorTab::default(),
+            workspace_path_input,
+            global_inputs,
             requests,
         }
+    }
+
+    /// 把 daemon 全局配置快照同步进设置页行内输入框。
+    pub(crate) fn sync_global_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = &self.config else {
+            return;
+        };
+        let allowlist = config.tool_allowlist.join(", ");
+        let compact = config.auto_compact_threshold.to_string();
+        let unload = config.session_idle_unload_secs.to_string();
+        let shell = config
+            .exec
+            .default_shell
+            .as_deref()
+            .unwrap_or("auto")
+            .to_owned();
+        let budget = config
+            .goals
+            .max_token_budget
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        self.global_inputs
+            .tool_allowlist
+            .update(cx, |f, cx| f.set_value(&allowlist, window, cx));
+        self.global_inputs
+            .auto_compact
+            .update(cx, |f, cx| f.set_value(&compact, window, cx));
+        self.global_inputs
+            .idle_unload
+            .update(cx, |f, cx| f.set_value(&unload, window, cx));
+        self.global_inputs
+            .default_shell
+            .update(cx, |f, cx| f.set_value(&shell, window, cx));
+        self.global_inputs
+            .goal_budget
+            .update(cx, |f, cx| f.set_value(&budget, window, cx));
+        self.global_inputs.seeded = true;
+    }
+
+    /// 切换主导航分区(主页 / 工具 / 团队 / 接入)并自动触发对应数据加载。
+    pub fn navigate(
+        &mut self,
+        section: PrimarySection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.section != section || self.settings_open {
+            self.page_epoch = self.page_epoch.wrapping_add(1);
+        }
+        self.section = section;
+        self.settings_open = false;
+        self.settings_form = None;
+        match section {
+            PrimarySection::Home => {
+                self.new_session_open = false;
+                if self.current.is_none() {
+                    let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
+                    self.startup_input
+                        .update(cx, |field, cx| field.focus(window, cx));
+                }
+            }
+            PrimarySection::Tools => {
+                self.new_session_open = false;
+                let _ = self.requests.unbounded_send(BridgeRequest::QueryConfig);
+                self.refresh_skills();
+            }
+            PrimarySection::Team => {
+                self.new_session_open = false;
+                if self.team_page_seed.is_none() {
+                    self.team_page_seed = self
+                        .current
+                        .as_ref()
+                        .map(|c| c.read(cx).session_id.clone())
+                        .or_else(|| self.sessions.iter().find(|s| !s.archived).map(|s| s.id.clone()));
+                }
+                self.refresh_team_page();
+            }
+            PrimarySection::Access => {
+                self.new_session_open = false;
+                self.refresh_accounts();
+                let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
+                let _ = self.requests.unbounded_send(BridgeRequest::QueryConfig);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 打开内联 StartupView 准备新建对话,并聚焦其双层 Composer。
+    pub fn open_startup(
+        &mut self,
+        workspace_idx: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(idx) = workspace_idx {
+            self.new_workspace = idx;
+        }
+        if !self.new_session_open || self.section != PrimarySection::Home || self.settings_open {
+            self.page_epoch = self.page_epoch.wrapping_add(1);
+        }
+        self.section = PrimarySection::Home;
+        self.new_session_open = true;
+        self.settings_open = false;
+        self.settings_form = None;
+        let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
+        self.startup_input
+            .update(cx, |field, cx| field.focus(window, cx));
+        cx.notify();
+    }
+
+    /// 跨工作区刷新 daemon `skills.catalog`。
+    pub fn refresh_skills(&mut self) {
+        self.skills_scanning = true;
+        let workspaces = self
+            .workspaces
+            .iter()
+            .map(|w| (Some(w.path.clone()), w.title.clone()))
+            .collect();
+        let _ = self
+            .requests
+            .unbounded_send(BridgeRequest::QuerySkills { workspaces });
+    }
+
+    /// 刷新「团队」页当前选定会话的 team 快照。
+    pub fn refresh_team_page(&mut self) {
+        if let Some(seed) = self.team_page_seed.clone() {
+            self.team_page_loading = true;
+            let _ = self
+                .requests
+                .unbounded_send(BridgeRequest::QueryTeam { seed });
+        }
+    }
+
+    /// 后台 2s 心跳调入:团队页可见时约每 6s 低频轮询刷新。
+    pub fn poll_team_page(&mut self) {
+        if self.section == PrimarySection::Team && self.team_page_seed.is_some() {
+            self.team_poll_tick = self.team_poll_tick.wrapping_add(1);
+            if self.team_poll_tick.is_multiple_of(3) {
+                self.refresh_team_page();
+            }
+        }
+    }
+
+    /// 打开设置页(种字体输入框与全局策略行内输入框 + 拉配置/服务商目录)。
+    pub(crate) fn open_settings(
+        &mut self,
+        editor: SettingsEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings_open || self.settings_editor != editor {
+            self.settings_open = true;
+            self.new_session_open = false;
+            self.settings_editor = editor;
+            self.settings_form = None;
+            let family = qaqh_gpui_kit::settings::get(cx)
+                .typography
+                .ui_font_family
+                .clone();
+            self.font_field
+                .update(cx, |field, cx| field.set_value(&family, window, cx));
+            self.sync_global_inputs(window, cx);
+            let _ = self.requests.unbounded_send(BridgeRequest::QueryConfig);
+            let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
+            if self.provider_presets.is_empty() {
+                let _ = self
+                    .requests
+                    .unbounded_send(BridgeRequest::ListProviderPresets);
+            }
+        }
+        cx.notify();
     }
 
     pub fn handle(&mut self, message: BridgeMsg, window: &mut Window, cx: &mut Context<Self>) {
@@ -145,7 +450,7 @@ impl DaemonStore {
                     "session" => "会话操作", "workspace" => "工作区操作", "provider" => "服务商设置",
                     "profile" => "预设设置", "model" => "模型设置", "config" => "全局设置",
                     "interaction" => "提问应答", "plan" => "计划评审", "tool" => "工具授权",
-                    "conversation" => "对话操作", "exec_session" => "执行会话操作", "driver" => "控制权操作",
+                    "conversation" => "对话操作", "exec_session" => "执行会话操作",
                     _ => "操作",
                 };
                 match result {
@@ -158,7 +463,7 @@ impl DaemonStore {
                             // 成功受理走瞬时气泡;常驻状态行只承载失败/待确认。
                             let status = if ack.result.is_some() { "已完成" } else { "已受理" };
                             window.push_notification(
-                                gpui_component::notification::Notification::success(
+                                gpui_kit::component::notification::Notification::success(
                                     format!("{label} · {status}"),
                                 ),
                                 cx,
@@ -174,6 +479,12 @@ impl DaemonStore {
             BridgeMsg::Connection(state) => {
                 let id = match &state { qaqh_gpui_wire::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None };
                 self.connection = state;
+                if id.is_some() {
+                    self.shell_error = None;
+                    if self.shell_dock_open {
+                        let _ = self.requests.unbounded_send(BridgeRequest::ShellList);
+                    }
+                }
                 for store in &self.stores {
                     store.update(cx, |store, cx| {
                         if store.client_session_id != id {
@@ -227,17 +538,6 @@ impl DaemonStore {
                     });
                 }
             }
-            BridgeMsg::ResolvedContent(seed, reference, result) => {
-                if let Some(store) = self.stores.iter().find(|store| store.read(cx).session_id == seed) {
-                    store.update(cx, |store, cx| {
-                        match result {
-                            Ok(text) => qaqh_gpui_session::content::replace(store, &reference, text),
-                            Err(error) => store.operation_error = Some(error),
-                        }
-                        cx.notify();
-                    });
-                }
-            }
             BridgeMsg::Line(text) => {
                 self.lines.push(text);
                 if self.lines.len() > 200 { self.lines.drain(..100); }
@@ -265,6 +565,14 @@ impl DaemonStore {
             }
             BridgeMsg::Workspaces(entries) => {
                 self.workspaces = entries;
+                if self.section == PrimarySection::Tools {
+                    self.refresh_skills();
+                }
+                cx.notify();
+            }
+            BridgeMsg::SkillsCatalog(report) => {
+                self.skills_scanning = false;
+                self.skills_report = Some(report);
                 cx.notify();
             }
             BridgeMsg::Todos(seed, value) => {
@@ -278,13 +586,26 @@ impl DaemonStore {
                 }
             }
             BridgeMsg::Team(seed, value) => {
-                // 只对当前选中会话生效;花名册是粗投影,精确状态看 session.list。
+                // 对当前激活会话侧栏 & 独立「团队」页分别更新;花名册是粗投影。
                 let current_seed = self
                     .current
                     .as_ref()
                     .map(|current| current.read(cx).session_id.clone());
+                let matches_page = self.team_page_seed.as_deref() == Some(seed.as_str());
+                let mut changed = false;
                 if current_seed.as_deref() == Some(seed.as_str()) {
+                    if matches_page {
+                        self.team_page_snapshot = Some((seed.clone(), (*value).clone()));
+                        self.team_page_loading = false;
+                    }
                     self.team = Some((seed, *value));
+                    changed = true;
+                } else if matches_page {
+                    self.team_page_snapshot = Some((seed, *value));
+                    self.team_page_loading = false;
+                    changed = true;
+                }
+                if changed {
                     cx.notify();
                 }
             }
@@ -347,6 +668,17 @@ impl DaemonStore {
                     }
                     cx.notify();
                 });
+                // ADR-0016 自动接续:封箱线正开着且模型未声明「不拽我」→ 精确跳后继
+                // (HandoffSealed 权威事件驱动,不看本地钟;后台会话封箱不打扰)。
+                if let Some(current) = self.current.as_ref()
+                    && current.read(cx).session_id == seed
+                {
+                    let jump = current.read(cx).handoff_auto_jump.clone();
+                    if let Some(successor) = jump {
+                        current.update(cx, |store, _| store.handoff_auto_jump = None);
+                        self.select(successor, window, cx);
+                    }
+                }
                 // ask 请求到达即弹模态应答卡(仅当前会话);关闭后可经 footer 按钮重开。
                 // 需在 seed 被 QueryTodo 移动之前判定。
                 if let Some(iid) = ask_arrival
@@ -432,8 +764,11 @@ impl DaemonStore {
             }
             BridgeMsg::Created(seed, cwd) => {
                 self.lines.push(format!("会话已创建:{seed}"));
+                self.section = PrimarySection::Home;
                 self.new_session_open = false;
                 self.creating_session = false;
+                self.startup_input
+                    .update(cx, |field, cx| field.set_value("", window, cx));
                 self.select(seed, window, cx);
                 if let Some(store) = &self.current {
                     store.update(cx, |store, cx| {
@@ -456,6 +791,7 @@ impl DaemonStore {
             }
             BridgeMsg::Config(value) => {
                 self.config = Some(value);
+                self.sync_global_inputs(window, cx);
                 cx.notify();
             }
             BridgeMsg::Providers(value) => {
@@ -473,6 +809,10 @@ impl DaemonStore {
                         .or_else(|| model_options_from(&catalog).into_iter().next());
                 }
                 self.providers = Some(catalog);
+                cx.notify();
+            }
+            BridgeMsg::ProviderPresets(presets) => {
+                self.provider_presets = presets;
                 cx.notify();
             }
             BridgeMsg::SessionSettings { seed, settings, write_completed } => {
@@ -507,6 +847,18 @@ impl DaemonStore {
             BridgeMsg::ServiceResult { method, result } => {
                 self.handle_service_result(&method, result, cx);
                 cx.notify();
+            }
+            BridgeMsg::Shells(shells) => crate::shell_panel::sync_shells(self, shells, cx),
+            BridgeMsg::ShellOpened(info) => crate::shell_panel::opened(self, info, window, cx),
+            BridgeMsg::ShellRemoved(shell_id) => crate::shell_panel::removed(self, &shell_id, cx),
+            BridgeMsg::ShellBytes { shell_id, bytes } => {
+                crate::shell_panel::on_bytes(self, &shell_id, &bytes, cx);
+            }
+            BridgeMsg::ShellStatus { shell_id, status } => {
+                crate::shell_panel::on_status(self, &shell_id, status, cx);
+            }
+            BridgeMsg::ShellError(error) => {
+                crate::shell_panel::on_error(self, error, window, cx);
             }
         }
     }
@@ -699,6 +1051,10 @@ impl DaemonStore {
     /// 新建会话:cwd 取所选工作区路径;创建成功经 BridgeMsg::Created 自动选中。
     /// 模型未选 = None(继承全局默认,eb3f31c 的 model_selection Inherit 口径)。
     pub fn create_session(&mut self) {
+        self.create_session_with_prompt(None);
+    }
+
+    pub fn create_session_with_prompt(&mut self, first_message: Option<String>) {
         if self.creating_session {
             return;
         }
@@ -706,16 +1062,34 @@ impl DaemonStore {
             .workspaces
             .get(self.new_workspace)
             .map(|workspace| workspace.path.clone());
-        self.creating_session = self.requests.unbounded_send(BridgeRequest::CreateSession {
-            cwd,
-            model_selection: self.new_model.clone(),
-            title: None,
-            first_message: None,
-            handoff_from: None,
-        }).is_ok();
+        self.creating_session = self
+            .requests
+            .unbounded_send(BridgeRequest::CreateSession {
+                cwd,
+                model_selection: self.new_model.clone(),
+                tool_mode: self.startup_tool_mode.clone(),
+                title: None,
+                first_message,
+                handoff_from: None,
+            })
+            .is_ok();
+    }
+
+    pub fn submit_startup(&mut self, cx: &mut Context<Self>) {
+        let text = self.startup_input.read(cx).value().trim().to_string();
+        if text.is_empty() || self.creating_session {
+            return;
+        }
+        self.create_session_with_prompt(Some(text));
+        cx.notify();
     }
 
     pub fn select(&mut self, seed: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.section != PrimarySection::Home || self.new_session_open {
+            self.page_epoch = self.page_epoch.wrapping_add(1);
+        }
+        self.section = PrimarySection::Home;
+        self.new_session_open = false;
         self.persist(cx);
         self.workbench.recent_session = Some(seed.clone());
         // 已访问过的会话直接复用 store(状态/流保持);新会话才 attach。
@@ -760,7 +1134,7 @@ impl DaemonStore {
         }
     }
 
-    pub fn persist(&mut self, cx: &gpui::App) {
+    pub fn persist(&mut self, cx: &gpui_kit::App) {
         for store in &self.stores {
             let store = store.read(cx);
             self.workbench.drafts.insert(store.session_id.clone(), store.draft(cx));
@@ -770,4 +1144,31 @@ impl DaemonStore {
             if self.lines.last() != Some(&error) { self.lines.push(error); }
         }
     }
+}
+
+/// 侧栏/全局共用标题清洗:绝不允许空串、"(无标题)"或 "ses_*" ULID 上屏。
+pub(crate) fn clean_session_title(
+    row: &SessionRow,
+    workspaces: &[WorkspaceEntry],
+) -> gpui_kit::SharedString {
+    let raw = row.title.trim();
+    if !raw.is_empty() && raw != "(无标题)" && !raw.starts_with("ses_") {
+        return gpui_kit::SharedString::from(raw.to_owned());
+    }
+    row.workspace_id
+        .as_ref()
+        .and_then(|wid| {
+            workspaces
+                .iter()
+                .find(|entry| &entry.id == wid)
+                .map(|entry| gpui_kit::SharedString::from(entry.title.clone()))
+        })
+        .or_else(|| {
+            row.cwd.as_ref().and_then(|cwd| {
+                let trimmed = cwd.trim_end_matches(['/', '\\']);
+                let tail = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+                (!tail.is_empty()).then(|| gpui_kit::SharedString::from(tail.to_owned()))
+            })
+        })
+        .unwrap_or_else(|| gpui_kit::SharedString::from("未命名会话"))
 }
