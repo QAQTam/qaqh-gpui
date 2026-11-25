@@ -14,20 +14,32 @@ use std::sync::Arc;
 use gpui_kit::prelude::*;
 use gpui_kit::AnyElement;
 use gpui_kit::App;
+use gpui_kit::Bounds;
 use gpui_kit::ClipboardItem;
+use gpui_kit::Element;
 use gpui_kit::ElementId;
 use gpui_kit::FontStyle;
 use gpui_kit::FontWeight;
+use gpui_kit::GlobalElementId;
 use gpui_kit::HighlightStyle;
+use gpui_kit::Hsla;
+use gpui_kit::InspectorElementId;
 use gpui_kit::InteractiveElement;
+use gpui_kit::LayoutId;
+use gpui_kit::Pixels;
 use gpui_kit::SharedString;
 use gpui_kit::StrikethroughStyle;
 use gpui_kit::Styled;
 use gpui_kit::StyledText;
+use gpui_kit::TextLayout;
+use gpui_kit::TransformationMatrix;
 use gpui_kit::UnderlineStyle;
+use gpui_kit::Window;
 use gpui_kit::div;
+use gpui_kit::point;
 use gpui_kit::px;
 use gpui_kit::relative;
+use gpui_kit::size;
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
@@ -139,6 +151,62 @@ mod tests {
         let blocks = parse_blocks(partial);
         assert!(matches!(blocks[0].kind, MdBlockKind::Paragraph { .. }));
     }
+
+    #[test]
+    fn autolinks_bare_urls_and_decorates_links_with_icons() {
+        let blocks = parse_blocks(
+            "仓库：https://github.com/QAQTam/qaqh-pets（PUBLIC），官网 https://example.com/docs。许可：[MIT](LICENSE-MIT)，忽略：[忽略](.gitignore)，清单：[Cargo.toml](Cargo.toml)，源码：[sidebar](crates/qaqh-gpui-shell/src/sidebar.rs#L10-L20)，以及 [**加粗**链接](README.md)。",
+        );
+        let MdBlockKind::Paragraph { text, runs } = &blocks[0].kind else {
+            panic!("expected paragraph");
+        };
+        let urls: Vec<&str> = runs
+            .iter()
+            .filter_map(|run| match &run.kind {
+                MdRunKind::Link(url) => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/QAQTam/qaqh-pets",
+                "https://example.com/docs",
+                "LICENSE-MIT",
+                ".gitignore",
+                "Cargo.toml",
+                "crates/qaqh-gpui-shell/src/sidebar.rs#L10-L20",
+                "README.md",
+                "README.md",
+            ]
+        );
+        let deco = plan_decorations(runs, text).expect("expected decorated plan");
+        // Github (lead + trail), Globe (lead + trail), Copyright, GitBranch, FileCog, FileCode, merged FileText
+        let icon_names: Vec<IconName> = deco.icons.iter().map(|icon| icon.icon).collect();
+        assert_eq!(
+            icon_names,
+            vec![
+                IconName::Github,
+                IconName::ExternalLink,
+                IconName::Globe,
+                IconName::ExternalLink,
+                IconName::Copyright,
+                IconName::GitBranch,
+                IconName::FileCog,
+                IconName::FileCode,
+                IconName::FileText,
+            ]
+        );
+        for icon in &deco.icons {
+            assert!(deco.out.is_char_boundary(icon.byte_index));
+        }
+        for range in &deco.click_ranges {
+            assert!(deco.out.is_char_boundary(range.start));
+            assert!(deco.out.is_char_boundary(range.end));
+            assert!(range.start < range.end);
+        }
+        assert!(deco.out.contains("**加粗**") || deco.out.contains("加粗链接"));
+    }
 }
 
 /// 块 id:section key 区分不同消息,offset 区分块内位置(状态跨帧稳定)。
@@ -203,15 +271,131 @@ fn tsv_table(source: &str) -> MdBlockKind {
     MdBlockKind::Table { columns: vec![Alignment::None; width], rows }
 }
 
-/// 向文本槽追加 chunk,栈顶 inline 样式(若有)记 run。
-fn push_text(sink: &mut String, runs: &mut Vec<MdRun>, styles: &[MdRunKind], chunk: &str) {
+fn append_styled_chunk(
+    sink: &mut String,
+    runs: &mut Vec<MdRun>,
+    style: Option<&MdRunKind>,
+    chunk: &str,
+) {
+    if chunk.is_empty() {
+        return;
+    }
     let start = sink.len();
     sink.push_str(chunk);
-    if let Some(kind) = inline_style(styles) {
+    if let Some(kind) = style {
         runs.push(MdRun {
             range: start..sink.len(),
             kind: kind.clone(),
         });
+    }
+}
+
+fn find_url_start(haystack: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(tail) = haystack.get(offset..) {
+        let idx_https = tail.find("https://");
+        let idx_http = tail.find("http://");
+        let rel = match (idx_https, idx_http) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        let abs = offset + rel;
+        let boundary_ok = abs == 0
+            || haystack
+                .get(..abs)
+                .and_then(|before| before.chars().next_back())
+                .is_some_and(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        if boundary_ok {
+            return Some(abs);
+        }
+        offset = abs + 4;
+    }
+    None
+}
+
+fn trim_trailing_url_punct(mut url: &str) -> &str {
+    loop {
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        if trimmed.len() != url.len() {
+            url = trimmed;
+            continue;
+        }
+        match url.chars().next_back() {
+            Some(')') if url.matches(')').count() > url.matches('(').count() => {
+                url = url.strip_suffix(')').unwrap_or(url);
+            }
+            Some(']') if url.matches(']').count() > url.matches('[').count() => {
+                url = url.strip_suffix(']').unwrap_or(url);
+            }
+            Some('}') if url.matches('}').count() > url.matches('{').count() => {
+                url = url.strip_suffix('}').unwrap_or(url);
+            }
+            _ => break,
+        }
+    }
+    url
+}
+
+fn is_valid_http_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    !host_port.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && (host.contains('.')
+            || host_port.starts_with('[')
+            || host.eq_ignore_ascii_case("localhost"))
+}
+
+/// 向文本槽追加 chunk,栈顶 inline 样式(若有)记 run;非链接内文本自动识别裸 http(s) URL。
+fn push_text(sink: &mut String, runs: &mut Vec<MdRun>, styles: &[MdRunKind], chunk: &str) {
+    if styles.iter().any(|kind| matches!(kind, MdRunKind::Link(_))) {
+        append_styled_chunk(sink, runs, inline_style(styles), chunk);
+        return;
+    }
+    let normal_style = inline_style(styles);
+    let mut cursor = 0usize;
+    while let Some(tail) = chunk.get(cursor..) {
+        let Some(rel_start) = find_url_start(tail) else {
+            append_styled_chunk(sink, runs, normal_style, tail);
+            return;
+        };
+        let abs_start = cursor + rel_start;
+        if let Some(prefix) = chunk.get(cursor..abs_start) {
+            append_styled_chunk(sink, runs, normal_style, prefix);
+        }
+        let Some(url_tail) = chunk.get(abs_start..) else {
+            return;
+        };
+        let raw_len = url_tail
+            .char_indices()
+            .find(|&(_, ch)| {
+                !ch.is_ascii()
+                    || ch.is_ascii_whitespace()
+                    || matches!(ch, '<' | '>' | '"' | '\'' | '`')
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(url_tail.len());
+        let candidate = url_tail.get(..raw_len).unwrap_or("");
+        let trimmed = trim_trailing_url_punct(candidate);
+        if is_valid_http_url(trimmed) {
+            append_styled_chunk(sink, runs, Some(&MdRunKind::Link(trimmed.to_owned())), trimmed);
+            cursor = abs_start + trimmed.len();
+        } else {
+            let advance = (abs_start + 4).min(chunk.len());
+            if let Some(plain) = chunk.get(abs_start..advance) {
+                append_styled_chunk(sink, runs, normal_style, plain);
+            }
+            cursor = advance;
+        }
     }
 }
 
@@ -540,6 +724,383 @@ fn styled(runs: &[MdRun], text: &str, t: &Palette) -> StyledText {
     )
 }
 
+#[derive(Clone)]
+enum LinkTarget {
+    Web(String),
+    Source(crate::code_panel::Location),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IconRole {
+    Web,
+    Dim,
+    Alert,
+    Code,
+    Type,
+    Shell,
+    Media,
+}
+
+impl IconRole {
+    fn color(self, t: &Palette) -> Hsla {
+        match self {
+            Self::Web => t.syn_function,
+            Self::Dim => t.dim,
+            Self::Alert => t.bad,
+            Self::Code => t.syn_keyword,
+            Self::Type => t.syn_type,
+            Self::Shell => t.syn_string,
+            Self::Media => t.syn_number,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IconPlan {
+    byte_index: usize,
+    icon: IconName,
+    role: IconRole,
+    scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InlineIcon {
+    byte_index: usize,
+    icon: IconName,
+    color: Hsla,
+    scale: f32,
+}
+
+enum HighlightSpec {
+    WebLink,
+    SourceLink { is_code: bool },
+    Run(MdRunKind),
+}
+
+struct DecoratedPlan {
+    out: String,
+    specs: Vec<(Range<usize>, HighlightSpec)>,
+    click_ranges: Vec<Range<usize>>,
+    targets: Vec<LinkTarget>,
+    icons: Vec<IconPlan>,
+}
+
+fn is_http_url(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        || url
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+}
+
+fn classify_link(run: &MdRun, text: &str) -> Option<LinkTarget> {
+    match &run.kind {
+        MdRunKind::Link(url) => {
+            if is_http_url(url) {
+                Some(LinkTarget::Web(url.clone()))
+            } else {
+                crate::code_panel::Location::parse(url, false).map(LinkTarget::Source)
+            }
+        }
+        MdRunKind::Code => text
+            .get(run.range.clone())
+            .and_then(|snippet| crate::code_panel::Location::parse(snippet, true))
+            .map(LinkTarget::Source),
+        _ => None,
+    }
+}
+
+fn web_host(url: &str) -> &str {
+    let rest = url
+        .split_once("://")
+        .map(|(_, after)| after)
+        .unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.split(':').next().unwrap_or("")
+}
+
+fn link_icons(target: &LinkTarget) -> ((IconName, IconRole), Option<(IconName, IconRole)>) {
+    match target {
+        LinkTarget::Web(url) => {
+            let host = web_host(url).to_ascii_lowercase();
+            let lead = if host == "github.com" || host.ends_with(".github.com") {
+                (IconName::Github, IconRole::Web)
+            } else {
+                (IconName::Globe, IconRole::Web)
+            };
+            (lead, Some((IconName::ExternalLink, IconRole::Dim)))
+        }
+        LinkTarget::Source(loc) => {
+            let path = loc.path();
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let lead = if file_name.starts_with("license")
+                || file_name.starts_with("copying")
+                || file_name.starts_with("notice")
+            {
+                (IconName::Copyright, IconRole::Dim)
+            } else if matches!(
+                file_name.as_str(),
+                ".gitignore" | ".gitattributes" | ".gitmodules" | ".gitconfig"
+            ) {
+                (IconName::GitBranch, IconRole::Alert)
+            } else if matches!(
+                file_name.as_str(),
+                "cargo.toml"
+                    | "cargo.lock"
+                    | "package.json"
+                    | "tsconfig.json"
+                    | "dockerfile"
+                    | "makefile"
+                    | "justfile"
+            ) || matches!(
+                ext.as_str(),
+                "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "env" | "lock"
+            ) {
+                (IconName::FileCog, IconRole::Dim)
+            } else if matches!(ext.as_str(), "md" | "mdx" | "markdown" | "rst" | "txt" | "adoc") {
+                (IconName::FileText, IconRole::Web)
+            } else if matches!(ext.as_str(), "json" | "jsonc" | "jsonl") {
+                (IconName::FileBraces, IconRole::Type)
+            } else if matches!(
+                ext.as_str(),
+                "rs" | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "mjs"
+                    | "cjs"
+                    | "py"
+                    | "go"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "hpp"
+                    | "java"
+                    | "kt"
+                    | "swift"
+                    | "cs"
+                    | "rb"
+                    | "php"
+                    | "lua"
+                    | "zig"
+                    | "css"
+                    | "scss"
+                    | "html"
+                    | "xml"
+                    | "vue"
+                    | "svelte"
+            ) {
+                (IconName::FileCode, IconRole::Code)
+            } else if matches!(
+                ext.as_str(),
+                "sh" | "bash" | "zsh" | "fish" | "ps1" | "psm1" | "bat" | "cmd"
+            ) {
+                (IconName::FileTerminal, IconRole::Shell)
+            } else if matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "bmp"
+            ) {
+                (IconName::FileImage, IconRole::Media)
+            } else if matches!(ext.as_str(), "sql" | "db" | "sqlite" | "sqlite3") {
+                (IconName::Database, IconRole::Type)
+            } else if matches!(ext.as_str(), "diff" | "patch") {
+                (IconName::FileDiff, IconRole::Shell)
+            } else if matches!(ext.as_str(), "zip" | "tar" | "gz" | "xz" | "zst" | "7z" | "rar") {
+                (IconName::FileArchive, IconRole::Dim)
+            } else if matches!(ext.as_str(), "csv" | "tsv" | "xlsx") {
+                (IconName::FileSpreadsheet, IconRole::Shell)
+            } else {
+                (IconName::FileText, IconRole::Dim)
+            };
+            (lead, None)
+        }
+    }
+}
+
+fn merge_adjacent_link_runs(runs: &[MdRun]) -> Vec<MdRun> {
+    let mut merged: Vec<MdRun> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let (Some(prev), MdRunKind::Link(url)) = (merged.last_mut(), &run.kind)
+            && prev.range.end == run.range.start
+            && matches!(&prev.kind, MdRunKind::Link(prev_url) if prev_url == url)
+        {
+            prev.range.end = run.range.end;
+            continue;
+        }
+        merged.push(run.clone());
+    }
+    merged
+}
+
+fn plan_decorations(runs: &[MdRun], text: &str) -> Option<DecoratedPlan> {
+    let merged = merge_adjacent_link_runs(runs);
+    if !merged.iter().any(|run| classify_link(run, text).is_some()) {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len() + merged.len() * 12);
+    let mut specs = Vec::with_capacity(merged.len());
+    let mut click_ranges = Vec::new();
+    let mut targets = Vec::new();
+    let mut icons = Vec::new();
+    let mut cursor = 0usize;
+
+    for run in merged {
+        if run.range.start > cursor {
+            if let Some(gap) = text.get(cursor..run.range.start) {
+                out.push_str(gap);
+            }
+            cursor = run.range.start;
+        }
+        let Some(slice) = text.get(run.range.clone()) else {
+            continue;
+        };
+        cursor = run.range.end;
+
+        if let Some(target) = classify_link(&run, text) {
+            let ((lead_icon, lead_role), trail) = link_icons(&target);
+            let click_start = out.len();
+            let lead_idx = out.len();
+            // Em Space + Thin Space + Word Joiner keeps the leading icon glued to the link text.
+            out.push_str("\u{2003}\u{2009}\u{2060}");
+            icons.push(IconPlan {
+                byte_index: lead_idx,
+                icon: lead_icon,
+                role: lead_role,
+                scale: 0.90,
+            });
+
+            let text_start = out.len();
+            out.push_str(slice);
+            let text_end = out.len();
+            let spec = match &target {
+                LinkTarget::Web(_) => HighlightSpec::WebLink,
+                LinkTarget::Source(_) => HighlightSpec::SourceLink {
+                    is_code: matches!(run.kind, MdRunKind::Code),
+                },
+            };
+            specs.push((text_start..text_end, spec));
+
+            if let Some((trail_icon, trail_role)) = trail {
+                out.push_str("\u{2060}\u{2009}");
+                let trail_idx = out.len();
+                out.push('\u{2003}');
+                icons.push(IconPlan {
+                    byte_index: trail_idx,
+                    icon: trail_icon,
+                    role: trail_role,
+                    scale: 0.78,
+                });
+            }
+
+            let click_end = out.len();
+            click_ranges.push(click_start..click_end);
+            targets.push(target);
+        } else {
+            let start = out.len();
+            out.push_str(slice);
+            specs.push((start..out.len(), HighlightSpec::Run(run.kind)));
+        }
+    }
+
+    if let Some(tail) = text.get(cursor..) {
+        out.push_str(tail);
+    }
+
+    Some(DecoratedPlan {
+        out,
+        specs,
+        click_ranges,
+        targets,
+        icons,
+    })
+}
+
+struct DecoratedText {
+    inner: AnyElement,
+    layout: TextLayout,
+    icons: Vec<InlineIcon>,
+}
+
+impl Element for DecoratedText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner.paint(window, cx);
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let line_height = self.layout.line_height();
+        for icon in &self.icons {
+            let Some(pos) = self.layout.position_for_index(icon.byte_index) else {
+                continue;
+            };
+            let icon_px = font_size * icon.scale;
+            let x_pad = ((font_size - icon_px) * 0.5).max(px(0.));
+            let y_pad = ((line_height - icon_px) * 0.5).max(px(0.));
+            let icon_bounds = Bounds::new(
+                point(pos.x + x_pad, pos.y + y_pad),
+                size(icon_px, icon_px),
+            );
+            let _ = window.paint_svg(
+                icon_bounds,
+                icon.icon.path(),
+                None,
+                TransformationMatrix::unit(),
+                icon.color,
+                cx,
+            );
+        }
+    }
+}
+
 /// 渲染一组块(每个块的 div id 按 source offset 命名,状态跨帧稳定)。
 pub fn render_blocks(
     blocks: &[MdBlock],
@@ -564,43 +1125,73 @@ fn render_block(
     let mut inline_index = 0usize;
     let mut styled = |runs: &[MdRun], text: &str, t: &Palette| {
         inline_index += 1;
-        let mut ranges = Vec::new();
-        let mut targets = Vec::new();
-        for run in runs {
-            let target = match &run.kind {
-                MdRunKind::Link(target) => crate::code_panel::Location::parse(target, false),
-                MdRunKind::Code => text.get(run.range.clone())
-                    .and_then(|text| crate::code_panel::Location::parse(text, true)),
-                _ => None,
-            };
-            if let Some(target) = target {
-                ranges.push(run.range.clone());
-                targets.push(target);
-            }
-        }
-        if targets.is_empty() {
+        let Some(plan) = plan_decorations(runs, text) else {
             return styled(runs, text, t).into_any_element();
-        }
-        let text = StyledText::new(text).with_highlights(
-            runs.iter().map(|run| {
-                let mut style = run_style(&run.kind, t);
-                if ranges.contains(&run.range) {
-                    style.color = Some(t.accent);
-                    style.underline = Some(UnderlineStyle {
-                        thickness: px(1.), color: None, wavy: false,
-                    });
-                }
-                (run.range.clone(), style)
-            }),
-        );
-        let session = session.downgrade();
-        gpui_kit::InteractiveText::new(("source-link", inline_index), text)
-            .on_click(ranges, move |index, _, cx| {
-                let _ = session.update(cx, |store, cx| {
-                    crate::code_panel::open_source(store, targets[index].clone(), cx);
-                });
+        };
+        let highlights = plan.specs.into_iter().map(|(range, spec)| {
+            let style = match spec {
+                HighlightSpec::WebLink => HighlightStyle {
+                    color: Some(t.syn_function),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(soft(t.syn_function, 0.45)),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+                HighlightSpec::SourceLink { is_code } => HighlightStyle {
+                    color: Some(t.text),
+                    background_color: is_code.then_some(t.code_bg),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(soft(t.dim, 0.45)),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+                HighlightSpec::Run(kind) => run_style(&kind, t),
+            };
+            (range, style)
+        });
+        let styled_text = StyledText::new(plan.out).with_highlights(highlights);
+        let layout = styled_text.layout().clone();
+        let icons: Vec<InlineIcon> = plan
+            .icons
+            .into_iter()
+            .map(|icon| InlineIcon {
+                byte_index: icon.byte_index,
+                icon: icon.icon,
+                color: icon.role.color(t),
+                scale: icon.scale,
             })
-            .into_any_element()
+            .collect();
+        let targets = plan.targets;
+        let session = session.downgrade();
+        let link_id = (section.wrapping_mul(1_000_003))
+            .wrapping_add(block.offset.wrapping_mul(31))
+            .wrapping_add(inline_index);
+        let interactive = gpui_kit::InteractiveText::new(("md-link", link_id), styled_text)
+            .on_click(plan.click_ranges, move |index, _, cx| {
+                let Some(target) = targets.get(index) else {
+                    return;
+                };
+                match target {
+                    LinkTarget::Web(url) => cx.open_url(url),
+                    LinkTarget::Source(location) => {
+                        let location = location.clone();
+                        let _ = session.update(cx, |store, cx| {
+                            crate::code_panel::open_source(store, location, cx);
+                        });
+                    }
+                }
+            })
+            .into_any_element();
+        DecoratedText {
+            inner: interactive,
+            layout,
+            icons,
+        }
+        .into_any_element()
     };
     match &block.kind {
         MdBlockKind::Rule => div()

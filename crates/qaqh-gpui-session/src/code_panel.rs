@@ -14,36 +14,162 @@ use qaqh_ringing_contract::state::ToolCallView;
 use qaqh_gpui_kit::{settings::Typography, theme::Palette};
 use crate::store::SessionStore;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
     path: PathBuf,
     line: usize,
     column: Option<usize>,
 }
 
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'%')
+            && let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(h), Some(l)) = (decode_hex_nibble(hi), decode_hex_nibble(lo))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        if let Some(&b) = bytes.get(i) {
+            out.push(b);
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+}
+
+fn strip_file_uri(value: &str) -> Option<String> {
+    let prefix = value.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("file://") {
+        return None;
+    }
+    let rest = value.get(7..)?;
+    let rest = if rest
+        .get(..10)
+        .is_some_and(|head| head.eq_ignore_ascii_case("localhost/"))
+    {
+        rest.get(9..).unwrap_or(rest)
+    } else {
+        rest
+    };
+    let decoded = percent_decode(rest);
+    let bytes = decoded.as_bytes();
+    if bytes.first() == Some(&b'/')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(2) == Some(&b':')
+        && let Some(stripped) = decoded.strip_prefix('/')
+    {
+        return Some(stripped.to_owned());
+    }
+    Some(decoded)
+}
+
+fn is_known_root_filename(name: &str) -> bool {
+    if name.len() > 1 && name.starts_with('.') {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("license")
+        || lower.starts_with("copying")
+        || lower.starts_with("notice")
+        || lower.starts_with("readme")
+        || lower.starts_with("changelog")
+        || matches!(
+            lower.as_str(),
+            "makefile"
+                | "dockerfile"
+                | "justfile"
+                | "procfile"
+                | "agents"
+                | "rakefile"
+                | "gemfile"
+                | "vagrantfile"
+        )
+}
+
+fn parse_hash_line_suffix(fragment: &str) -> Option<usize> {
+    let rest = fragment.strip_prefix('L')?;
+    if let Some((start, end)) = rest.split_once('-') {
+        let start_line: usize = start.parse().ok()?;
+        let end_line: usize = end.strip_prefix('L').unwrap_or(end).parse().ok()?;
+        (start_line > 0 && end_line > 0).then_some(start_line)
+    } else {
+        rest.parse::<usize>().ok().filter(|&line| line > 0)
+    }
+}
+
 impl Location {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn parse(value: &str, require_line: bool) -> Option<Self> {
-        let (path, line, column) = if let Some((path, line)) = value.rsplit_once("#L") {
-            (path, line.parse().ok()?, None)
-        } else if let Some((prefix, suffix)) = value.rsplit_once(':') {
-            let last = suffix.parse().ok()?;
+        if value.contains(['\n', '\r', '\0']) {
+            return None;
+        }
+        let stripped_uri = strip_file_uri(value);
+        let is_file_uri = stripped_uri.is_some();
+        let candidate = stripped_uri.as_deref().unwrap_or(value);
+        if !is_file_uri
+            && (value.contains("://")
+                || value
+                    .get(..7)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mailto:")))
+        {
+            return None;
+        }
+        if candidate.starts_with('#') {
+            return None;
+        }
+
+        let (path_str, line, column) = if let Some((prefix, fragment)) = candidate.rsplit_once('#') {
+            if fragment.starts_with('L') {
+                (prefix, parse_hash_line_suffix(fragment)?, None)
+            } else if require_line {
+                return None;
+            } else {
+                (prefix, 1, None)
+            }
+        } else if let Some((prefix, suffix)) = candidate.rsplit_once(':')
+            && let Ok(last) = suffix.parse::<usize>()
+        {
             match prefix.rsplit_once(':') {
-                Some((path, row)) => (path, row.parse().ok()?, Some(last)),
-                None => (prefix, last, None),
+                Some((path, row)) if row.parse::<usize>().is_ok() => {
+                    (path, row.parse().ok()?, Some(last))
+                }
+                _ => (prefix, last, None),
             }
         } else if require_line {
             return None;
         } else {
-            (value, 1, None)
+            (candidate, 1, None)
         };
-        let path = Path::new(path);
-        if line == 0
-            || column == Some(0)
-            || value.contains("://")
-            || path.as_os_str().is_empty()
-            || value.contains(['\n', '\r', '\0'])
-            || !(path.extension().is_some() || path.components().count() > 1)
-        {
+
+        let path = Path::new(path_str);
+        if line == 0 || column == Some(0) || path.as_os_str().is_empty() {
+            return None;
+        }
+        let accepted = is_file_uri
+            || path.extension().is_some()
+            || path.components().count() > 1
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_known_root_filename);
+        if !accepted {
             return None;
         }
         Some(Self {
@@ -98,12 +224,22 @@ struct DiffRow {
     new: Option<usize>,
 }
 
-fn load_source(root: &Path, location: &Location) -> std::io::Result<Excerpt> {
-    let root = root.canonicalize()?;
-    let path = root.join(&location.path).canonicalize()?;
-    if !path.starts_with(root) || !path.is_file() {
-        return Err(std::io::Error::other("目标必须是所选目录内的普通文件"));
-    }
+fn load_source(root: Option<&Path>, location: &Location) -> std::io::Result<Excerpt> {
+    let path = if location.path.is_absolute() {
+        let path = location.path.canonicalize()?;
+        if !path.is_file() {
+            return Err(std::io::Error::other("目标必须是存在的普通文件"));
+        }
+        path
+    } else {
+        let root = root.ok_or_else(|| std::io::Error::other("未选择源码目录"))?;
+        let root = root.canonicalize()?;
+        let path = root.join(&location.path).canonicalize()?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err(std::io::Error::other("目标必须是所选目录内的普通文件"));
+        }
+        path
+    };
     const MAX_BYTES: u64 = 4 * 1024 * 1024;
     let mut text = String::new();
     std::fs::File::open(path)?
@@ -140,7 +276,8 @@ fn load_location(
     store.code_panel.view = Some(View::Loading(location.clone()));
     cx.notify();
 
-    let root = (!choose_root)
+    let needs_root = !location.path.is_absolute();
+    let root = (needs_root && !choose_root)
         .then(|| {
             store
                 .code_panel
@@ -149,7 +286,7 @@ fn load_location(
                 .or_else(|| store.code_panel.cwd.clone())
         })
         .flatten();
-    let picker = root.is_none().then(|| {
+    let picker = (choose_root || (needs_root && root.is_none())).then(|| {
         cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -159,13 +296,17 @@ fn load_location(
     });
     let selecting = picker.is_some();
     cx.spawn(async move |session, cx| {
-        let root = match picker {
+        let root: Result<Option<PathBuf>, String> = match picker {
             Some(picker) => match picker.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next().ok_or_else(|| "未选择目录".into()),
+                Ok(Ok(Some(paths))) => paths
+                    .into_iter()
+                    .next()
+                    .map(Some)
+                    .ok_or_else(|| "未选择目录".into()),
                 Ok(Err(error)) => Err(error.to_string()),
                 _ => Err("未选择目录".into()),
             },
-            None => Ok(root.expect("已有本地目录")),
+            None => Ok(root),
         };
         let result = match &root {
             Ok(root) => {
@@ -173,7 +314,7 @@ fn load_location(
                 let location = location.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        load_source(&root, &location).map_err(|error| error.to_string())
+                        load_source(root.as_deref(), &location).map_err(|error| error.to_string())
                     })
                     .await
             }
@@ -181,7 +322,7 @@ fn load_location(
         };
         let _ = session.update(cx, |store, cx| {
             if store.code_panel.request == request {
-                if selecting && let Ok(root) = root {
+                if selecting && let Ok(Some(root)) = root {
                     store.code_panel.local_root = Some(root);
                 }
                 store.code_panel.view = Some(View::Source(location, result));
@@ -329,6 +470,56 @@ mod tests {
         assert!(!patches[1].deleted);
         assert_eq!(patches[2].path, "gone.rs");
         assert!(patches[2].deleted);
+    }
+
+    #[test]
+    fn location_parse_handles_file_uris_line_ranges_windows_and_root_files() {
+        let loc = Location::parse("file:///d:/Projects/qaqh-pets/Cargo.toml#L5", false).unwrap();
+        assert_eq!(loc.path, PathBuf::from("d:/Projects/qaqh-pets/Cargo.toml"));
+        assert_eq!(loc.line, 5);
+        assert_eq!(loc.column, None);
+
+        let loc = Location::parse("file:///d:/Projects/qaqh-pets/ASSETS.md#L5-L8", false).unwrap();
+        assert_eq!(loc.path, PathBuf::from("d:/Projects/qaqh-pets/ASSETS.md"));
+        assert_eq!(loc.line, 5);
+
+        let loc = Location::parse("file:///home/user/repo/src/main.rs#L12", false).unwrap();
+        assert_eq!(loc.path, PathBuf::from("/home/user/repo/src/main.rs"));
+        assert_eq!(loc.line, 12);
+
+        let loc = Location::parse("file:///D:/My%20Docs/notes.md", false).unwrap();
+        assert_eq!(loc.path, PathBuf::from("D:/My Docs/notes.md"));
+        assert_eq!(loc.line, 1);
+
+        let loc = Location::parse("D:/Projects/qaqh-pets/Cargo.toml", false).unwrap();
+        assert_eq!(loc.path, PathBuf::from("D:/Projects/qaqh-pets/Cargo.toml"));
+        assert_eq!(loc.line, 1);
+
+        let loc = Location::parse("D:/Projects/qaqh-pets/src/main.rs:42", true).unwrap();
+        assert_eq!(loc.path, PathBuf::from("D:/Projects/qaqh-pets/src/main.rs"));
+        assert_eq!(loc.line, 42);
+        assert_eq!(loc.column, None);
+
+        let loc = Location::parse("D:/Projects/qaqh-pets/src/main.rs:42:7", true).unwrap();
+        assert_eq!(loc.path, PathBuf::from("D:/Projects/qaqh-pets/src/main.rs"));
+        assert_eq!(loc.line, 42);
+        assert_eq!(loc.column, Some(7));
+
+        let loc = Location::parse("crates/qaqh-gpui-shell/src/sidebar.rs#L10-L20", false).unwrap();
+        assert_eq!(
+            loc.path,
+            PathBuf::from("crates/qaqh-gpui-shell/src/sidebar.rs")
+        );
+        assert_eq!(loc.line, 10);
+
+        assert!(Location::parse("LICENSE-MIT", false).is_some());
+        assert!(Location::parse(".gitignore", false).is_some());
+        assert!(Location::parse("Cargo.toml", false).is_some());
+
+        assert!(Location::parse("https://github.com/QAQTam/qaqh-pets", false).is_none());
+        assert!(Location::parse("#section", false).is_none());
+        assert!(Location::parse("hello", false).is_none());
+        assert!(Location::parse("file.rs#L0", false).is_none());
     }
 }
 
@@ -666,7 +857,9 @@ pub fn render(
                             .flex_shrink_0()
                             .children(
                                 match view {
-                                    View::Source(location, _) => Some(location.clone()),
+                                    View::Source(location, _) if !location.path.is_absolute() => {
+                                        Some(location.clone())
+                                    }
                                     _ => None,
                                 }
                                 .map(|location| {
