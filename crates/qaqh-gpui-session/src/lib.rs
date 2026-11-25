@@ -4,10 +4,12 @@
 //! orphan rule:impl Render for SessionStore 必须与类型同 crate,视图随状态走。
 //! DaemonStore(shell)是顶层消息泵,向下调用本 crate;本 crate 绝不反向引用 shell。
 
+pub mod ask_dock;
 pub mod code_panel;
 pub mod composer;
 pub mod controls;
 pub mod goal;
+pub mod handoff;
 pub mod markdown;
 pub mod persist;
 pub mod reducer;

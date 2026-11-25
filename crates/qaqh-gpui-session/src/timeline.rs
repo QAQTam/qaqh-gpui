@@ -10,12 +10,12 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, Div, Entity, FollowMode,
     FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, list, px, relative,
+    StatefulInteractiveElement, Styled, Window, div, list, px,
 };
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::input::Input;
+use gpui_kit::base::{SelectableText, TextSelection};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{Icon, Sizable, Size, WindowExt};
+use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
 use qaqh_ringing_contract::fact::{
     ActorKind, AssistantBlockKind, BlockId, ContentValue, InputPurpose, InteractionKind,
@@ -30,13 +30,11 @@ use qaqh_gpui_kit::kit::{
     RADIUS_BUBBLE, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, soft,
 };
 use qaqh_gpui_kit::motion::{
-    accordion_reveal, bottom_fade_mask, effective_motion, live_dot, pulse_easing, shimmer_label,
-    spring_chevron,
+    accordion_reveal, bottom_fade_mask, effective_motion, live_dot, shimmer_label, spring_chevron,
 };
 use qaqh_gpui_kit::primitives::action_button;
 use qaqh_gpui_kit::settings::{self, MotionLevel};
 use qaqh_gpui_kit::theme::{ActiveTheme, Palette};
-use qaqh_gpui_wire::ask;
 
 use crate::store::{ArgStream, SessionStore};
 
@@ -214,8 +212,65 @@ pub fn status_dot(status: SessionRunStatus, t: &Palette) -> Div {
         .child(div().text_xs().text_color(color).child(label))
 }
 
-fn user_bubble(text: &str, t: &Palette) -> Div {
+fn copy_context_menu(
+    menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+    message_text: &str,
+    entity: &gpui_kit::WeakEntity<SessionStore>,
+) -> PopupMenu {
+    let selected = TextSelection::selected_text(window, cx);
+    let selected_trimmed = selected.trim().to_string();
+    let has_selection = !selected_trimmed.is_empty();
+    let msg_owned = message_text.to_owned();
+    let weak = entity.clone();
+    menu.item(
+        PopupMenuItem::new("复制选中内容")
+            .icon(IconName::Copy)
+            .disabled(!has_selection)
+            .on_click(move |_, _, cx| {
+                if !selected_trimmed.is_empty() {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                        selected_trimmed.clone(),
+                    ));
+                }
+            }),
+    )
+    .item(
+        PopupMenuItem::new("复制此条消息")
+            .icon(IconName::Copy)
+            .disabled(msg_owned.is_empty())
+            .on_click(move |_, _, cx| {
+                if !msg_owned.is_empty() {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(msg_owned.clone()));
+                }
+            }),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new("复制全文对话")
+            .icon(IconName::Copy)
+            .on_click(move |_, _, cx| {
+                let _ = weak.update(cx, |store, cx| {
+                    let text = crate::controls::conversation_text(store);
+                    if !text.is_empty() {
+                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                    }
+                });
+            }),
+    )
+}
+
+fn user_bubble(
+    id: SharedString,
+    text: &str,
+    entity: &Entity<SessionStore>,
+    t: &Palette,
+) -> AnyElement {
+    let msg_text = text.to_owned();
+    let weak = entity.downgrade();
     div()
+        .id(id.clone())
         .self_end()
         .max_w(px(640.))
         .px_4()
@@ -226,7 +281,17 @@ fn user_bubble(text: &str, t: &Palette) -> Div {
         .border_color(soft(t.accent, 0.18))
         .text_sm()
         .text_color(t.text)
-        .child(text.to_string())
+        .child(
+            SelectableText::new(
+                SharedString::from(format!("{id}-sel")),
+                text.to_owned(),
+            )
+            .selection_color(t.selection_wash),
+        )
+        .context_menu(move |menu, window, cx| {
+            copy_context_menu(menu, window, cx, &msg_text, &weak)
+        })
+        .into_any_element()
 }
 
 /// UTF-8 安全尾部截断。
@@ -698,62 +763,6 @@ fn tool_card(
                 )),
         );
     }
-    if let Some(facts) = crate::store::handoff_facts(tool) {
-        body = body.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .child(div().size_1p5().rounded_full().bg(if facts.sealed {
-                    t.ok
-                } else {
-                    t.warn
-                }))
-                .child(div().text_xs().text_color(t.dim).child(if facts.sealed {
-                    "已封箱"
-                } else {
-                    "推断交接(机器面未读出)"
-                })),
-        );
-        if facts.sealed
-            && store.handoff_seal.is_none()
-            && let Some(planned_open) = facts.planned_open_at_ms
-        {
-            if planned_open > crate::store::now_ms() {
-                body = body.child(handoff_countdown(planned_open, facts.sealed_at_ms, t));
-            } else {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(t.dim)
-                        .child("阅读窗已结束,等待后继会话开箱…"),
-                );
-            }
-        }
-        if !facts.auto_continue {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(t.dim)
-                    .child("模型声明:交接后不自动接续 —— 需要时手动打开。"),
-            );
-        }
-        let entity = entity.downgrade();
-        body = body.child(
-            div().flex().gap_2().child(action_button(
-                cx,
-                "handoff-fork".into(),
-                "继续这条交接 →",
-                t.accent,
-                move |_, _, cx: &mut gpui_kit::App| {
-                    let _ = entity.update(cx, |store, _| {
-                        store.fork_handoff(facts.summary.clone(), facts.doc.clone())
-                    });
-                },
-                t,
-            )),
-        );
-    }
     if let Some(exec) = exec {
         let exec_id = exec.id.0.clone();
         let exec_handle = exec.id.clone();
@@ -896,56 +905,6 @@ fn tool_burst_card(
         .children(revealed)
 }
 
-/// 阅读窗倒计时行。
-fn handoff_countdown(planned_open_at_ms: u64, sealed_at_ms: Option<u64>, t: &Palette) -> Div {
-    let total = planned_open_at_ms
-        .saturating_sub(sealed_at_ms.unwrap_or(0))
-        .max(1) as f32;
-    let remaining = planned_open_at_ms.saturating_sub(crate::store::now_ms());
-    let fraction = ((remaining as f32 / total).clamp(0., 1.) * 1000.).round() / 1000.;
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .size_1p5()
-                .rounded_full()
-                .bg(t.accent)
-                .with_animation(
-                    "handoff-pulse",
-                    Animation::new(std::time::Duration::from_millis(1200))
-                        .repeat()
-                        .with_easing(pulse_easing),
-                    move |style, value| style.opacity(0.35 + 0.65 * value),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(t.dim)
-                .child(SharedString::from(format!(
-                    "阅读窗 {}s",
-                    remaining.div_ceil(1000)
-                ))),
-        )
-        .child(
-            div()
-                .flex_1()
-                .h_1p5()
-                .rounded_full()
-                .bg(soft(t.faint, 0.16))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .h_full()
-                        .rounded_full()
-                        .bg(t.accent)
-                        .w(relative(fraction)),
-                ),
-        )
-}
-
 /// Provider 重试横幅:居中圆角警示胶囊。
 pub(crate) fn provider_retry_banner(store: &SessionStore, t: &Palette) -> Option<Div> {
     let retry = store.provider_retry.as_ref()?;
@@ -1086,12 +1045,18 @@ fn assistant_section(
     entity: &Entity<SessionStore>,
     t: &Palette,
     ty: &settings::Typography,
-) -> gpui_kit::Stateful<Div> {
+) -> AnyElement {
     let animate_motion = effective_motion(cx) != MotionLevel::Off;
     let reasoning = matches!(kind, AssistantBlockKind::Reasoning);
-    let (expanded, header, body) = {
+    let weak_entity = entity.downgrade();
+    let (expanded, header, body, full_text, md_extensions, md_key) = {
         let store = entity.read(cx);
         let text = assistant_source_text(store, source);
+        let md_key = SharedString::from(format!(
+            "md-{}-{}-{section}",
+            store.session_id, block_id.0
+        ));
+        let md_extensions = store.md_extensions.clone();
         let expanded = reasoning && store.expanded_thinking.contains(block_id);
         let collapsed = reasoning && !expanded;
         let header: Option<AnyElement> = if reasoning {
@@ -1127,11 +1092,18 @@ fn assistant_section(
             None
         };
         let body = if reasoning {
-            Vec::new()
+            None
         } else {
-            crate::markdown::render_blocks(&store.md_cache.get(section, text), section, t, ty, entity)
+            Some(crate::markdown::render_document(
+                md_key.clone(),
+                text,
+                &md_extensions,
+                weak_entity.clone(),
+                t,
+                ty,
+            ))
         };
-        (expanded, header, body)
+        (expanded, header, body, text.to_owned(), md_extensions, md_key)
     };
 
     let mut container = div()
@@ -1146,6 +1118,8 @@ fn assistant_section(
         let entity_for_body = entity.clone();
         let t_copy = *t;
         let ty_copy = *ty;
+        let md_ext_for_body = md_extensions.clone();
+        let md_key_for_body = md_key.clone();
         let revealed = accordion_reveal(
             SharedString::from(format!("think-reveal-{}", block_id.0)),
             expanded,
@@ -1154,12 +1128,13 @@ fn assistant_section(
             move |cx| {
                 let store = entity_for_body.read(cx);
                 let text = assistant_source_text(store, source);
-                let body = crate::markdown::render_blocks(
-                    &store.md_cache.get(section, text),
-                    section,
+                let body = crate::markdown::render_document(
+                    md_key_for_body.clone(),
+                    text,
+                    &md_ext_for_body,
+                    entity_for_body.downgrade(),
                     &t_copy,
                     &ty_copy,
-                    &entity_for_body,
                 );
                 div()
                     .ml_2p5()
@@ -1169,28 +1144,33 @@ fn assistant_section(
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .children(body)
+                    .child(body)
                     .into_any_element()
             },
         );
         container = container.children(revealed);
-    } else {
-        container = container.children(body);
+    } else if let Some(body) = body {
+        container = container.child(body);
     }
 
-    container.children((live && !reasoning).then(|| {
-        div()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .pt_0p5()
-            .child(live_dot(format!("live-gen-{}", block_id.0), t.accent, true))
-            .child(shimmer_label(
-                format!("live-shimmer-{}", block_id.0),
-                "正在生成…",
-                t,
-            ))
-    }))
+    container
+        .children((live && !reasoning).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .pt_0p5()
+                .child(live_dot(format!("live-gen-{}", block_id.0), t.accent, true))
+                .child(shimmer_label(
+                    format!("live-shimmer-{}", block_id.0),
+                    "正在生成…",
+                    t,
+                ))
+        }))
+        .context_menu(move |menu, window, cx| {
+            copy_context_menu(menu, window, cx, &full_text, &weak_entity)
+        })
+        .into_any_element()
 }
 
 /// 通知行:左侧呼吸点/色点 + 标签 + 正文。
@@ -1282,6 +1262,54 @@ fn timeline_entry(
         );
     }
 
+    let open_info = {
+        let store = entity.read(cx);
+        if matches!(store.entries.get(index), Some(TimelineEntry::Input { .. })) {
+            crate::handoff::detect_open_source(store, index).map(|src| {
+                let text = match store.entries.get(index) {
+                    Some(TimelineEntry::Input { content, .. }) => content_text(content).to_owned(),
+                    _ => String::new(),
+                };
+                (src, text)
+            })
+        } else {
+            None
+        }
+    };
+    if let Some((open_source, open_text)) = open_info {
+        return Some(
+            crate::handoff::render_open_card(
+                window,
+                cx,
+                entity,
+                &open_text,
+                &open_source,
+                t,
+                ty,
+            )
+            .into_any_element(),
+        );
+    }
+
+    let seal_facts = {
+        let store = entity.read(cx);
+        if let Some(TimelineEntry::ToolCall { call_id, .. }) = store.entries.get(index) {
+            store
+                .tools
+                .iter()
+                .find(|tool| &tool.call_id == call_id)
+                .and_then(crate::store::handoff_facts)
+        } else {
+            None
+        }
+    };
+    if let Some(facts) = seal_facts {
+        return Some(
+            crate::handoff::render_seal_card(window, cx, entity, &facts, t, ty)
+                .into_any_element(),
+        );
+    }
+
     let store = entity.read(cx);
     let entry = store.entries.get(index)?;
     Some(match entry {
@@ -1320,9 +1348,17 @@ fn timeline_entry(
                 notice_line(label, text, t.dim, t).into_any_element()
             } else {
                 let mut row = match purpose {
-                    InputPurpose::TriggerTurn => {
-                        div().flex().flex_col().items_end().gap_1p5().child(user_bubble(text, t))
-                    }
+                    InputPurpose::TriggerTurn => div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap_1p5()
+                        .child(user_bubble(
+                            SharedString::from(format!("user-msg-{index}")),
+                            text,
+                            entity,
+                            t,
+                        )),
                     InputPurpose::QueueOnly => notice_line("排队消息", text, t.dim, t),
                     InputPurpose::Steer => notice_line("运行中转向", text, t.warn, t),
                     InputPurpose::Interject => notice_line("运行中插话", text, t.warn, t),
@@ -1515,247 +1551,8 @@ fn interaction_card(
         })
 }
 
-impl SessionStore {
-    fn ask_dialog(
-        &mut self,
-        interaction: &qaqh_ringing_contract::state::InteractionView,
-        dialog: Dialog,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Dialog {
-        let t = *cx.colors();
-        let iid = interaction.interaction_id.clone();
-        let questions = ask::parse_request(&interaction.request);
-        match questions {
-            Ok(questions) if !questions.is_empty() => {
-                let ids: Vec<String> = questions.iter().map(|q| q.id.clone()).collect();
-                let mut body: Vec<AnyElement> = Vec::new();
-                if let Some(hint) = &self.ask_hint {
-                    body.push(
-                        div()
-                            .text_xs()
-                            .text_color(t.bad)
-                            .child(SharedString::from(hint.clone()))
-                            .into_any_element(),
-                    );
-                }
-                for (index, question) in questions.iter().enumerate() {
-                    let field =
-                        self.ask_draft(&iid, questions.len(), window, cx).customs[index].clone();
-                    let mut row = div().flex().flex_col().gap_1p5();
-                    row = row.child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(SharedString::from(format!(
-                                "{}. {}",
-                                index + 1,
-                                question.question
-                            ))),
-                    );
-                    for option in &question.options {
-                        let chosen = self.ask_draft(&iid, questions.len(), window, cx).answers
-                            [index]
-                            .as_deref()
-                            == Some(option.as_str());
-                        let opt = option.clone();
-                        let opt_click = opt.clone();
-                        let iid_click = iid.clone();
-                        row = row.child(
-                            div()
-                                .id(SharedString::from(format!("ask-{iid}-{index}-{opt}")))
-                                .px_3()
-                                .py_1p5()
-                                .rounded(px(RADIUS_CONTROL))
-                                .text_xs()
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(if chosen { t.accent } else { t.border_subtle })
-                                .bg(if chosen { t.accent_soft } else { t.surface_subtle })
-                                .text_color(if chosen { t.accent } else { t.text })
-                                .hover(|style| style.bg(t.hover))
-                                .on_click(cx.listener(
-                                    move |store: &mut SessionStore, _, window: &mut Window, cx| {
-                                        let draft = store.ask_draft(&iid_click, index + 1, window, cx);
-                                        draft.answers[index] = Some(opt_click.clone());
-                                        draft.customs[index].update(cx, |custom, cx| {
-                                            custom.set_value("", window, cx)
-                                        });
-                                        cx.notify();
-                                    },
-                                ))
-                                .child(SharedString::from(format!(
-                                    "{} {opt}",
-                                    if chosen { "●" } else { "○" }
-                                ))),
-                        );
-                    }
-                    if question.allow_custom {
-                        row = row.child(Input::new(&field).small().w_full());
-                    }
-                    body.push(row.into_any_element());
-                }
-                let submit = {
-                    let iid_submit = iid.clone();
-                    let ids = ids.clone();
-                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
-                        if store.ask_submit(&iid_submit, &ids, cx).is_some() {
-                            store.ask_hint = None;
-                            window.close_dialog(cx);
-                        } else {
-                            store.ask_hint = Some("请先选择答案或填写自定义回答".into());
-                        }
-                        cx.notify();
-                    })
-                };
-                let skip = {
-                    let iid_skip = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
-                        store.ask_dismiss(&iid_skip);
-                        store.ask_hint = None;
-                        window.close_dialog(cx);
-                        cx.notify();
-                    })
-                };
-                dialog
-                    .title("会话提问")
-                    .children(body)
-                    .footer(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(qaqh_gpui_kit::kit::button(
-                                cx,
-                                qaqh_gpui_kit::kit::BtnKind::Soft,
-                                format!("ask-submit-{iid}"),
-                                "提交回答",
-                                &t,
-                                submit,
-                            ))
-                            .child(qaqh_gpui_kit::kit::button(
-                                cx,
-                                qaqh_gpui_kit::kit::BtnKind::Ghost,
-                                format!("ask-skip-{iid}"),
-                                "跳过",
-                                &t,
-                                skip,
-                            )),
-                    )
-            }
-            _ => {
-                let field = self.ask_draft(&iid, 1, window, cx).customs[0].clone();
-                let submit = {
-                    let ids = vec!["q1".to_string()];
-                    let iid_submit = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
-                        if store.ask_submit(&iid_submit, &ids, cx).is_some() {
-                            store.ask_hint = None;
-                            window.close_dialog(cx);
-                        } else {
-                            store.ask_hint = Some("请填写回答".into());
-                        }
-                        cx.notify();
-                    })
-                };
-                let skip = {
-                    let iid_skip = iid.clone();
-                    cx.listener(move |store: &mut SessionStore, _, window: &mut Window, cx| {
-                        store.ask_dismiss(&iid_skip);
-                        store.ask_hint = None;
-                        window.close_dialog(cx);
-                        cx.notify();
-                    })
-                };
-                let mut body: Vec<AnyElement> = Vec::new();
-                body.push(
-                    div()
-                        .text_sm()
-                        .child(SharedString::from(content_text(&interaction.request).to_owned()))
-                        .into_any_element(),
-                );
-                if let Some(hint) = &self.ask_hint {
-                    body.push(
-                        div()
-                            .text_xs()
-                            .text_color(t.bad)
-                            .child(SharedString::from(hint.clone()))
-                            .into_any_element(),
-                    );
-                }
-                body.push(Input::new(&field).small().w_full().into_any_element());
-                dialog
-                    .title("会话提问")
-                    .children(body)
-                    .footer(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(qaqh_gpui_kit::kit::button(
-                                cx,
-                                qaqh_gpui_kit::kit::BtnKind::Soft,
-                                format!("ask-submit-{iid}"),
-                                "提交回答",
-                                &t,
-                                submit,
-                            ))
-                            .child(qaqh_gpui_kit::kit::button(
-                                cx,
-                                qaqh_gpui_kit::kit::BtnKind::Ghost,
-                                format!("ask-skip-{iid}"),
-                                "跳过",
-                                &t,
-                                skip,
-                            )),
-                    )
-            }
-        }
-    }
-}
-
-/// 打开 ask 应答 Dialog。
-pub fn open_ask_dialog(
-    store: &Entity<SessionStore>,
-    interaction_id: qaqh_ringing_contract::fact::InteractionId,
-    window: &mut Window,
-    cx: &mut gpui_kit::App,
-) {
-    window.open_dialog(cx, {
-        let store = store.clone();
-        move |dialog, window, cx| {
-            store.update(cx, |store, cx| {
-                let t = *cx.colors();
-                match store
-                    .interactions
-                    .iter()
-                    .find(|view| view.interaction_id == interaction_id)
-                {
-                    Some(interaction) if interaction.resolution.is_none() => {
-                        let interaction = interaction.clone();
-                        store.ask_dialog(&interaction, dialog, window, cx)
-                    }
-                    _ => dialog
-                        .title("会话提问")
-                        .child(div().text_sm().text_color(t.dim).child("该提问已处理。"))
-                        .footer(
-                            div().flex().justify_end().child(action_button(
-                                cx,
-                                "ask-dialog-done".into(),
-                                "关闭",
-                                t.dim,
-                                |_, window: &mut Window, cx: &mut gpui_kit::App| window.close_dialog(cx),
-                                &t,
-                            )),
-                        ),
-                }
-            })
-        }
-    });
-}
-
 impl Render for SessionStore {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.colors();
         crate::terminal_panel::sync(self, cx);
 
@@ -2094,50 +1891,13 @@ impl Render for SessionStore {
                     );
                 }
                 InteractionKind::Ask => {
-                    let entity = cx.entity();
-                    let iid = interaction.interaction_id.clone();
-                    pending_interactions.push(
-                        div()
-                            .rounded(px(RADIUS_CARD))
-                            .border_1()
-                            .border_color(soft(t.warn, 0.35))
-                            .bg(t.warn_bg)
-                            .px_3p5()
-                            .py_2()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(t.warn)
-                                    .child(
-                                        Icon::new(IconName::CircleAlert)
-                                            .with_size(Size::XSmall)
-                                            .text_color(t.warn),
-                                    )
-                                    .child("代理正在等待你回答提问"),
-                            )
-                            .child(
-                                action_button(
-                                    cx,
-                                    format!("ask-open-{}", iid.0),
-                                    "打开提问弹窗",
-                                    t.accent,
-                                    move |_, window: &mut Window, cx: &mut gpui_kit::App| {
-                                        open_ask_dialog(&entity, iid.clone(), window, cx);
-                                    },
-                                    &t,
-                                )
-                                .into_any_element(),
-                            )
-                            .into_any_element(),
-                    );
+                    pending_interactions.push(crate::ask_dock::render(
+                        self,
+                        interaction,
+                        window,
+                        cx,
+                        &t,
+                    ));
                 }
             }
         }

@@ -131,10 +131,22 @@ pub fn accordion_reveal(
     }
     let content = build(cx);
     if progress >= 0.999 {
-        return Some(content);
+        return Some(
+            div()
+                .flex_shrink_0()
+                .w_full()
+                .child(content)
+                .into_any_element(),
+        );
     }
     let wrapped = div().w_full().opacity(progress).child(content).into_any_element();
-    Some(MotionReveal::new(elem_id, progress, wrapped).into_any_element())
+    Some(
+        div()
+            .flex_shrink_0()
+            .w_full()
+            .child(MotionReveal::new(elem_id, progress, wrapped))
+            .into_any_element(),
+    )
 }
 
 /// 0° ↔ 90° 物理弹簧折叠指示箭头(ChevronRight)。

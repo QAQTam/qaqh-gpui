@@ -128,6 +128,7 @@ impl Render for DaemonStore {
                 div()
                     .id(SharedString::from(format!("grp-{key}")))
                     .group("grp")
+                    .flex_shrink_0()
                     .px_2()
                     .pt_2p5()
                     .pb_1()
@@ -144,6 +145,7 @@ impl Render for DaemonStore {
                                 daemon.collapsed.remove(&title);
                             } else {
                                 daemon.collapsed.insert(title.clone());
+                                daemon.expanded_more.remove(&title);
                             }
                             cx.notify();
                         },
@@ -177,83 +179,117 @@ impl Render for DaemonStore {
                     .children(new_in)
                     .into_any_element(),
             );
+            const WORKSPACE_PREVIEW_LIMIT: usize = 5;
             let group_rows = group.rows.clone();
             let group_titles: Vec<SharedString> = group_rows
                 .iter()
                 .map(|row| clean_session_title(row, &self.workspaces))
                 .collect();
+            let group_parents: Vec<Option<SharedString>> = group_rows
+                .iter()
+                .map(|row| {
+                    row.handoff_from_session_id.as_ref().and_then(|parent_id| {
+                        self.sessions
+                            .iter()
+                            .find(|item| &item.id == parent_id)
+                            .map(|parent| clean_session_title(parent, &self.workspaces))
+                    })
+                })
+                .collect();
             let rename_draft = self.rename_draft.clone();
             let active_id_for_grp = active_id.clone();
             let daemon_for_grp = daemon_entity.clone();
+            let anchors_for_grp = self.handoff_anchors.clone();
+            let has_more = query.is_empty() && group_rows.len() > WORKSPACE_PREVIEW_LIMIT;
+            let show_all = !has_more || self.expanded_more.contains(&key);
+            let primary_len = if has_more {
+                WORKSPACE_PREVIEW_LIMIT
+            } else {
+                group_rows.len()
+            };
+            let extra_count = group_rows.len().saturating_sub(primary_len);
+            let extra_panel = has_more
+                .then(|| {
+                    accordion_reveal(
+                        SharedString::from(format!("ws-more-{key}")),
+                        !collapsed && show_all,
+                        window,
+                        cx,
+                        |_cx| {
+                            render_session_rows(
+                                &group_rows[primary_len..],
+                                &group_titles[primary_len..],
+                                &group_parents[primary_len..],
+                                &rename_draft,
+                                active_id_for_grp.as_deref(),
+                                active_tone,
+                                &daemon_for_grp,
+                                &anchors_for_grp,
+                                &t,
+                                animate_motion,
+                            )
+                            .into_any_element()
+                        },
+                    )
+                })
+                .flatten();
             let reveal_key = SharedString::from(format!("ws-grp-{key}"));
             if let Some(panel) = accordion_reveal(reveal_key, !collapsed, window, cx, |_cx| {
-                let mut list = div().flex().flex_col().gap_0p5();
-                for (row, display_title) in group_rows.iter().zip(group_titles.iter()) {
-                    if rename_draft
-                        .as_ref()
-                        .is_some_and(|(rid, _)| rid == &row.id)
-                    {
-                        let draft = rename_draft.as_ref().unwrap().1.clone();
-                        let daemon_esc = daemon_for_grp.clone();
-                        list = list.child(
-                            div()
-                                .id(SharedString::from(format!("sess-rename-{}", row.id)))
-                                .mx_1()
-                                .my_0p5()
-                                .px_2()
-                                .py_1()
-                                .rounded(px(RADIUS_CONTROL))
-                                .bg(t.card)
-                                .border_1()
-                                .border_color(t.accent)
-                                .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                                    if event.keystroke.key == "escape" {
-                                        let _ = daemon_esc.update(cx, |daemon, cx| {
-                                            daemon.rename_draft = None;
-                                            cx.notify();
-                                        });
-                                        cx.stop_propagation();
+                let mut list = render_session_rows(
+                    &group_rows[..primary_len],
+                    &group_titles[..primary_len],
+                    &group_parents[..primary_len],
+                    &rename_draft,
+                    active_id_for_grp.as_deref(),
+                    active_tone,
+                    &daemon_for_grp,
+                    &anchors_for_grp,
+                    &t,
+                    animate_motion,
+                );
+                if let Some(extra) = extra_panel {
+                    list = list.child(extra);
+                }
+                if has_more {
+                    let more_key = key.clone();
+                    let daemon_more = daemon_for_grp.clone();
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!("ws-more-btn-{key}")))
+                            .mx_0p5()
+                            .px_2p5()
+                            .py_1()
+                            .rounded(px(RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(t.dim)
+                            .hover(|style| style.bg(t.hover).text_color(t.text))
+                            .on_click(move |_, _, cx| {
+                                let _ = daemon_more.update(cx, |daemon, cx| {
+                                    if !daemon.expanded_more.remove(&more_key) {
+                                        daemon.expanded_more.insert(more_key.clone());
                                     }
-                                })
-                                .child(Input::new(&draft).small()),
-                        );
-                        continue;
-                    }
-                    let selected = active_id_for_grp.as_deref() == Some(row.id.as_str());
-                    let id = row.id.clone();
-                    let archived = row.archived;
-                    let daemon_click = daemon_for_grp.clone();
-                    let listener =
-                        move |event: &ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
-                            let _ = daemon_click.update(cx, |daemon, cx| {
-                                if event.is_secondary() {
-                                    let position = event.mouse_position().unwrap_or_default();
-                                    let size = window.viewport_size();
-                                    daemon.ctx_menu = Some(crate::daemon::SessionCtxMenu {
-                                        session_id: id.clone(),
-                                        archived,
-                                        position: gpui_kit::point(
-                                            position.x.min(size.width - px(180.)).max(px(0.)),
-                                            position.y.min(size.height - px(120.)).max(px(0.)),
-                                        ),
-                                        confirm_delete: false,
-                                    });
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                Icon::new(if show_all {
+                                    IconName::ChevronUp
                                 } else {
-                                    daemon.select(id.clone(), window, cx);
-                                }
-                                cx.notify();
-                            });
-                        };
-                    let tone = if selected { active_tone } else { None };
-                    list = list.child(sidebar_row(
-                        row,
-                        display_title.as_ref(),
-                        selected,
-                        tone,
-                        &t,
-                        animate_motion,
-                        listener,
-                    ));
+                                    IconName::ChevronDown
+                                })
+                                .with_size(Size::XSmall)
+                                .text_color(t.faint),
+                            )
+                            .child(if show_all {
+                                SharedString::from("收起多余会话")
+                            } else {
+                                SharedString::from(format!("显示更多（余 {extra_count} 条）"))
+                            }),
+                    );
                 }
                 list.into_any_element()
             }) {
@@ -425,17 +461,29 @@ impl Render for DaemonStore {
             .child(new_chat_card)
             .child(primary_nav)
             .child(search_bar)
-            .child(
+            .child({
+                let anchors = self.handoff_anchors.clone();
                 div()
-                    .id("session-list")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap_0p5()
-                    .children(rows),
-            )
+                    .child(
+                        div()
+                            .id("session-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .children(rows),
+                    )
+                    .child(qaqh_gpui_session::handoff::anchor_probe(move |bounds| {
+                        anchors.record_sidebar_list(bounds);
+                    }))
+            })
             .child(utility_footer);
 
         let animated_width = spring_f32(
@@ -531,6 +579,7 @@ impl Render for DaemonStore {
                 .id("settings-modal-backdrop")
                 .absolute()
                 .inset_0()
+                .when(self.settings_open, |el| el.occlude())
                 .bg(soft(t.scrim, t.scrim.a * p))
                 .flex()
                 .items_center()
@@ -648,6 +697,15 @@ impl Render for DaemonStore {
                     .as_ref()
                     .map(|menu| ctx_menu_element(menu, cx, &t, animate_motion)),
             )
+            .children(self.fly_box.as_ref().map(|fly| {
+                qaqh_gpui_session::handoff::fly_box_overlay(
+                    fly.from,
+                    fly.target_session_id.clone(),
+                    fly.started_at,
+                    self.handoff_anchors.clone(),
+                    t,
+                )
+            }))
     }
 }
 
@@ -808,6 +866,7 @@ fn ctx_menu_element(
                 .id("ctx-menu-backdrop")
                 .absolute()
                 .inset_0()
+                .occlude()
                 .on_click(cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
                     daemon.ctx_menu = None;
                     cx.notify();
@@ -844,4 +903,89 @@ fn ctx_item(
         .child(label)
         .on_click(listener)
         .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_session_rows(
+    rows: &[qaqh_gpui_session::store::SessionRow],
+    titles: &[SharedString],
+    parents: &[Option<SharedString>],
+    rename_draft: &Option<(String, gpui_kit::Entity<InputState>)>,
+    active_id: Option<&str>,
+    active_tone: Option<bool>,
+    daemon_entity: &gpui_kit::Entity<DaemonStore>,
+    anchors: &qaqh_gpui_session::handoff::HandoffAnchors,
+    t: &Palette,
+    animate_motion: bool,
+) -> gpui_kit::Div {
+    let mut list = div().flex().flex_col().gap_0p5();
+    for ((row, display_title), parent_title) in rows.iter().zip(titles.iter()).zip(parents.iter()) {
+        if rename_draft
+            .as_ref()
+            .is_some_and(|(rid, _)| rid == &row.id)
+        {
+            let draft = rename_draft.as_ref().unwrap().1.clone();
+            let daemon_esc = daemon_entity.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("sess-rename-{}", row.id)))
+                    .mx_1()
+                    .my_0p5()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(RADIUS_CONTROL))
+                    .bg(t.card)
+                    .border_1()
+                    .border_color(t.accent)
+                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            let _ = daemon_esc.update(cx, |daemon, cx| {
+                                daemon.rename_draft = None;
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(Input::new(&draft).small()),
+            );
+            continue;
+        }
+        let selected = active_id == Some(row.id.as_str());
+        let id = row.id.clone();
+        let archived = row.archived;
+        let daemon_click = daemon_entity.clone();
+        let listener = move |event: &ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
+            let _ = daemon_click.update(cx, |daemon, cx| {
+                if event.is_secondary() {
+                    let position = event.mouse_position().unwrap_or_default();
+                    let size = window.viewport_size();
+                    daemon.ctx_menu = Some(crate::daemon::SessionCtxMenu {
+                        session_id: id.clone(),
+                        archived,
+                        position: gpui_kit::point(
+                            position.x.min(size.width - px(180.)).max(px(0.)),
+                            position.y.min(size.height - px(120.)).max(px(0.)),
+                        ),
+                        confirm_delete: false,
+                    });
+                } else {
+                    daemon.select(id.clone(), window, cx);
+                }
+                cx.notify();
+            });
+        };
+        let tone = if selected { active_tone } else { None };
+        list = list.child(sidebar_row(
+            row,
+            display_title.as_ref(),
+            parent_title.clone(),
+            anchors.clone(),
+            selected,
+            tone,
+            t,
+            animate_motion,
+            listener,
+        ));
+    }
+    list
 }

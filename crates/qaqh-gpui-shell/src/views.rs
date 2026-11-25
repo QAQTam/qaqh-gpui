@@ -32,9 +32,12 @@ use qaqh_types::SessionRunStatus;
 use crate::daemon::{DaemonStore, InspectorTab};
 
 /// 侧栏条目:中性悬浮胶囊;仅运行中/等待授权/失败时显示状态点,历史空闲会话干净留白。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sidebar_row(
     row: &SessionRow,
     display_title: &str,
+    parent_title: Option<SharedString>,
+    anchors: qaqh_gpui_session::handoff::HandoffAnchors,
     selected: bool,
     tone: Option<bool>,
     t: &Palette,
@@ -47,8 +50,27 @@ pub(crate) fn sidebar_row(
         _ if tone == Some(false) => Some((t.bad, false)),
         _ => None,
     };
+    let anchor_id = row.id.clone();
+    let lineage_badge = row.handoff_from_session_id.as_ref().map(|_| {
+        let tip = match &parent_title {
+            Some(title) if !title.is_empty() => format!("交接自「{title}」"),
+            _ => "由上游会话交接而来".to_owned(),
+        };
+        div()
+            .id(SharedString::from(format!("sess-fork-{}", row.id)))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+            .child(
+                Icon::new(IconName::GitFork)
+                    .with_size(Size::XSmall)
+                    .text_color(t.faint),
+            )
+    });
     div()
         .id(SharedString::from(format!("sess-{}", row.id)))
+        .relative()
         .mx_0p5()
         .px_2p5()
         .py_1p5()
@@ -78,6 +100,7 @@ pub(crate) fn sidebar_row(
                 .truncate()
                 .child(SharedString::from(display_title.to_owned())),
         )
+        .children(lineage_badge)
         .child(
             div()
                 .flex_shrink_0()
@@ -85,6 +108,9 @@ pub(crate) fn sidebar_row(
                 .text_color(t.faint)
                 .child(qaqh_gpui_kit::kit::relative_time(row.updated_at)),
         )
+        .child(qaqh_gpui_session::handoff::anchor_probe(move |bounds| {
+            anchors.record_sidebar_row(&anchor_id, bounds);
+        }))
 }
 
 fn format_tok_count(tokens: u64) -> String {

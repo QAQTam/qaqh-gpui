@@ -2,7 +2,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::prelude::*;
-use gpui_kit::{Context, Div, PathPromptOptions, SharedString, div, px};
+use gpui_kit::base::{SelectableText, TextSelection};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::{ClipboardItem, Context, Div, PathPromptOptions, SharedString, div, px};
 use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
 use qaqh_gpui_kit::kit::{
@@ -642,44 +644,61 @@ pub fn render(
     cx: &mut Context<SessionStore>,
 ) -> Option<Div> {
     let view = store.code_panel.view.as_ref()?;
-    let (title, body) = match view {
+    let (title, body, full_copy_text) = match view {
         View::Loading(location) => (
             location.path.display().to_string(),
             div().child("正在读取源码…"),
+            String::new(),
         ),
         View::Source(location, result) => {
             let mut title = format!("{}:{}", location.path.display(), location.line);
             if let Some(column) = location.column {
                 title.push_str(&format!(":{column}"));
             }
-            let body = match result {
+            let (body, copy_all) = match result {
                 Ok(excerpt) => {
                     let lang = location
                         .path
                         .extension()
                         .and_then(|extension| extension.to_str());
-                    div().children(excerpt.lines.iter().enumerate().map(|(index, line)| {
-                        let number = excerpt.first_line + index;
-                        div()
-                            .flex()
-                            .gap_2()
-                            .whitespace_nowrap()
-                            .when(number == location.line, |row| {
-                                row.bg(t.code_bg).border_l_2().border_color(t.accent)
-                            })
-                            .child(
-                                div()
-                                    .w(px(48.))
-                                    .flex_shrink_0()
-                                    .text_color(t.dim)
-                                    .child(number.to_string()),
-                            )
-                            .child(qaqh_gpui_render::highlight::code_text(line, lang, t))
-                    }))
+                    let line_refs: Vec<&str> = excerpt.lines.iter().map(String::as_str).collect();
+                    let per_line = qaqh_gpui_render::highlight::highlight_lines(&line_refs, lang, t);
+                    let copy_all = excerpt.lines.join("\n");
+                    let body = div().children(excerpt.lines.iter().zip(per_line).enumerate().map(
+                        |(index, (line, spans))| {
+                            let number = excerpt.first_line + index;
+                            div()
+                                .flex()
+                                .gap_2()
+                                .whitespace_nowrap()
+                                .when(number == location.line, |row| {
+                                    row.bg(t.code_bg).border_l_2().border_color(t.accent)
+                                })
+                                .child(
+                                    div()
+                                        .w(px(48.))
+                                        .flex_shrink_0()
+                                        .text_color(t.dim)
+                                        .child(number.to_string()),
+                                )
+                                .child(
+                                    SelectableText::new(
+                                        SharedString::from(format!(
+                                            "code-src-{}-{number}",
+                                            store.code_panel.request
+                                        )),
+                                        line.clone(),
+                                    )
+                                    .highlights(spans)
+                                    .selection_color(t.selection_wash),
+                                )
+                        },
+                    ));
+                    (body, copy_all)
                 }
-                Err(error) => div().text_color(t.warn).child(error.clone()),
+                Err(error) => (div().text_color(t.warn).child(error.clone()), String::new()),
             };
-            (title, body)
+            (title, body, copy_all)
         }
         View::Diff(review) => {
             let Review {
@@ -719,14 +738,40 @@ pub fn render(
                         }))
                 }));
             let mut body = div().child(files);
+            let mut copy_all = String::new();
             if let Some(patch) = patches.get(*selected) {
-                body =
-                    body.children(patch.rows.iter().enumerate().map(|(index, row)| {
-                        let (color, row_bg) = match row.text.as_bytes().first() {
-                            Some(b'+') => (t.ok, Some(soft(t.ok, 0.08))),
-                            Some(b'-') => (t.bad, Some(soft(t.bad, 0.08))),
-                            Some(b'@') => (t.accent, Some(soft(t.accent, 0.07))),
-                            _ => (t.text, None),
+                copy_all = patch
+                    .rows
+                    .iter()
+                    .map(|row| row.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let lang = Path::new(&patch.path)
+                    .extension()
+                    .and_then(|extension| extension.to_str());
+                let code_lines: Vec<&str> = patch
+                    .rows
+                    .iter()
+                    .map(|row| match row.text.as_bytes().first() {
+                        Some(b'+' | b'-' | b' ') => row.text.get(1..).unwrap_or(""),
+                        _ => "",
+                    })
+                    .collect();
+                let per_line = qaqh_gpui_render::highlight::highlight_lines(&code_lines, lang, t);
+                body = body.children(patch.rows.iter().zip(per_line).enumerate().map(
+                    |(index, (row, spans))| {
+                        let first = row.text.as_bytes().first().copied();
+                        let (sign_str, color, row_bg, is_code) = match first {
+                            Some(b'+') => ("+", t.ok, Some(soft(t.ok, 0.08)), true),
+                            Some(b'-') => ("-", t.bad, Some(soft(t.bad, 0.08)), true),
+                            Some(b'@') => ("", t.accent, Some(soft(t.accent, 0.07)), false),
+                            Some(b' ') => (" ", t.dim, None, true),
+                            _ => ("", t.text, None, false),
+                        };
+                        let code_body = if is_code {
+                            row.text.get(1..).unwrap_or("").to_owned()
+                        } else {
+                            row.text.clone()
                         };
                         let path = PathBuf::from(&patch.path);
                         let line = row.new;
@@ -737,7 +782,7 @@ pub fn render(
                             .px_1p5()
                             .rounded(px(4.))
                             .whitespace_nowrap()
-                            .text_color(color)
+                            .text_color(if is_code { t.text } else { color })
                             .when_some(row_bg, |el, bg| el.bg(bg))
                             .child(div().w(px(82.)).flex_shrink_0().text_color(t.dim).child(
                                 format!(
@@ -746,7 +791,20 @@ pub fn render(
                                     line.map(|line| line.to_string()).unwrap_or_default()
                                 ),
                             ))
-                            .child(row.text.clone())
+                            .when(is_code, |el| {
+                                el.child(div().w(px(10.)).flex_shrink_0().text_color(color).child(sign_str))
+                            })
+                            .child(
+                                SelectableText::new(
+                                    SharedString::from(format!(
+                                        "code-diff-{}-{}-{}",
+                                        store.code_panel.request, *selected, index
+                                    )),
+                                    code_body,
+                                )
+                                .highlights(spans)
+                                .selection_color(t.selection_wash),
+                            )
                             .when_some(line.filter(|_| !patch.deleted), |element, line| {
                                 element.cursor_pointer().on_click(cx.listener(
                                     move |store, _, _, cx| {
@@ -762,7 +820,8 @@ pub fn render(
                                     },
                                 ))
                             })
-                    }));
+                    },
+                ));
             } else if !review.loading && !review.failed {
                 body = body.child("当前工具结果没有可显示的补丁正文");
             }
@@ -772,7 +831,7 @@ pub fn render(
             if review.failed {
                 body = body.child(div().text_color(t.warn).child("部分工具结果读取失败"));
             }
-            ("本轮改动".into(), body)
+            ("本轮改动".into(), body, copy_all)
         }
     };
     Some(
@@ -889,7 +948,37 @@ pub fn render(
                     .p_3p5()
                     .font_family("monospace")
                     .text_size(px(ty.code_font_size))
-                    .child(body),
+                    .child(body)
+                    .context_menu(move |menu, window, cx| {
+                        let selected = TextSelection::selected_text(window, cx);
+                        let selected_trimmed = selected.trim().to_string();
+                        let has_selection = !selected_trimmed.is_empty();
+                        let copy_all = full_copy_text.clone();
+                        menu.item(
+                            PopupMenuItem::new("复制选中内容")
+                                .icon(IconName::Copy)
+                                .disabled(!has_selection)
+                                .on_click(move |_, _, cx| {
+                                    if !selected_trimmed.is_empty() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            selected_trimmed.clone(),
+                                        ));
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("复制全部内容")
+                                .icon(IconName::Copy)
+                                .disabled(copy_all.is_empty())
+                                .on_click(move |_, _, cx| {
+                                    if !copy_all.is_empty() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_all.clone(),
+                                        ));
+                                    }
+                                }),
+                        )
+                    }),
             ),
     )
 }

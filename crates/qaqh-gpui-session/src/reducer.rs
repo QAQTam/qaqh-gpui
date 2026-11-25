@@ -41,13 +41,57 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     clear_transient(store);
 }
 
+/// 快照重灌后同步交接投影(A 侧倒计时/新鲜封箱仪式 + B 侧新鲜开箱仪式)。
+/// 与 `apply_snapshot` 分离以保持纯快照单测无需 `Context`。
+pub fn sync_handoff_after_snapshot(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
+    let latest_facts = store
+        .tools
+        .iter()
+        .rev()
+        .find(|view| view.tool_name.as_deref() == Some("handoff"))
+        .and_then(crate::store::handoff_facts);
+
+    if let Some(facts) = latest_facts {
+        if !facts.auto_continue && !store.handoff_eager {
+            store.handoff_stay = true;
+        }
+        if facts.sealed {
+            let fresh = facts
+                .sealed_at_ms
+                .is_some_and(|t0| crate::store::now_ms().saturating_sub(t0) < 12_000);
+            if fresh
+                && !store.handoff_ritual_done.contains(&facts.call_id)
+                && !store.handoff_seal_rituals.contains_key(&facts.call_id)
+            {
+                store
+                    .handoff_seal_rituals
+                    .insert(facts.call_id.clone(), std::time::Instant::now());
+            }
+        }
+        store.handoff_open = (facts.sealed && facts.planned_open_at_ms.is_some()).then_some(facts);
+        arm_handoff_tick(store, cx);
+    }
+
+    if let Some(first_input) = store
+        .entries
+        .iter()
+        .position(|entry| matches!(entry, TimelineEntry::Input { .. }))
+        && let Some(source) = crate::handoff::detect_open_source(store, first_input)
+        && source.at_ms > 0
+        && crate::store::now_ms().saturating_sub(source.at_ms) < 12_000
+        && !store.handoff_open_ritual_done
+        && store.handoff_open_ritual.is_none()
+    {
+        store.handoff_open_ritual = Some(std::time::Instant::now());
+    }
+}
+
 /// resync:清暂态,已提交状态等待快照重灌。
 pub fn clear_transient(store: &mut SessionStore) {
     store.streaming.clear();
     store.arg_stream.clear();
     store.output_tail.clear();
     store.exec_output_tail.clear();
-    store.md_cache.clear();
     store.provider_retry = None;
 }
 
@@ -244,15 +288,29 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                 });
             }
             // ADR-016 开箱机器面:handoff 工具终态成功即解析 T0/计划开箱并武装
-            // 倒计时(纯展示,§决策 3)。
-            if updated {
-                if let Some(view) = store.tools.iter().find(|view| view.call_id == finished_call_id)
-                    && view.tool_name.as_deref() == Some("handoff")
-                {
-                    store.handoff_open = crate::store::handoff_facts(view)
-                        .filter(|facts| facts.sealed && facts.planned_open_at_ms.is_some());
-                    arm_handoff_tick(store, cx);
+            // 倒计时(纯展示,§决策 3);若刚封箱(12s 内)则触发一次封箱大盒仪式。
+            if updated
+                && let Some(view) = store.tools.iter().find(|view| view.call_id == finished_call_id)
+                && view.tool_name.as_deref() == Some("handoff")
+                && let Some(facts) = crate::store::handoff_facts(view)
+            {
+                if !facts.auto_continue && !store.handoff_eager {
+                    store.handoff_stay = true;
                 }
+                if facts.sealed
+                    && !store.handoff_ritual_done.contains(&finished_call_id)
+                    && !store.handoff_seal_rituals.contains_key(&finished_call_id)
+                    && facts
+                        .sealed_at_ms
+                        .is_none_or(|t0| crate::store::now_ms().saturating_sub(t0) < 12_000)
+                {
+                    store
+                        .handoff_seal_rituals
+                        .insert(finished_call_id.clone(), std::time::Instant::now());
+                }
+                store.handoff_open =
+                    (facts.sealed && facts.planned_open_at_ms.is_some()).then_some(facts);
+                arm_handoff_tick(store, cx);
             }
         }
         SessionEvent::ExecSessionStarted { session } => upsert_exec(store, session),
@@ -382,18 +440,12 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             successor_session_id,
             work_summary,
             turn_id,
+            at_ms,
             ..
         } => {
-            // ADR-0016 纯信息面:fork 本体不依赖本事件。仅封箱线本线需要标记,
-            // 后继线经 session.list 正常渲染。双发幂等:整字段替换(同 GoalUpdated 口径)。
+            // ADR-0016 纯信息面:双发到封箱线与后继线。
             if sealed_session_id == store.session_id {
-                store.handoff_seal = Some(HandoffSeal {
-                    successor_session_id: successor_session_id.clone(),
-                    work_summary,
-                });
-                // 自动接续偏好:同回合 handoff 工具的 args/output;false = 「不拽我」
-                // (内核照常 fork,只是前端不自动跳)。
-                let auto_continue = store
+                let model_auto = store
                     .tools
                     .iter()
                     .find(|tool| {
@@ -403,7 +455,27 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                     .and_then(crate::store::handoff_facts)
                     .map(|facts| facts.auto_continue)
                     .unwrap_or(true);
-                store.handoff_auto_jump = auto_continue.then(|| successor_session_id);
+                store.handoff_seal = Some(HandoffSeal {
+                    sealed_session_id,
+                    successor_session_id: successor_session_id.clone(),
+                    work_summary,
+                    at_ms,
+                });
+                let should_jump = store.handoff_eager || (!store.handoff_stay && model_auto);
+                store.handoff_auto_jump = should_jump.then_some(successor_session_id);
+            } else if successor_session_id == store.session_id {
+                store.handoff_incoming = Some(crate::handoff::HandoffOpenSource {
+                    parent_session_id: sealed_session_id,
+                    work_summary,
+                    at_ms,
+                });
+                if at_ms > 0
+                    && crate::store::now_ms().saturating_sub(at_ms) < 12_000
+                    && !store.handoff_open_ritual_done
+                    && store.handoff_open_ritual.is_none()
+                {
+                    store.handoff_open_ritual = Some(std::time::Instant::now());
+                }
             }
         }
         SessionEvent::PromptBlocked { reason } => {

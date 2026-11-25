@@ -10,10 +10,10 @@ use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::AppContext as _;
 use gpui_kit::Context;
 use gpui_kit::Entity;
+use gpui_kit::Subscription;
 use gpui_kit::Window;
 use qaqh_ringing_contract::events::SessionEvent;
 use qaqh_ringing_contract::fact::ActivityState;
-use qaqh_ringing_contract::fact::InteractionKind;
 use qaqh_ringing_contract::workspace::WorkspaceEntry;
 
 use qaqh_gpui_wire::bridge::{
@@ -86,6 +86,13 @@ pub struct SessionCtxMenu {
     pub confirm_delete: bool,
 }
 
+/// 窗口级跨区飞箱状态:A 卡头盒槽 → 侧栏后继会话行。
+pub struct FlyBoxState {
+    pub from: gpui_kit::Point<gpui_kit::Pixels>,
+    pub target_session_id: String,
+    pub started_at: std::time::Instant,
+}
+
 pub struct DaemonStore {
     pub last_operation: Option<String>,
     pub connection: qaqh_gpui_wire::bridge::ConnectionState,
@@ -97,6 +104,8 @@ pub struct DaemonStore {
     pub workspaces: Vec<WorkspaceEntry>,
     /// 侧栏分组折叠状态(组标题)。
     pub collapsed: HashSet<String>,
+    /// 侧栏工作区分组展开全部会话的组键(未在集合中时默认展示前 5 条)。
+    pub expanded_more: HashSet<String>,
     /// 会话右键菜单(侧栏行右键打开;None = 关闭)。
     pub ctx_menu: Option<SessionCtxMenu>,
     /// 侧栏行内重命名草稿(session_id, 输入框实体)。
@@ -163,6 +172,14 @@ pub struct DaemonStore {
     pub workspace_path_input: Entity<InputState>,
     /// 全局策略页行内输入框。
     pub global_inputs: GlobalConfigInputs,
+    /// 跨组件交接飞箱坐标锚点表。
+    pub handoff_anchors: qaqh_gpui_session::handoff::HandoffAnchors,
+    /// 正在播放的跨区飞箱浮层状态。
+    pub fly_box: Option<FlyBoxState>,
+    /// 飞箱代际令牌(防手切打断后回调误切会话)。
+    pub fly_box_epoch: u64,
+    /// 缓存会话的导航事件订阅(随 LRU 淘汰一起清理)。
+    pub session_subs: Vec<(String, Subscription)>,
     pub requests: UnboundedSender<BridgeRequest>,
 }
 
@@ -213,6 +230,7 @@ impl DaemonStore {
             last_operation: None,
             connection: qaqh_gpui_wire::bridge::ConnectionState::Connecting,
             collapsed: workbench.collapsed.iter().cloned().collect(),
+            expanded_more: HashSet::new(),
             workbench,
             session_search,
             show_archived: false,
@@ -265,6 +283,10 @@ impl DaemonStore {
             inspector_tab: InspectorTab::default(),
             workspace_path_input,
             global_inputs,
+            handoff_anchors: Default::default(),
+            fly_box: None,
+            fly_box_epoch: 0,
+            session_subs: Vec::new(),
             requests,
         }
     }
@@ -547,11 +569,12 @@ impl DaemonStore {
                 crate::desktop::roster_notifications(&self.sessions, &value, cx);
                 self.sessions = rows_from(&value);
                 for store in &self.stores {
-                    let id = &store.read(cx).session_id;
-                    if let Some(row) = self.sessions.iter().find(|row| &row.id == id) {
+                    let id = store.read(cx).session_id.clone();
+                    if let Some(row) = self.sessions.iter().find(|row| row.id == id) {
                         let cwd = row.cwd.as_deref().map(Into::into);
                         store.update(cx, |store, _| store.code_panel.cwd = cwd);
                     }
+                    self.sync_store_lineage(store, cx);
                 }
                 if self.current.is_none()
                     && let Some(id) = self.workbench.recent_session.as_ref()
@@ -610,15 +633,6 @@ impl DaemonStore {
                 }
             }
             BridgeMsg::Event(seed, frame) => {
-                // ask 请求在 frame 被消费前先摘出 id(apply_frame 会 move frame)。
-                let ask_arrival = match &frame.event {
-                    SessionEvent::InteractionRequested { interaction }
-                        if interaction.kind == InteractionKind::Ask =>
-                    {
-                        Some(interaction.interaction_id.clone())
-                    }
-                    _ => None,
-                };
                 let notification = match &frame.event {
                     SessionEvent::InteractionRequested { .. } => Some("会话等待你的响应"),
                     SessionEvent::TurnEnded { outcome, .. } => Some(match outcome {
@@ -668,7 +682,7 @@ impl DaemonStore {
                     }
                     cx.notify();
                 });
-                // ADR-0016 自动接续:封箱线正开着且模型未声明「不拽我」→ 精确跳后继
+                // ADR-0016 自动接续:封箱线正开着且模型未声明「不拽我」→ 先播飞箱再切后继
                 // (HandoffSealed 权威事件驱动,不看本地钟;后台会话封箱不打扰)。
                 if let Some(current) = self.current.as_ref()
                     && current.read(cx).session_id == seed
@@ -676,18 +690,8 @@ impl DaemonStore {
                     let jump = current.read(cx).handoff_auto_jump.clone();
                     if let Some(successor) = jump {
                         current.update(cx, |store, _| store.handoff_auto_jump = None);
-                        self.select(successor, window, cx);
+                        self.jump_with_fly(successor, Some(seed.clone()), window, cx);
                     }
-                }
-                // ask 请求到达即弹模态应答卡(仅当前会话);关闭后可经 footer 按钮重开。
-                // 需在 seed 被 QueryTodo 移动之前判定。
-                if let Some(iid) = ask_arrival
-                    && let Some(entity) = self
-                        .current
-                        .as_ref()
-                        .filter(|store| store.read(cx).session_id == seed)
-                {
-                    qaqh_gpui_session::timeline::open_ask_dialog(entity, iid, window, cx);
                 }
                 if refresh_todos {
                     let _ = self
@@ -735,6 +739,7 @@ impl DaemonStore {
                     qaqh_gpui_wire::diagnostics::record("snapshot", Some(&store.session_id), None, Some(store.seq));
                     store.snapshot_pending = false;
                     for frame in std::mem::take(&mut store.buffered_frames) { qaqh_gpui_session::reducer::apply_frame(store, frame, cx); }
+                    qaqh_gpui_session::reducer::sync_handoff_after_snapshot(store, cx);
                     cx.notify();
                 });
                 let _ = self.requests.unbounded_send(BridgeRequest::QueryTodo { seed });
@@ -1084,7 +1089,91 @@ impl DaemonStore {
         cx.notify();
     }
 
+    fn sync_store_lineage(&self, store: &Entity<SessionStore>, cx: &mut Context<Self>) {
+        let store_id = store.read(cx).session_id.clone();
+        let meta_info = self
+            .sessions
+            .iter()
+            .find(|row| row.id == store_id)
+            .map(|row| (row.handoff_from_session_id.clone(), row.created_at_ms));
+        let child_seal = self
+            .sessions
+            .iter()
+            .find(|row| row.handoff_from_session_id.as_deref() == Some(store_id.as_str()))
+            .map(|child| qaqh_gpui_session::store::HandoffSeal {
+                sealed_session_id: store_id.clone(),
+                successor_session_id: child.id.clone(),
+                work_summary: clean_session_title(child, &self.workspaces).to_string(),
+                at_ms: child.created_at_ms,
+            });
+        store.update(cx, |store, cx| {
+            let mut changed = false;
+            if let Some((parent_id, created_at_ms)) = meta_info {
+                if store.handoff_from_session_id != parent_id {
+                    store.handoff_from_session_id = parent_id;
+                    changed = true;
+                }
+                if store.session_created_at_ms != created_at_ms && created_at_ms > 0 {
+                    store.session_created_at_ms = created_at_ms;
+                    changed = true;
+                }
+            }
+            if store.handoff_seal.is_none()
+                && let Some(seal) = child_seal
+            {
+                store.handoff_seal = Some(seal);
+                changed = true;
+            }
+            if changed {
+                cx.notify();
+            }
+        });
+    }
+
+    /// 交接跨区跳转:Full 动效下先从 A 侧盒槽飞箱 680ms 落位至侧栏目标行，再切到后继会话。
+    pub fn jump_with_fly(
+        &mut self,
+        target_session_id: String,
+        fly_from_session: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.requests.unbounded_send(BridgeRequest::RefreshRoster);
+        let full_motion = qaqh_gpui_kit::motion::effective_motion(cx)
+            == qaqh_gpui_kit::settings::MotionLevel::Full;
+        if full_motion
+            && let Some(from_id) = fly_from_session
+            && let Some(from_bounds) = self.handoff_anchors.seal_icon(&from_id)
+        {
+            self.fly_box_epoch = self.fly_box_epoch.wrapping_add(1);
+            let epoch = self.fly_box_epoch;
+            self.fly_box = Some(FlyBoxState {
+                from: from_bounds.center(),
+                target_session_id: target_session_id.clone(),
+                started_at: std::time::Instant::now(),
+            });
+            cx.notify();
+            let dur = std::time::Duration::from_secs_f32(
+                qaqh_gpui_session::handoff::FLY_BOX_SECS,
+            );
+            cx.spawn_in(window, async move |daemon, cx| {
+                cx.background_executor().timer(dur).await;
+                let _ = daemon.update_in(cx, |daemon, window, cx| {
+                    if daemon.fly_box_epoch == epoch {
+                        daemon.fly_box = None;
+                        daemon.select(target_session_id, window, cx);
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        self.select(target_session_id, window, cx);
+    }
+
     pub fn select(&mut self, seed: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.fly_box = None;
+        self.fly_box_epoch = self.fly_box_epoch.wrapping_add(1);
         if self.section != PrimarySection::Home || self.new_session_open {
             self.page_epoch = self.page_epoch.wrapping_add(1);
         }
@@ -1103,6 +1192,7 @@ impl DaemonStore {
                 // LRU:复用的会话移到末尾,避免被新会话挤出缓存。
                 self.stores.retain(|cached| cached != &store);
                 self.stores.push(store.clone());
+                self.sync_store_lineage(&store, cx);
                 store.update(cx, |store, _| { store.snapshot_pending = true; store.buffered_frames.clear(); });
                 let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
                 self.current = Some(store);
@@ -1110,9 +1200,11 @@ impl DaemonStore {
             }
             None => {
                 let requests = self.requests.clone();
+                let anchors = self.handoff_anchors.clone();
                 let draft = self.workbench.drafts.get(&seed).cloned().unwrap_or_default();
                 let store = cx.new(|cx| SessionStore::new(seed.clone(), requests, draft, window, cx));
                 store.update(cx, |store, _| {
+                    store.handoff_anchors = anchors;
                     store.catalog = self.providers.clone();
                     store.client_session_id = match &self.connection {
                         qaqh_gpui_wire::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None,
@@ -1123,10 +1215,30 @@ impl DaemonStore {
                 {
                     store.update(cx, |store, _| store.code_panel.cwd = Some(cwd.into()));
                 }
+                self.sync_store_lineage(&store, cx);
+                let sub = cx.subscribe_in(
+                    &store,
+                    window,
+                    |daemon, _, event: &qaqh_gpui_session::store::SessionNavEvent, window, cx| {
+                        let qaqh_gpui_session::store::SessionNavEvent::OpenSession {
+                            session_id,
+                            fly_from_session,
+                        } = event;
+                        daemon.jump_with_fly(
+                            session_id.clone(),
+                            fly_from_session.clone(),
+                            window,
+                            cx,
+                        );
+                    },
+                );
+                self.session_subs.push((seed.clone(), sub));
                 self.stores.push(store.clone());
                 self.current = Some(store);
                 if self.stores.len() > 4 {
-                    self.stores.remove(0);
+                    let evicted = self.stores.remove(0);
+                    let evicted_id = evicted.read(cx).session_id.clone();
+                    self.session_subs.retain(|(sid, _)| sid != &evicted_id);
                 }
                 let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
                 cx.notify();

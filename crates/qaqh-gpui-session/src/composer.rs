@@ -484,6 +484,87 @@ pub fn render(
     t: &Palette,
     content_width: f32,
 ) -> Div {
+    // ADR-016:封箱会话 loop 已闭门,置灰禁用输入并提供后继会话直达入口。
+    if let Some(seal) = store.handoff_seal.as_ref() {
+        let summary = seal.work_summary.trim();
+        let subtitle = if summary.is_empty() {
+            "上下文已封箱并移交，无法继续在此会话输入".to_owned()
+        } else {
+            format!("已移交至后继会话 · {summary}")
+        };
+        return div()
+            .w_full()
+            .max_w(px(content_width + 48.))
+            .mx_auto()
+            .px_4()
+            .pb_3()
+            .child(
+                div()
+                    .rounded(px(RADIUS_COMPOSER))
+                    .bg(t.surface_subtle)
+                    .border_1()
+                    .border_color(t.border)
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .child(
+                                Icon::new(IconName::PackageCheck)
+                                    .with_size(Size::Small)
+                                    .text_color(t.ok),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.text)
+                                            .child("当前会话已封箱交接"),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(t.dim)
+                                            .child(subtitle),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        Button::new("composer-handoff-open")
+                            .with_size(Size::Small)
+                            .rounded(ButtonRounded::Size(px(RADIUS_CHIP)))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(t.accent)
+                                    .foreground(t.on_accent)
+                                    .hover(t.accent_hover)
+                                    .active(t.accent_hover),
+                            )
+                            .icon(Icon::new(IconName::ArrowRight).text_color(t.on_accent))
+                            .label("打开后继会话")
+                            .on_click(cx.listener(|store, _, _, cx| {
+                                store.open_handoff_successor(cx);
+                            })),
+                    ),
+            );
+    }
+
     let running = store.activity == Some(ActivityState::Running);
     let blocked = (!running).then(|| store.send_block_reason()).flatten();
     let entity = cx.entity().downgrade();

@@ -22,23 +22,29 @@ pub(crate) fn render(
     cx: &mut Context<DaemonStore>,
     t: &Palette,
 ) -> impl IntoElement {
-    let sidebar_btn = titlebar_pill(
-        "tb-sidebar",
-        IconName::PanelLeft,
-        None,
-        None,
-        daemon.sidebar_open,
-        if daemon.sidebar_open {
-            "收起侧栏 (Ctrl+B)"
-        } else {
-            "展开侧栏 (Ctrl+B)"
-        },
-        t,
-        cx.listener(|daemon, _, _, cx| {
-            daemon.sidebar_open = !daemon.sidebar_open;
-            cx.notify();
-        }),
-    );
+    let anchors = daemon.handoff_anchors.clone();
+    let sidebar_btn = div()
+        .relative()
+        .child(titlebar_pill(
+            "tb-sidebar",
+            IconName::PanelLeft,
+            None,
+            None,
+            daemon.sidebar_open,
+            if daemon.sidebar_open {
+                "收起侧栏 (Ctrl+B)"
+            } else {
+                "展开侧栏 (Ctrl+B)"
+            },
+            t,
+            cx.listener(|daemon, _, _, cx| {
+                daemon.sidebar_open = !daemon.sidebar_open;
+                cx.notify();
+            }),
+        ))
+        .child(qaqh_gpui_session::handoff::anchor_probe(move |bounds| {
+            anchors.record_titlebar_toggle(bounds);
+        }));
 
     let mut left = div()
         .flex()
@@ -111,7 +117,7 @@ pub(crate) fn render(
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(move |_, _, cx| {
                         let _ = target.update(cx, |store, cx| {
-                            store.open_handoff_successor();
+                            store.open_handoff_successor(cx);
                             cx.notify();
                         });
                     })

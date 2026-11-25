@@ -253,6 +253,8 @@ pub enum BridgeRequest {
     },
     /// attach(session.resume)+ activate_stream + bootstrap 快照。
     Select(String),
+    /// 立即刷新侧栏会话列表(交接建行后加速锚点定位)。
+    RefreshRoster,
     /// 重新 bootstrap 并投递快照(reset 后)。
     Refill(String),
     /// conversation.send_message。
@@ -456,7 +458,7 @@ async fn serve(
                         BridgeRequest::SendMessage { seed, outbox } => {
                             let _ = to_ui.unbounded_send(BridgeMsg::Delivery(seed, outbox.command_id, DeliveryResult::Unknown("尚未连接；原请求已保存".into())));
                         }
-                        BridgeRequest::Select(_) => {},
+                        BridgeRequest::Select(_) | BridgeRequest::RefreshRoster => {},
                         BridgeRequest::AttachFile { seed, .. } => {
                             let _ = to_ui.unbounded_send(BridgeMsg::Attachment(seed, Err("连接尚未恢复".into())));
                         }
@@ -665,6 +667,9 @@ async fn handle_request(
             refill(client, to_ui, &seed).await;
             query_todos(client, to_ui, &seed).await;
             query_team(client, to_ui, &seed).await;
+        }
+        BridgeRequest::RefreshRoster => {
+            poll_roster(client, to_ui).await;
         }
         BridgeRequest::Refill(seed) => refill(client, to_ui, &seed).await,
         BridgeRequest::SendMessage { seed, outbox } => {

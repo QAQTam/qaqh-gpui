@@ -11,6 +11,9 @@ use gpui_kit::App;
 use gpui_kit::AppContext as _;
 use gpui_kit::Context;
 use gpui_kit::Entity;
+use gpui_kit::FocusHandle;
+use gpui_kit::Focusable;
+use gpui_kit::Subscription;
 use gpui_kit::Window;
 use gpui_kit::{ListAlignment, ListState, px};
 use qaqh_ringing_contract::fact::ActivityState;
@@ -47,12 +50,22 @@ pub enum StreamState {
     Closed { reason: String },
 }
 
-/// ask 卡草稿:每题已选项 + 自定义输入框(焦点由 InputState 自管)。
+/// ask 卡草稿:题号列表 + 步进页码 + 折叠态 + 卡片焦点 + 每题已选项/自定义输入框。
 pub struct AskDraft {
+    /// 与请求对齐的题号列表;仅在题号列表变化时重建草稿。
+    pub question_ids: Vec<String>,
     /// 每题点选的选项文本(与 customs 互斥生效)。
     pub answers: Vec<Option<String>>,
     /// 每题自定义输入框(非空时优先于 answers)。
     pub customs: Vec<Entity<InputState>>,
+    /// 当前激活题索引(0-based)。
+    pub active_index: usize,
+    /// 是否折叠为单行提醒条。
+    pub collapsed: bool,
+    /// Ask 卡片键盘导航焦点句柄。
+    pub focus_handle: FocusHandle,
+    /// 自定义输入框订阅,随草稿释放自动清理。
+    pub _subscriptions: Vec<Subscription>,
 }
 
 /// 参数生成中的流式摘要(ToolArgumentsDelta 的投影;声明后由 ToolDeclared 收口)。
@@ -69,12 +82,26 @@ pub struct ArgStream {
     pub args_complete: bool,
 }
 
+/// 会话内向外壳派发的导航请求(如封箱飞箱跳后继、开箱「去源头」跳前驱)。
+#[derive(Clone, Debug)]
+pub enum SessionNavEvent {
+    OpenSession {
+        session_id: String,
+        fly_from_session: Option<String>,
+    },
+}
+
+impl gpui_kit::EventEmitter<SessionNavEvent> for SessionStore {}
+
 /// ADR-0016 封箱投影:标记旧线已封箱所需的后继入口与工作简述。
 /// HandoffSealed 双发(封箱线/后继线),仅封箱线本线落库;整字段替换幂等。
 /// bootstrap 快照不携带本字段;封箱是不可逆历史事实,resync 后保留。
+#[derive(Clone, Debug)]
 pub struct HandoffSeal {
+    pub sealed_session_id: String,
     pub successor_session_id: String,
     pub work_summary: String,
+    pub at_ms: u64,
 }
 
 /// ADR-016 交接卡事实:fork 文档/简述取 args(模型亲手写的结构化);T0/计划
@@ -83,6 +110,7 @@ pub struct HandoffSeal {
 /// `sealed=false` 仍给卡片(electron inferred 路径同口径:入口照给,出处标出)。
 #[derive(Clone, Debug)]
 pub struct HandoffFacts {
+    pub call_id: ToolCallId,
     pub summary: Option<String>,
     pub doc: String,
     /// 机器面 `handed_off === true`(权威封箱标记)。
@@ -90,6 +118,9 @@ pub struct HandoffFacts {
     pub sealed_at_ms: Option<u64>,
     pub planned_open_at_ms: Option<u64>,
     pub auto_continue: bool,
+    pub context_used_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub modified_files: Vec<String>,
 }
 
 /// 毫秒钟(倒计时/开箱判定);daemon 与前端同机,unix ms 直接比对。
@@ -132,7 +163,23 @@ pub fn handoff_facts(tool: &ToolCallView) -> Option<HandoffFacts> {
         .as_ref()
         .and_then(|payload| payload.get("auto_continue"))
         .and_then(|value| value.as_bool());
+    let string_list = |value: Option<&serde_json::Value>| -> Vec<String> {
+        value
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut modified_files = string_list(payload.as_ref().and_then(|p| p.get("modified_files")));
+    if modified_files.is_empty() {
+        modified_files = string_list(args.get("modified_files"));
+    }
     Some(HandoffFacts {
+        call_id: tool.call_id.clone(),
         summary,
         doc,
         sealed,
@@ -145,6 +192,15 @@ pub fn handoff_facts(tool: &ToolCallView) -> Option<HandoffFacts> {
             .and_then(|payload| payload.get("planned_open_at_ms"))
             .and_then(|value| value.as_u64()),
         auto_continue: arg_auto.or(output_auto).unwrap_or(true),
+        context_used_tokens: payload
+            .as_ref()
+            .and_then(|payload| payload.get("context_used_tokens"))
+            .and_then(|value| value.as_u64()),
+        context_window_tokens: payload
+            .as_ref()
+            .and_then(|payload| payload.get("context_window_tokens"))
+            .and_then(|value| value.as_u64()),
+        modified_files,
     })
 }
 
@@ -174,7 +230,9 @@ fn extract_machine_json(output: &str) -> Option<serde_json::Value> {
                 b'}' if !in_string => {
                     depth -= 1;
                     if depth == 0 {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output[start..=start + offset]) {
+                        if let Some(slice) = output.get(start..=start + offset)
+                            && let Ok(value) = serde_json::from_str::<serde_json::Value>(slice)
+                        {
                             let with_seal = value.get("handed_off").is_some();
                             if first.is_none() {
                                 first = Some(value.clone());
@@ -250,14 +308,40 @@ pub struct SessionStore {
     pub handoff_auto_jump: Option<String>,
     /// 倒计时 ticker 已武装(防重复 spawn)。
     pub handoff_ticking: bool,
+    /// 跨组件飞箱坐标锚点表(壳层与 SessionStore 共享)。
+    pub handoff_anchors: crate::handoff::HandoffAnchors,
+    /// 来自目录血缘的前驱会话 id(ADR-016 切片 2)。
+    pub handoff_from_session_id: Option<String>,
+    /// 本会话创建时刻(unix ms;开箱卡兜底时间源)。
+    pub session_created_at_ms: u64,
+    /// 通过 HandoffSealed 双发到达的后继线权威开箱来源。
+    pub handoff_incoming: Option<crate::handoff::HandoffOpenSource>,
+    /// 「不拽我」标记:用户点取消自动或模型声明 `auto_continue:false`。
+    pub handoff_stay: bool,
+    /// 用户点「立即继续」:后继一落盘立即飞箱跳转。
+    pub handoff_eager: bool,
+    /// A 侧展开查看交接文档的 call_id 集合。
+    pub handoff_doc_open: HashSet<ToolCallId>,
+    /// B 侧开箱卡正文是否展开全文。
+    pub handoff_open_expanded: bool,
+    /// B 侧开箱卡是否切换为纯文本原文视图。
+    pub handoff_open_raw: bool,
+    /// A 侧正在播放的大盒封箱仪式(call_id -> 启动时刻)。
+    pub handoff_seal_rituals: std::collections::HashMap<ToolCallId, std::time::Instant>,
+    /// 已播完或已历史定格的封箱仪式(切回不重播)。
+    pub handoff_ritual_done: HashSet<ToolCallId>,
+    /// B 侧正在播放的大盒开箱仪式启动时刻。
+    pub handoff_open_ritual: Option<std::time::Instant>,
+    /// B 侧开箱仪式是否已结束/定格(切回不重播)。
+    pub handoff_open_ritual_done: bool,
     /// Provider 请求重试中(ADR-0018):横幅投影;权威帧到达即清。
     pub provider_retry: Option<ProviderRetry>,
     pub exec_sessions: Vec<ExecSessionView>,
     /// 执行会话输出:exec_session_id → (已收 offset 上界, 累计文本)。
     pub exec_output_tail: Vec<(ExecSessionId, u64, String)>,
     pub stream: StreamState,
-    /// markdown 解析缓存(M4):section key → (源哈希, 解析结果)。
-    pub md_cache: crate::markdown::ParseCache,
+    /// Markdown 扩展插件句柄(每会话固定一次,避免每帧触发 TextView 重解析)。
+    pub md_extensions: Arc<gpui_kit::base::text::MarkdownExtensions>,
     /// 后台执行终端面板(pty 捕获流 → 只读 ANSI 屏)。
     pub terminal_panel: crate::terminal_panel::TerminalPanel,
     /// 流式吐字速率采样:3s 滑窗,元素 = (到达时刻, 本次净增字符数)。
@@ -362,14 +446,27 @@ impl SessionStore {
             subagents: Vec::new(),
             goal: None,
             handoff_seal: None,
-handoff_open: None,
-handoff_auto_jump: None,
-handoff_ticking: false,
+            handoff_open: None,
+            handoff_auto_jump: None,
+            handoff_ticking: false,
+            handoff_anchors: Default::default(),
+            handoff_from_session_id: None,
+            session_created_at_ms: 0,
+            handoff_incoming: None,
+            handoff_stay: false,
+            handoff_eager: false,
+            handoff_doc_open: HashSet::new(),
+            handoff_open_expanded: false,
+            handoff_open_raw: false,
+            handoff_seal_rituals: std::collections::HashMap::new(),
+            handoff_ritual_done: HashSet::new(),
+            handoff_open_ritual: None,
+            handoff_open_ritual_done: false,
 provider_retry: None,
             exec_sessions: Vec::new(),
             exec_output_tail: Vec::new(),
             stream: StreamState::Connecting,
-            md_cache: crate::markdown::ParseCache::default(),
+            md_extensions: crate::markdown::extensions(cx.weak_entity()),
             tok_samples: std::collections::VecDeque::new(),
             timeline_list,
             terminal_panel: crate::terminal_panel::TerminalPanel::new(cx),
@@ -392,6 +489,7 @@ provider_retry: None,
             return Some("等待连接恢复");
         }
         if self.snapshot_pending { return Some("会话状态正在同步"); }
+        if self.handoff_seal.is_some() { return Some("当前会话已封箱，请在后继会话继续"); }
         if self.attachment_pending { return Some("附件正在准备"); }
         if self.outbox.as_ref().is_some_and(|o| matches!(o.state,
             qaqh_gpui_wire::delivery::DeliveryState::Sending | qaqh_gpui_wire::delivery::DeliveryState::Accepted | qaqh_gpui_wire::delivery::DeliveryState::Uncertain)) {
@@ -548,12 +646,62 @@ provider_retry: None,
             command: RingingCommand::GoalClear {},
         });
     }
-    /// 取(或建)ask 卡草稿;输入框实体需窗口上下文创建。
-    /// 请求被引用内容解析替换后题数可能变化,题数不匹配时重建,防越界。
+    fn new_ask_draft(
+        interaction_id: &InteractionId,
+        question_ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AskDraft {
+        let mut customs = Vec::with_capacity(question_ids.len());
+        let mut subscriptions = Vec::with_capacity(question_ids.len());
+        for q_idx in 0..question_ids.len() {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("其它（输入自定义回答）"));
+            let iid_sub = interaction_id.clone();
+            let sub = cx.subscribe(
+                &input,
+                move |store: &mut SessionStore, field, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        let has_text = !field.read(cx).value().trim().is_empty();
+                        if has_text {
+                            if let Some((_, draft)) = store
+                                .ask_drafts
+                                .iter_mut()
+                                .find(|(id, _)| id == &iid_sub)
+                                && let Some(slot) = draft.answers.get_mut(q_idx)
+                            {
+                                *slot = None;
+                            }
+                            store.ask_hint = None;
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        store.ask_advance_or_submit(&iid_sub, cx);
+                    }
+                    InputEvent::PressEnter { shift: true, .. } => {}
+                },
+            );
+            customs.push(input);
+            subscriptions.push(sub);
+        }
+        AskDraft {
+            question_ids: question_ids.to_vec(),
+            answers: vec![None; question_ids.len()],
+            customs,
+            active_index: 0,
+            collapsed: false,
+            focus_handle: cx.focus_handle(),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// 取(或建)ask 卡草稿;仅当题号列表变化时重建,防跨题点击清空已答内容。
     pub fn ask_draft(
         &mut self,
         interaction_id: &InteractionId,
-        question_count: usize,
+        question_ids: &[String],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> &mut AskDraft {
@@ -563,37 +711,179 @@ provider_retry: None,
             .position(|(id, _)| id == interaction_id);
         let index = match position {
             Some(index) => {
-                if self.ask_drafts[index].1.answers.len() != question_count {
-                    self.ask_drafts[index].1 = AskDraft {
-                        answers: vec![None; question_count],
-                        customs: (0..question_count)
-                            .map(|_| cx.new(|cx| InputState::new(window, cx).placeholder("其它…")))
-                            .collect(),
-                    };
+                if self.ask_drafts[index].1.question_ids != question_ids {
+                    self.ask_drafts[index].1 =
+                        Self::new_ask_draft(interaction_id, question_ids, window, cx);
                 }
                 index
             }
             None => {
-                self.ask_drafts.push((
-                    interaction_id.clone(),
-                    AskDraft {
-                        answers: vec![None; question_count],
-                        customs: (0..question_count)
-                            .map(|_| cx.new(|cx| InputState::new(window, cx).placeholder("其它…")))
-                            .collect(),
-                    },
-                ));
+                let draft = Self::new_ask_draft(interaction_id, question_ids, window, cx);
+                self.ask_drafts.push((interaction_id.clone(), draft));
                 self.ask_drafts.len() - 1
             }
         };
         &mut self.ask_drafts[index].1
     }
 
-    /// 组装应答并清草稿;未回答的题返回 None(调用方提示)。
+    pub fn ask_select_option(
+        &mut self,
+        interaction_id: &InteractionId,
+        index: usize,
+        option: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, draft)) = self
+            .ask_drafts
+            .iter_mut()
+            .find(|(id, _)| id == interaction_id)
+        else {
+            return;
+        };
+        if let Some(slot) = draft.answers.get_mut(index) {
+            *slot = Some(option);
+        }
+        let field = draft.customs.get(index).cloned();
+        let focus = draft.focus_handle.clone();
+        self.ask_hint = None;
+        if let Some(field) = field {
+            field.update(cx, |custom, cx| custom.set_value("", window, cx));
+        }
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn ask_focus_custom(
+        &mut self,
+        interaction_id: &InteractionId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, draft)) = self
+            .ask_drafts
+            .iter_mut()
+            .find(|(id, _)| id == interaction_id)
+        else {
+            return;
+        };
+        if let Some(slot) = draft.answers.get_mut(index) {
+            *slot = None;
+        }
+        let field = draft.customs.get(index).cloned();
+        self.ask_hint = None;
+        if let Some(field) = field {
+            let input_focus = field.read(cx).focus_handle(cx);
+            input_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn ask_set_step(
+        &mut self,
+        interaction_id: &InteractionId,
+        step: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, draft)) = self
+            .ask_drafts
+            .iter_mut()
+            .find(|(id, _)| id == interaction_id)
+            && !draft.question_ids.is_empty()
+        {
+            draft.active_index = step.min(draft.question_ids.len() - 1);
+            self.ask_hint = None;
+            cx.notify();
+        }
+    }
+
+    pub fn ask_toggle_collapsed(
+        &mut self,
+        interaction_id: &InteractionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, draft)) = self
+            .ask_drafts
+            .iter_mut()
+            .find(|(id, _)| id == interaction_id)
+        {
+            draft.collapsed = !draft.collapsed;
+            cx.notify();
+        }
+    }
+
+    pub fn ask_question_answered(
+        &self,
+        interaction_id: &InteractionId,
+        index: usize,
+        cx: &Context<Self>,
+    ) -> bool {
+        let Some((_, draft)) = self.ask_drafts.iter().find(|(id, _)| id == interaction_id) else {
+            return false;
+        };
+        let has_custom = draft
+            .customs
+            .get(index)
+            .is_some_and(|field| !field.read(cx).value().trim().is_empty());
+        has_custom || draft.answers.get(index).is_some_and(Option::is_some)
+    }
+
+    pub fn ask_advance_or_submit(
+        &mut self,
+        interaction_id: &InteractionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((active, total)) = self
+            .ask_drafts
+            .iter()
+            .find(|(id, _)| id == interaction_id)
+            .map(|(_, draft)| (draft.active_index, draft.question_ids.len()))
+        else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+        if !self.ask_question_answered(interaction_id, active, cx) {
+            self.ask_hint = Some("请先选择选项或输入自定义回答".into());
+            cx.notify();
+            return;
+        }
+        if active + 1 < total {
+            if let Some((_, draft)) = self
+                .ask_drafts
+                .iter_mut()
+                .find(|(id, _)| id == interaction_id)
+            {
+                draft.active_index = active + 1;
+            }
+            self.ask_hint = None;
+            cx.notify();
+            return;
+        }
+        if let Some(missing) =
+            (0..total).find(|&idx| !self.ask_question_answered(interaction_id, idx, cx))
+        {
+            if let Some((_, draft)) = self
+                .ask_drafts
+                .iter_mut()
+                .find(|(id, _)| id == interaction_id)
+            {
+                draft.active_index = missing;
+            }
+            self.ask_hint = Some(format!("第 {} 题尚未回答", missing + 1));
+            cx.notify();
+            return;
+        }
+        let _ = self.ask_submit(interaction_id, cx);
+        cx.notify();
+    }
+
+    /// 组装应答并发送;未回答的题返回 None(调用方提示)。
     pub fn ask_submit(
         &mut self,
         interaction_id: &InteractionId,
-        question_ids: &[String],
         cx: &Context<Self>,
     ) -> Option<Vec<qaqh_client::AskAnswer>> {
         let index = self
@@ -601,8 +891,8 @@ provider_retry: None,
             .iter()
             .position(|(id, _)| id == interaction_id)?;
         let draft = &self.ask_drafts[index].1;
-        let mut answers = Vec::new();
-        for (position, id) in question_ids.iter().enumerate() {
+        let mut answers = Vec::with_capacity(draft.question_ids.len());
+        for (position, id) in draft.question_ids.iter().enumerate() {
             let custom = draft
                 .customs
                 .get(position)
@@ -625,10 +915,12 @@ provider_retry: None,
                 interaction_id: interaction_id.0.clone(),
                 answers: answers.clone(),
             });
+        self.ask_hint = None;
         Some(answers)
     }
 
     pub fn ask_dismiss(&mut self, interaction_id: &InteractionId) {
+        self.ask_hint = None;
         let _ = self
             .requests
             .unbounded_send(BridgeRequest::DismissAsk {
@@ -659,11 +951,35 @@ provider_retry: None,
         });
     }
 
-    /// ADR-0016 投影切换:跳后继会话(Select = attach + activate_stream + bootstrap)。
-    pub fn open_handoff_successor(&mut self) {
+    /// ADR-0016 投影切换:跳后继会话(先通知壳层播飞箱，落位后再 Select)。
+    pub fn open_handoff_successor(&mut self, cx: &mut Context<Self>) {
         if let Some(seal) = &self.handoff_seal {
-            let _ = self.requests.unbounded_send(BridgeRequest::Select(seal.successor_session_id.clone()));
+            cx.emit(SessionNavEvent::OpenSession {
+                session_id: seal.successor_session_id.clone(),
+                fly_from_session: Some(self.session_id.clone()),
+            });
         }
+    }
+
+    /// 跨会话导航(例如 B 侧「去源头」跳回 A 会话)。
+    pub fn open_session(&mut self, session_id: String, fly: bool, cx: &mut Context<Self>) {
+        cx.emit(SessionNavEvent::OpenSession {
+            session_id,
+            fly_from_session: fly.then(|| self.session_id.clone()),
+        });
+    }
+
+    /// 「不拽我」:停掉阅读窗自动倒计时，HandoffSealed 落地后不再自动跳走。
+    pub fn cancel_handoff_auto(&mut self) {
+        self.handoff_stay = true;
+        self.handoff_eager = false;
+        self.handoff_auto_jump = None;
+    }
+
+    /// 立即继续:记录急迫标记，HandoffSealed 一落盘立即飞箱跳到后继。
+    pub fn arm_handoff_eager(&mut self) {
+        self.handoff_stay = false;
+        self.handoff_eager = true;
     }
 
     pub fn cancel_turn(&mut self) {
@@ -823,6 +1139,7 @@ pub struct SessionRow {
     pub workspace_id: Option<String>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub handoff_from_session_id: Option<String>,
 }
 
 pub fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
@@ -841,6 +1158,7 @@ pub fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
             workspace_id: entry.workspace_id.clone(),
             cwd: entry.meta.cwd.clone(),
             archived: entry.meta.archived,
+            handoff_from_session_id: entry.meta.handoff_from_session_id.clone(),
         })
         .filter(|row| !row.id.is_empty())
         .collect()
@@ -988,6 +1306,7 @@ mod tests {
             workspace_id: None,
             cwd: None,
             archived: false,
+            handoff_from_session_id: None,
         };
         // ses_a 只有毫秒创建时刻,ses_b 是老数据(仅秒制 updated_at):
         // 200_000ms > 100s×1000,新会话排前。

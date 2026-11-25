@@ -52,8 +52,6 @@ qaqh-profile = { path = "../qaqh-backend/crates/qaqh-profile" }
 # ---- 第三方 ----
 futures = "0.3"
 base64 = "0.22"
-# Markdown 流式渲染(M4):pulldown-cmark 事件流,MIT/Apache。
-pulldown-cmark = { version = "0.13", default-features = false }
 # AST 代码高亮(M5):官方 highlighter + 各语言 grammar(MIT 系)。
 tree-sitter-highlight = "0.25"
 tree-sitter-rust = "0.24"

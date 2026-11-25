@@ -122,6 +122,10 @@ pub struct Palette {
     pub btn: Hsla,
     pub btn_hover: Hsla,
     pub code_bg: Hsla,
+    /// 行内代码微色差前景色(与正文 text 拉开层次)。
+    pub code_fg: Hsla,
+    /// 文本拖选半透明底色(叠于舞台/代码块之下)。
+    pub selection_wash: Hsla,
     /// 语法高亮槽(M5):keyword/string/number(function)/type/comment。
     pub syn_keyword: Hsla,
     pub syn_string: Hsla,
@@ -132,7 +136,7 @@ pub struct Palette {
 }
 
 impl Palette {
-    fn for_appearance(appearance: Appearance, preset: ThemePreset) -> Self {
+    pub fn for_appearance(appearance: Appearance, preset: ThemePreset) -> Self {
         match appearance {
             Appearance::Light => Self::light(preset),
             Appearance::Dark => Self::dark(preset),
@@ -199,6 +203,8 @@ impl Palette {
             btn,
             btn_hover,
             code_bg,
+            code_fg: rgb(0xcbd5e1).into(),
+            selection_wash: hsla(215. / 360., 0.80, 0.58, 0.30),
             syn_keyword: rgb(0xc792ea).into(),
             syn_string: rgb(0xa3e635).into(),
             syn_number: rgb(0xf78c6c).into(),
@@ -290,6 +296,8 @@ impl Palette {
             btn,
             btn_hover,
             code_bg,
+            code_fg: rgb(0x334155).into(),
+            selection_wash: hsla(215. / 360., 0.80, 0.55, 0.20),
             syn_keyword: rgb(0x9333ea).into(),
             syn_string: rgb(0x15803d).into(),
             syn_number: rgb(0xb45309).into(),
@@ -409,8 +417,8 @@ pub fn sync_component_theme(cx: &mut App) {
         c.danger_foreground = rgb(0xffffff).into();
         c.success = p.ok;
         c.warning = p.warn;
-        c.link = p.text;
-        c.selection = p.selected;
+        c.link = p.syn_function;
+        c.selection = p.selection_wash;
         c.switch = if light_theme {
             rgb(0xd4d4d8).into()
         } else {

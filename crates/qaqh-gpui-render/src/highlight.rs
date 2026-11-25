@@ -78,9 +78,9 @@ const HIGHLIGHT_NAMES: &[&str] = &[
 fn canonical(lang: &str) -> Option<&'static str> {
     match lang.to_ascii_lowercase().as_str() {
         "rust" | "rs" => Some("rust"),
-        "python" | "py" => Some("python"),
-        "javascript" | "js" => Some("javascript"),
-        "typescript" | "ts" => Some("typescript"),
+        "python" | "py" | "pyw" => Some("python"),
+        "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
+        "typescript" | "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
         "go" | "golang" => Some("go"),
         "json" | "jsonc" => Some("json"),
         "bash" | "sh" | "shell" | "zsh" => Some("bash"),
@@ -252,24 +252,81 @@ fn name_style(name: &str, t: &Palette) -> HighlightStyle {
     }
 }
 
-/// 代码块文本:已知语言走 AST 高亮,否则纯样式 fallback。
-pub fn code_text(code: &str, lang: Option<&str>, t: &Palette) -> StyledText {
+/// 计算代码文本的 AST 语法高亮区间;未知语言或解析失败返回空 Vec。
+pub fn highlight_spans(
+    code: &str,
+    lang: Option<&str>,
+    t: &Palette,
+) -> Vec<(Range<usize>, HighlightStyle)> {
     let Some(runs) = lang.and_then(canonical).and_then(|lang| {
         let engine = ENGINE.get_or_init(|| Mutex::new(Engine::new()));
         let mut guard = engine.lock().expect("highlight engine mutex poisoned");
         guard.highlight(lang, code)
     }) else {
-        return StyledText::new(code);
+        return Vec::new();
     };
-    StyledText::new(code).with_highlights(
-        runs.iter()
-            .map(|(range, index)| (range.clone(), name_style(HIGHLIGHT_NAMES[*index], t))),
-    )
+    runs.iter()
+        .map(|(range, index)| (range.clone(), name_style(HIGHLIGHT_NAMES[*index], t)))
+        .collect()
+}
+
+/// 整段多行代码统一做 AST 高亮后再切分回每行局部偏移,保留跨行注释/字符串上下文。
+pub fn highlight_lines(
+    lines: &[&str],
+    lang: Option<&str>,
+    t: &Palette,
+) -> Vec<Vec<(Range<usize>, HighlightStyle)>> {
+    let mut per_line = vec![Vec::new(); lines.len()];
+    if lines.is_empty() {
+        return per_line;
+    }
+    let joined = lines.join("\n");
+    let spans = highlight_spans(&joined, lang, t);
+    if spans.is_empty() {
+        return per_line;
+    }
+
+    let mut line_bounds = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    for line in lines {
+        let end = offset + line.len();
+        line_bounds.push(offset..end);
+        offset = end + 1;
+    }
+
+    for (span, style) in spans {
+        if span.start >= span.end {
+            continue;
+        }
+        let first_line = line_bounds.partition_point(|bound| bound.end <= span.start);
+        for (line_idx, bound) in line_bounds.iter().enumerate().skip(first_line) {
+            if bound.start >= span.end {
+                break;
+            }
+            let local_start = span.start.saturating_sub(bound.start);
+            let local_end = span.end.min(bound.end).saturating_sub(bound.start);
+            if local_start < local_end {
+                per_line[line_idx].push((local_start..local_end, style));
+            }
+        }
+    }
+    per_line
+}
+
+/// 代码块文本:已知语言走 AST 高亮,否则纯样式 fallback。
+pub fn code_text(code: &str, lang: Option<&str>, t: &Palette) -> StyledText {
+    let spans = highlight_spans(code, lang, t);
+    if spans.is_empty() {
+        StyledText::new(code.to_owned())
+    } else {
+        StyledText::new(code.to_owned()).with_highlights(spans)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Engine;
+    use super::{Engine, highlight_lines};
+    use qaqh_gpui_kit::theme::{Appearance, Palette, ThemePreset};
 
     /// 资产集成冒烟:7 个 query 全部能随 grammar 编译加载(Apache query +
     /// MIT grammar 与 highlight 运行时 ABI 兼容),并产出非空 runs。
@@ -297,5 +354,28 @@ mod tests {
                 .unwrap_or_else(|| panic!("{lang} 高亮产出为空"));
             assert!(!runs.is_empty(), "{lang} 无高亮 runs");
         }
+    }
+
+    #[test]
+    fn highlight_lines_preserves_multiline_comments_across_lines() {
+        let palette = Palette::for_appearance(Appearance::Dark, ThemePreset::WarmPaper);
+        let lines = ["/* block comment", "still comment */ let x = 1;"];
+        let per_line = highlight_lines(&lines, Some("rust"), &palette);
+        assert_eq!(per_line.len(), 2);
+        assert!(
+            per_line[0]
+                .iter()
+                .any(|(range, style)| *range == (0..16) && style.color == Some(palette.syn_comment))
+        );
+        assert!(
+            per_line[1]
+                .iter()
+                .any(|(range, style)| *range == (0..16) && style.color == Some(palette.syn_comment))
+        );
+        assert!(
+            per_line[1]
+                .iter()
+                .any(|(_, style)| style.color == Some(palette.syn_keyword))
+        );
     }
 }
