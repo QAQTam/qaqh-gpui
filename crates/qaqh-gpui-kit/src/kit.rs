@@ -230,7 +230,7 @@ pub fn hero(t: &Palette) -> Div {
         .gap_4()
 }
 
-/// 相对时间(≤3 字档)。输入为 Unix 秒。
+/// 相对时间(≤4 字符紧凑英文单位档)。输入为 Unix 秒。
 pub fn relative_time(updated_secs: u64) -> SharedString {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -238,17 +238,17 @@ pub fn relative_time(updated_secs: u64) -> SharedString {
         .unwrap_or(0);
     let delta = now.saturating_sub(updated_secs);
     if delta < 60 {
-        "刚刚".into()
+        "<1M".into()
     } else if delta < 3600 {
-        SharedString::from(format!("{}分", delta / 60))
+        SharedString::from(format!("{}M", delta / 60))
     } else if delta < 86_400 {
-        SharedString::from(format!("{}时", delta / 3600))
+        SharedString::from(format!("{}H", delta / 3600))
     } else if delta < 30 * 86_400 {
-        SharedString::from(format!("{}天", delta / 86_400))
+        SharedString::from(format!("{}D", delta / 86_400))
     } else if delta < 365 * 86_400 {
-        SharedString::from(format!("{}月", delta / (30 * 86_400)))
+        SharedString::from(format!("{}MO", delta / (30 * 86_400)))
     } else {
-        SharedString::from(format!("{}年+", delta / (365 * 86_400)))
+        SharedString::from(format!("{}Y+", delta / (365 * 86_400)))
     }
 }
 
