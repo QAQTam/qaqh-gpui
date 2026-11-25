@@ -124,61 +124,124 @@ impl Render for DaemonStore {
                     )
             });
 
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("grp-{key}")))
-                    .group("grp")
-                    .flex_shrink_0()
-                    .px_2()
-                    .pt_2p5()
-                    .pb_1()
-                    .mx_0p5()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .rounded(px(RADIUS_CONTROL))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(t.hover))
-                    .on_click(cx.listener(
-                        move |daemon: &mut DaemonStore, _, _, cx: &mut Context<DaemonStore>| {
-                            if was_collapsed {
-                                daemon.collapsed.remove(&title);
-                            } else {
-                                daemon.collapsed.insert(title.clone());
-                                daemon.expanded_more.remove(&title);
+            let is_renaming_ws = group_id.as_ref().is_some_and(|wid| {
+                self.rename_draft
+                    .as_ref()
+                    .is_some_and(|(target, _)| *target == crate::daemon::RenameTarget::Workspace(wid.clone()))
+            });
+            if is_renaming_ws {
+                let draft = self.rename_draft.as_ref().unwrap().1.clone();
+                let daemon_esc = daemon_entity.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("ws-rename-{key}")))
+                        .flex_shrink_0()
+                        .mx_1()
+                        .mt_2()
+                        .mb_0p5()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(RADIUS_CONTROL))
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.accent)
+                        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "escape" {
+                                let _ = daemon_esc.update(cx, |daemon, cx| {
+                                    daemon.rename_draft = None;
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
                             }
-                            cx.notify();
-                        },
-                    ))
-                    .child(spring_chevron(
-                        SharedString::from(format!("ws-chev-{key}")),
-                        !collapsed,
-                        t.faint,
-                        animate_motion,
-                    ))
-                    .child(
-                        Icon::new(if collapsed {
-                            IconName::Folder
-                        } else {
-                            IconName::FolderOpen
                         })
-                        .with_size(Size::XSmall)
-                        .text_color(t.dim),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text)
-                            .truncate()
-                            .child(group.title.clone()),
-                    )
-                    .children(move_in)
-                    .children(new_in)
-                    .into_any_element(),
-            );
+                        .child(Input::new(&draft).small())
+                        .into_any_element(),
+                );
+            } else {
+                let group_id_for_ctx = group_id.clone();
+                let group_title_for_ctx = group.title.clone();
+                let group_session_ids: Vec<String> =
+                    group.rows.iter().map(|row| row.id.clone()).collect();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("grp-{key}")))
+                        .group("grp")
+                        .flex_shrink_0()
+                        .px_2()
+                        .pt_2p5()
+                        .pb_1()
+                        .mx_0p5()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .rounded(px(RADIUS_CONTROL))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(t.hover))
+                        .on_click(cx.listener(
+                            move |daemon: &mut DaemonStore,
+                                  event: &ClickEvent,
+                                  window: &mut Window,
+                                  cx: &mut Context<DaemonStore>| {
+                                if event.is_secondary() {
+                                    if let Some(workspace_id) = group_id_for_ctx.clone() {
+                                        let position = event.mouse_position().unwrap_or_default();
+                                        let size = window.viewport_size();
+                                        daemon.ctx_menu = Some(crate::daemon::SidebarCtxMenu {
+                                            target: crate::daemon::SidebarCtxTarget::Workspace {
+                                                workspace_id,
+                                                title: group_title_for_ctx.clone(),
+                                                archived_view: daemon.show_archived,
+                                                session_ids: group_session_ids.clone(),
+                                            },
+                                            position: gpui_kit::point(
+                                                position.x.min(size.width - px(180.)).max(px(0.)),
+                                                position.y.min(size.height - px(120.)).max(px(0.)),
+                                            ),
+                                            confirm_delete: false,
+                                        });
+                                        cx.notify();
+                                    }
+                                    return;
+                                }
+                                if was_collapsed {
+                                    daemon.collapsed.remove(&title);
+                                } else {
+                                    daemon.collapsed.insert(title.clone());
+                                    daemon.expanded_more.remove(&title);
+                                }
+                                cx.notify();
+                            },
+                        ))
+                        .child(spring_chevron(
+                            SharedString::from(format!("ws-chev-{key}")),
+                            !collapsed,
+                            t.faint,
+                            animate_motion,
+                        ))
+                        .child(
+                            Icon::new(if collapsed {
+                                IconName::Folder
+                            } else {
+                                IconName::FolderOpen
+                            })
+                            .with_size(Size::XSmall)
+                            .text_color(t.dim),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text)
+                                .truncate()
+                                .child(group.title.clone()),
+                        )
+                        .children(move_in)
+                        .children(new_in)
+                        .into_any_element(),
+                );
+            }
             const WORKSPACE_PREVIEW_LIMIT: usize = 5;
             let group_rows = group.rows.clone();
             let group_titles: Vec<SharedString> = group_rows
@@ -709,126 +772,302 @@ impl Render for DaemonStore {
     }
 }
 
-/// 会话右键菜单:圆角悬浮卡(含轻柔入场浮现动画)。
+/// 侧栏右键菜单(会话/工作区统一圆角悬浮卡,含轻柔入场浮现动画)。
 fn ctx_menu_element(
-    menu: &crate::daemon::SessionCtxMenu,
+    menu: &crate::daemon::SidebarCtxMenu,
     cx: &mut Context<DaemonStore>,
     t: &Palette,
     animate_motion: bool,
 ) -> AnyElement {
-    let session_id = menu.session_id.clone();
-    let archived = menu.archived;
     let confirm_delete = menu.confirm_delete;
-
-    let rename_item = ctx_item(
-        "ctx-rename",
-        IconName::Pencil,
-        "重命名".into(),
-        t.text,
-        t,
-        cx.listener({
+    let (anim_key, items): (String, Vec<AnyElement>) = match &menu.target {
+        crate::daemon::SidebarCtxTarget::Session {
+            session_id,
+            archived,
+        } => {
             let session_id = session_id.clone();
-            move |daemon: &mut DaemonStore, _, window: &mut Window, cx| {
-                let Some(row) = daemon.sessions.iter().find(|row| row.id == session_id) else {
-                    return;
-                };
-                let title = if row.title.is_empty() {
-                    String::new()
-                } else {
-                    row.title.clone()
-                };
-                let state = cx.new(|cx| InputState::new(window, cx).placeholder("输入新标题…"));
-                state.update(cx, |field, cx| field.set_value(&title, window, cx));
-                let emitter = state.clone();
-                let sid = session_id.clone();
-                cx.subscribe(&state, move |daemon: &mut DaemonStore, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                        let title = emitter.read(cx).value().trim().to_string();
-                        if !title.is_empty() {
-                            let _ = daemon.requests.unbounded_send(BridgeRequest::RenameSession {
-                                seed: sid.clone(),
-                                title,
-                            });
-                        }
-                        daemon.rename_draft = None;
+            let archived = *archived;
+            let rename_item = ctx_item(
+                "ctx-rename",
+                IconName::Pencil,
+                "重命名".into(),
+                t.text,
+                t,
+                cx.listener({
+                    let session_id = session_id.clone();
+                    move |daemon: &mut DaemonStore, _, window: &mut Window, cx| {
+                        let Some(row) = daemon.sessions.iter().find(|row| row.id == session_id)
+                        else {
+                            return;
+                        };
+                        let title = if row.title.is_empty() {
+                            String::new()
+                        } else {
+                            row.title.clone()
+                        };
+                        let state =
+                            cx.new(|cx| InputState::new(window, cx).placeholder("输入新标题…"));
+                        state.update(cx, |field, cx| field.set_value(&title, window, cx));
+                        let emitter = state.clone();
+                        let sid = session_id.clone();
+                        cx.subscribe(
+                            &state,
+                            move |daemon: &mut DaemonStore, _, event: &InputEvent, cx| {
+                                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                                    let title = emitter.read(cx).value().trim().to_string();
+                                    if !title.is_empty() {
+                                        let _ = daemon.requests.unbounded_send(
+                                            BridgeRequest::RenameSession {
+                                                seed: sid.clone(),
+                                                title,
+                                            },
+                                        );
+                                    }
+                                    daemon.rename_draft = None;
+                                    cx.notify();
+                                }
+                            },
+                        )
+                        .detach();
+                        daemon.rename_draft =
+                            Some((crate::daemon::RenameTarget::Session(session_id.clone()), state));
+                        daemon.ctx_menu = None;
                         cx.notify();
                     }
-                })
-                .detach();
-                daemon.rename_draft = Some((session_id.clone(), state));
-                daemon.ctx_menu = None;
-                cx.notify();
-            }
-        }),
-    );
-    let archive_item = ctx_item(
-        "ctx-archive",
-        if archived {
-            IconName::ArchiveRestore
-        } else {
-            IconName::Archive
-        },
-        if archived { "取消归档".into() } else { "归档".into() },
-        t.text,
-        t,
-        cx.listener({
-            let session_id = session_id.clone();
-            move |daemon: &mut DaemonStore, _, _, cx| {
-                let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
-                    target: CommandTarget::Session {
-                        session_id: session_id.clone(),
-                    },
-                    command: if archived {
-                        RingingCommand::SessionUnarchive {}
-                    } else {
-                        RingingCommand::SessionArchive {}
-                    },
-                });
-                daemon.ctx_menu = None;
-                cx.notify();
-            }
-        }),
-    );
-    let delete_item = ctx_item(
-        "ctx-delete",
-        if confirm_delete {
-            IconName::TriangleAlert
-        } else {
-            IconName::Trash
-        },
-        if confirm_delete {
-            "确认删除".into()
-        } else {
-            "删除".into()
-        },
-        if confirm_delete { t.bad } else { t.text },
-        t,
-        cx.listener({
-            let session_id = session_id.clone();
-            move |daemon: &mut DaemonStore, _, _, cx| {
-                if let Some(menu) = daemon.ctx_menu.as_mut()
-                    && menu.session_id == session_id
-                    && !menu.confirm_delete
-                {
-                    menu.confirm_delete = true;
-                    cx.notify();
-                    return;
-                }
-                let _ = daemon.requests.unbounded_send(BridgeRequest::DeleteSession {
-                    seed: session_id.clone(),
-                });
-                if daemon
-                    .rename_draft
-                    .as_ref()
-                    .is_some_and(|(rid, _)| rid == &session_id)
-                {
-                    daemon.rename_draft = None;
-                }
-                daemon.ctx_menu = None;
-                cx.notify();
-            }
-        }),
-    );
+                }),
+            );
+            let archive_item = ctx_item(
+                "ctx-archive",
+                if archived {
+                    IconName::ArchiveRestore
+                } else {
+                    IconName::Archive
+                },
+                if archived {
+                    "取消归档".into()
+                } else {
+                    "归档".into()
+                },
+                t.text,
+                t,
+                cx.listener({
+                    let session_id = session_id.clone();
+                    move |daemon: &mut DaemonStore, _, _, cx| {
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
+                            target: CommandTarget::Session {
+                                session_id: session_id.clone(),
+                            },
+                            command: if archived {
+                                RingingCommand::SessionUnarchive {}
+                            } else {
+                                RingingCommand::SessionArchive {}
+                            },
+                        });
+                        daemon.ctx_menu = None;
+                        cx.notify();
+                    }
+                }),
+            );
+            let delete_item = ctx_item(
+                "ctx-delete",
+                if confirm_delete {
+                    IconName::TriangleAlert
+                } else {
+                    IconName::Trash
+                },
+                if confirm_delete {
+                    "确认删除".into()
+                } else {
+                    "删除".into()
+                },
+                if confirm_delete { t.bad } else { t.text },
+                t,
+                cx.listener({
+                    let session_id = session_id.clone();
+                    move |daemon: &mut DaemonStore, _, _, cx| {
+                        if let Some(menu) = daemon.ctx_menu.as_mut()
+                            && matches!(
+                                &menu.target,
+                                crate::daemon::SidebarCtxTarget::Session { session_id: id, .. }
+                                if id == &session_id
+                            )
+                            && !menu.confirm_delete
+                        {
+                            menu.confirm_delete = true;
+                            cx.notify();
+                            return;
+                        }
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::DeleteSession {
+                            seed: session_id.clone(),
+                        });
+                        if daemon.rename_draft.as_ref().is_some_and(|(target, _)| {
+                            *target == crate::daemon::RenameTarget::Session(session_id.clone())
+                        }) {
+                            daemon.rename_draft = None;
+                        }
+                        daemon.ctx_menu = None;
+                        cx.notify();
+                    }
+                }),
+            );
+            (
+                format!("sess-{session_id}"),
+                vec![rename_item, archive_item, delete_item],
+            )
+        }
+        crate::daemon::SidebarCtxTarget::Workspace {
+            workspace_id,
+            title,
+            archived_view,
+            session_ids,
+        } => {
+            let workspace_id = workspace_id.clone();
+            let current_title = title.clone();
+            let archived_view = *archived_view;
+            let session_ids = session_ids.clone();
+            let has_sessions = !session_ids.is_empty();
+
+            let rename_item = ctx_item(
+                "ctx-ws-rename",
+                IconName::Pencil,
+                "重命名".into(),
+                t.text,
+                t,
+                cx.listener({
+                    let workspace_id = workspace_id.clone();
+                    let current_title = current_title.clone();
+                    move |daemon: &mut DaemonStore, _, window: &mut Window, cx| {
+                        let state = cx
+                            .new(|cx| InputState::new(window, cx).placeholder("输入工作区名称…"));
+                        state.update(cx, |field, cx| field.set_value(&current_title, window, cx));
+                        let emitter = state.clone();
+                        let wid = workspace_id.clone();
+                        cx.subscribe(
+                            &state,
+                            move |daemon: &mut DaemonStore, _, event: &InputEvent, cx| {
+                                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                                    let new_title = emitter.read(cx).value().trim().to_string();
+                                    if !new_title.is_empty() {
+                                        let _ = daemon.requests.unbounded_send(
+                                            BridgeRequest::Command {
+                                                target: CommandTarget::Workspace {
+                                                    workspace_id: wid.clone(),
+                                                },
+                                                command: RingingCommand::WorkspaceRename {
+                                                    title: new_title,
+                                                },
+                                            },
+                                        );
+                                    }
+                                    daemon.rename_draft = None;
+                                    cx.notify();
+                                }
+                            },
+                        )
+                        .detach();
+                        daemon.rename_draft = Some((
+                            crate::daemon::RenameTarget::Workspace(workspace_id.clone()),
+                            state,
+                        ));
+                        daemon.ctx_menu = None;
+                        cx.notify();
+                    }
+                }),
+            );
+
+            let archive_label: SharedString = if archived_view {
+                "取消归档".into()
+            } else {
+                "归档".into()
+            };
+            let archive_item = ctx_item(
+                "ctx-ws-archive",
+                if archived_view {
+                    IconName::ArchiveRestore
+                } else {
+                    IconName::Archive
+                },
+                archive_label,
+                if has_sessions { t.text } else { t.faint },
+                t,
+                cx.listener({
+                    let session_ids = session_ids.clone();
+                    move |daemon: &mut DaemonStore, _, _, cx| {
+                        if !has_sessions {
+                            return;
+                        }
+                        for sid in &session_ids {
+                            let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
+                                target: CommandTarget::Session {
+                                    session_id: sid.clone(),
+                                },
+                                command: if archived_view {
+                                    RingingCommand::SessionUnarchive {}
+                                } else {
+                                    RingingCommand::SessionArchive {}
+                                },
+                            });
+                        }
+                        daemon.ctx_menu = None;
+                        cx.notify();
+                    }
+                }),
+            );
+
+            let delete_item = ctx_item(
+                "ctx-ws-delete",
+                if confirm_delete {
+                    IconName::TriangleAlert
+                } else {
+                    IconName::Trash
+                },
+                if confirm_delete {
+                    "确认删除".into()
+                } else {
+                    "删除".into()
+                },
+                if confirm_delete { t.bad } else { t.text },
+                t,
+                cx.listener({
+                    let workspace_id = workspace_id.clone();
+                    move |daemon: &mut DaemonStore, _, _, cx| {
+                        if let Some(menu) = daemon.ctx_menu.as_mut()
+                            && matches!(
+                                &menu.target,
+                                crate::daemon::SidebarCtxTarget::Workspace { workspace_id: id, .. }
+                                if id == &workspace_id
+                            )
+                            && !menu.confirm_delete
+                        {
+                            menu.confirm_delete = true;
+                            cx.notify();
+                            return;
+                        }
+                        let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
+                            target: CommandTarget::Workspace {
+                                workspace_id: workspace_id.clone(),
+                            },
+                            command: RingingCommand::WorkspaceDelete {},
+                        });
+                        if daemon.rename_draft.as_ref().is_some_and(|(target, _)| {
+                            *target == crate::daemon::RenameTarget::Workspace(workspace_id.clone())
+                        }) {
+                            daemon.rename_draft = None;
+                        }
+                        daemon.collapsed.remove(&workspace_id);
+                        daemon.expanded_more.remove(&workspace_id);
+                        daemon.ctx_menu = None;
+                        cx.notify();
+                    }
+                }),
+            );
+
+            (
+                format!("ws-{workspace_id}"),
+                vec![rename_item, archive_item, delete_item],
+            )
+        }
+    };
 
     let card = div()
         .absolute()
@@ -844,11 +1083,11 @@ fn ctx_menu_element(
         .bg(t.card)
         .p_1p5()
         .shadow(shadow_popover(t))
-        .children([rename_item, archive_item, delete_item]);
+        .children(items);
 
     let card_el: AnyElement = if animate_motion {
         card.with_animation(
-            SharedString::from(format!("ctx-enter-{}", menu.session_id)),
+            SharedString::from(format!("ctx-enter-{anim_key}")),
             Animation::new(Duration::from_millis(120))
                 .with_easing(gpui_kit::base::animation::ease_out_cubic),
             |el, v| el.opacity(v).mt(px((1.0 - v) * 4.0)),
@@ -910,7 +1149,7 @@ fn render_session_rows(
     rows: &[qaqh_gpui_session::store::SessionRow],
     titles: &[SharedString],
     parents: &[Option<SharedString>],
-    rename_draft: &Option<(String, gpui_kit::Entity<InputState>)>,
+    rename_draft: &Option<(crate::daemon::RenameTarget, gpui_kit::Entity<InputState>)>,
     active_id: Option<&str>,
     active_tone: Option<bool>,
     daemon_entity: &gpui_kit::Entity<DaemonStore>,
@@ -920,10 +1159,9 @@ fn render_session_rows(
 ) -> gpui_kit::Div {
     let mut list = div().flex().flex_col().gap_0p5();
     for ((row, display_title), parent_title) in rows.iter().zip(titles.iter()).zip(parents.iter()) {
-        if rename_draft
-            .as_ref()
-            .is_some_and(|(rid, _)| rid == &row.id)
-        {
+        if rename_draft.as_ref().is_some_and(|(target, _)| {
+            *target == crate::daemon::RenameTarget::Session(row.id.clone())
+        }) {
             let draft = rename_draft.as_ref().unwrap().1.clone();
             let daemon_esc = daemon_entity.clone();
             list = list.child(
@@ -959,9 +1197,11 @@ fn render_session_rows(
                 if event.is_secondary() {
                     let position = event.mouse_position().unwrap_or_default();
                     let size = window.viewport_size();
-                    daemon.ctx_menu = Some(crate::daemon::SessionCtxMenu {
-                        session_id: id.clone(),
-                        archived,
+                    daemon.ctx_menu = Some(crate::daemon::SidebarCtxMenu {
+                        target: crate::daemon::SidebarCtxTarget::Session {
+                            session_id: id.clone(),
+                            archived,
+                        },
                         position: gpui_kit::point(
                             position.x.min(size.width - px(180.)).max(px(0.)),
                             position.y.min(size.height - px(120.)).max(px(0.)),

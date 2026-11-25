@@ -269,7 +269,7 @@ fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) 
                     div()
                         .text_xs()
                         .text_color(t.dim)
-                        .child("工作区目录位于 daemon 所在机器，移除分组仅删除分组记录，不删除本地文件。"),
+                        .child("移除分组不会删除本地文件"),
                 ),
         )
         .child(
@@ -516,13 +516,6 @@ pub(crate) fn accounts(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &
         .flex()
         .flex_col()
         .gap_3()
-        .child(
-            div()
-                .px_1()
-                .text_xs()
-                .text_color(t.dim)
-                .child("浏览器授权登录，凭据保存在本机账号管理器中，不会写入 daemon 明文配置。"),
-        )
         .child(siwc_card(daemon, cx, t))
         .child(dsaccount_card(daemon, cx, t));
     if let Some(line) = &daemon.account_line {
@@ -862,12 +855,6 @@ fn archived(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) ->
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(t.text)
                     .child("暂无已归档会话"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(t.dim)
-                    .child("在侧栏对任意会话右键选择「归档」，或恢复后可继续使用。"),
             );
     }
 
@@ -1050,14 +1037,9 @@ fn about(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Di
         .child(section_card(
             "桌面壳与协议",
             vec![
-                setting_row(
-                    "应用版本",
-                    "gpui-kit 0.11.0（纯原生 DX11 / DirectWrite 渲染，零 WebView）",
-                    engine_value,
-                    t,
-                ),
-                setting_row("RingingV2 契约", "当前前端绑定协议版本", rev_value, t),
-                setting_row("运行平台", "目标操作系统与指令集架构", arch_value, t),
+                setting_row("应用版本", "", engine_value, t),
+                setting_row("RingingV2 契约", "", rev_value, t),
+                setting_row("运行平台", "", arch_value, t),
                 setting_row("Daemon 连接", &conn_text, div().into_any_element(), t),
             ],
             t,
@@ -1065,14 +1047,9 @@ fn about(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Di
         .child(section_card(
             "本地路径与排障",
             vec![
-                setting_row("界面偏好文件", "Theme / MotionLevel / 排版配置持久化路径", cfg_value, t),
-                setting_row("诊断事件日志", "脱敏记录协议状态，不含对话或密钥内容", log_value, t),
-                setting_row(
-                    "导出诊断快照",
-                    "复制版本、契约修订号与近期事件摘要到剪贴板",
-                    copy_diag_btn,
-                    t,
-                ),
+                setting_row("界面偏好文件", "", cfg_value, t),
+                setting_row("诊断事件日志", "", log_value, t),
+                setting_row("导出诊断快照", "", copy_diag_btn, t),
             ],
             t,
         ))
@@ -1367,7 +1344,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "cfg-sandbox",
                 "命令沙箱",
-                "在隔离沙箱环境中执行工具命令",
+                "",
                 config.sandbox.enabled,
                 |enabled| ConfigPatch {
                     sandbox: Some(SandboxPatch {
@@ -1381,7 +1358,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "cfg-allowlist",
                 "全局工具白名单",
-                "仅放行下方列出的受信任工具",
+                "",
                 config.tool_allowlist_enabled,
                 |enabled| ConfigPatch {
                     tool_allowlist_enabled: Some(enabled),
@@ -1393,7 +1370,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "apply-allowlist",
                 "允许的工具名单",
-                "使用英文逗号分隔工具名称",
+                "英文逗号分隔",
                 220.,
                 &daemon.global_inputs.tool_allowlist,
                 |raw| {
@@ -1408,7 +1385,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "apply-compact",
                 "自动压缩阈值 (0–1)",
-                "上下文占用超过该比例时自动整理历史",
+                "",
                 96.,
                 &daemon.global_inputs.auto_compact,
                 |raw| {
@@ -1424,7 +1401,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "apply-idle-unload",
                 "空闲卸载时长 (秒)",
-                "超过秒数无交互后卸载会话内存，0 为关闭",
+                "0 表示关闭",
                 96.,
                 &daemon.global_inputs.idle_unload,
                 |raw| {
@@ -1440,7 +1417,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "apply-shell",
                 "默认 Shell",
-                "如 pwsh / bash / cmd，填 auto 自动探测",
+                "pwsh / bash / cmd，填 auto 自动探测",
                 140.,
                 &daemon.global_inputs.default_shell,
                 |raw| {
@@ -1464,7 +1441,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "cfg-goals",
                 "启用 Goal 模式",
-                "允许代理围绕长期目标自动续跑多轮直到达成",
+                "",
                 config.goals.enabled,
                 |enabled| ConfigPatch {
                     goals: Some(GoalsPatch {
@@ -1479,7 +1456,7 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
                 t,
                 "apply-goal-budget",
                 "默认 Token 预算",
-                "留空应用即可清除预算上限；不允许填 0",
+                "留空表示不限",
                 140.,
                 &daemon.global_inputs.goal_budget,
                 |raw| {
@@ -1505,28 +1482,16 @@ fn global(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> D
         t,
     );
 
-    let integration_rows: Vec<Div> = [
-        (
-            "MCP 服务集成",
-            config.mcp.enabled,
-            config
-                .mcp
-                .servers
-                .iter()
-                .map(|server| server.name.as_str())
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "LSP 语言服务",
-            config.lsp.enabled,
-            config
-                .lsp
-                .servers
-                .iter()
-                .map(|server| server.name.as_str())
-                .collect::<Vec<_>>(),
-        ),
-    ]
+    let integration_rows: Vec<Div> = [(
+        "MCP 服务集成",
+        config.mcp.enabled,
+        config
+            .mcp
+            .servers
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>(),
+    )]
     .into_iter()
     .map(|(name, enabled, servers)| {
         let desc = if servers.is_empty() {
@@ -1807,22 +1772,10 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                 .justify_between()
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(t.text)
-                                .child("服务商目录"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(t.dim)
-                                .child("管理模型端点、接口协议与凭据来源"),
-                        ),
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.text)
+                        .child("服务商目录"),
                 )
                 .child(add),
         ),
@@ -1900,7 +1853,7 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(t.dim)
-                        .child("官方预设一键填充（点击填入表单并配置密钥）"),
+                        .child("官方预设"),
                 )
                 .child(div().flex().flex_wrap().gap_2().children(chips)),
         );
@@ -2032,7 +1985,7 @@ fn provider_card(
                 .py_3()
                 .text_xs()
                 .text_color(t.faint)
-                .child("暂无模型，点击右上角「添加模型」即可配置。"),
+                .child("暂无模型"),
         );
     }
     c
@@ -2278,7 +2231,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
             });
             rows.push(setting_row(
                 "推理强度",
-                "仅对当前支持深度推理的模型生效",
+                "",
                 div()
                     .flex()
                     .flex_wrap()
@@ -2327,7 +2280,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
         if meta.tool_mode == qaqh_types::CUSTOM {
             "当前正在使用自定义工具名单"
         } else {
-            "控制本会话允许代理调用的工具集合"
+            ""
         },
         div()
             .flex()

@@ -41,15 +41,6 @@ fn decode<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|error| format!("{method} 响应解析失败:{error}"))
 }
 
-/// 右侧 Inspector 页签(会话概览 / 任务清单 / 团队协作板)。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum InspectorTab {
-    #[default]
-    Overview,
-    Tasks,
-    Team,
-}
-
 /// 主导航分区(对齐 Overcoder v5.0: 主页 / 工具 / 团队 / 接入)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PrimarySection {
@@ -60,7 +51,7 @@ pub enum PrimarySection {
     Access,
 }
 
-/// 「工具」页子分栏(Skills / MCP & LSP)。
+/// 「工具」页子分栏(Skills / MCP)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolsTab {
     #[default]
@@ -78,12 +69,32 @@ pub struct GlobalConfigInputs {
     pub seeded: bool,
 }
 
-/// 会话右键菜单状态:目标会话 + 打开位置;删除走二段确认。
-pub struct SessionCtxMenu {
-    pub session_id: String,
-    pub archived: bool,
+/// 侧栏右键菜单目标:会话行或工作区标题行。
+pub enum SidebarCtxTarget {
+    Session {
+        session_id: String,
+        archived: bool,
+    },
+    Workspace {
+        workspace_id: String,
+        title: String,
+        archived_view: bool,
+        session_ids: Vec<String>,
+    },
+}
+
+/// 侧栏右键菜单状态:目标对象 + 打开位置;删除统一走二段确认。
+pub struct SidebarCtxMenu {
+    pub target: SidebarCtxTarget,
     pub position: gpui_kit::Point<gpui_kit::Pixels>,
     pub confirm_delete: bool,
+}
+
+/// 侧栏行内重命名目标:同一时刻最多激活一个重命名输入框。
+#[derive(Clone, PartialEq, Eq)]
+pub enum RenameTarget {
+    Session(String),
+    Workspace(String),
 }
 
 /// 窗口级跨区飞箱状态:A 卡头盒槽 → 侧栏后继会话行。
@@ -106,10 +117,10 @@ pub struct DaemonStore {
     pub collapsed: HashSet<String>,
     /// 侧栏工作区分组展开全部会话的组键(未在集合中时默认展示前 5 条)。
     pub expanded_more: HashSet<String>,
-    /// 会话右键菜单(侧栏行右键打开;None = 关闭)。
-    pub ctx_menu: Option<SessionCtxMenu>,
-    /// 侧栏行内重命名草稿(session_id, 输入框实体)。
-    pub rename_draft: Option<(String, Entity<InputState>)>,
+    /// 侧栏右键菜单(会话行/工作区行右键打开;None = 关闭)。
+    pub ctx_menu: Option<SidebarCtxMenu>,
+    /// 侧栏行内重命名草稿(目标, 输入框实体)。
+    pub rename_draft: Option<(RenameTarget, Entity<InputState>)>,
     /// 设置页打开状态(占用主区,侧栏常驻)。
     pub settings_open: bool,
     /// 设置页 daemon 侧数据:config.load 快照 + provider.list + 官方预设表。
@@ -167,7 +178,6 @@ pub struct DaemonStore {
     /// 工作台面板收折态(弹簧动画驱动)。
     pub sidebar_open: bool,
     pub inspector_open: bool,
-    pub inspector_tab: InspectorTab,
     /// 工作区页行内路径输入框。
     pub workspace_path_input: Entity<InputState>,
     /// 全局策略页行内输入框。
@@ -280,7 +290,6 @@ impl DaemonStore {
             shell_error: None,
             sidebar_open: true,
             inspector_open: false,
-            inspector_tab: InspectorTab::default(),
             workspace_path_input,
             global_inputs,
             handoff_anchors: Default::default(),
@@ -599,12 +608,22 @@ impl DaemonStore {
                 cx.notify();
             }
             BridgeMsg::Todos(seed, value) => {
+                let rows = todos_from(&value);
+                for store in &self.stores {
+                    if store.read(cx).session_id == seed {
+                        let rows = rows.clone();
+                        store.update(cx, |s, cx| {
+                            s.todos = rows;
+                            cx.notify();
+                        });
+                    }
+                }
                 let current_seed = self
                     .current
                     .as_ref()
                     .map(|current| current.read(cx).session_id.clone());
                 if current_seed.as_deref() == Some(seed.as_str()) {
-                    self.todos = Some((seed, todos_from(&value)));
+                    self.todos = Some((seed, rows));
                     cx.notify();
                 }
             }

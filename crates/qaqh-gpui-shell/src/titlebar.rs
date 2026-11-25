@@ -180,33 +180,46 @@ pub(crate) fn render(
         _ => None,
     };
 
-    let inspector_btn = (daemon.section == PrimarySection::Home
+    let in_session = daemon.section == PrimarySection::Home
         && !daemon.settings_open
         && !daemon.new_session_open
-        && daemon.current.is_some())
-    .then(|| {
-        let (icon, label, badge) = if let Some((done, total)) = todo_counts {
-            (
-                IconName::ListChecks,
-                "任务",
-                Some(SharedString::from(format!("{done}/{total}"))),
-            )
-        } else if let Some((done, total)) = team_counts {
-            (
-                IconName::Users,
-                "团队",
-                Some(SharedString::from(format!("{done}/{total}"))),
-            )
-        } else {
-            (IconName::Activity, "概览", None)
-        };
+        && daemon.current.is_some();
+
+    let todo_card_open = daemon
+        .current
+        .as_ref()
+        .is_some_and(|current| current.read(cx).todo_card_open);
+    let todo_btn = (in_session && todo_counts.is_some()).then(|| {
+        let (done, total) = todo_counts.unwrap();
+        titlebar_pill(
+            "tb-todo",
+            IconName::ListChecks,
+            Some("任务".into()),
+            Some(SharedString::from(format!("{done}/{total}"))),
+            todo_card_open,
+            "显示/隐藏任务清单卡片",
+            t,
+            cx.listener(|daemon, _, _, cx| {
+                if let Some(current) = daemon.current.clone() {
+                    current.update(cx, |store, cx| {
+                        store.todo_card_open = !store.todo_card_open;
+                        cx.notify();
+                    });
+                }
+                cx.notify();
+            }),
+        )
+    });
+
+    let team_btn = (in_session && team_counts.is_some()).then(|| {
+        let (done, total) = team_counts.unwrap();
         titlebar_pill(
             "tb-inspector",
-            icon,
-            Some(label.into()),
-            badge,
+            IconName::Users,
+            Some("团队".into()),
+            Some(SharedString::from(format!("{done}/{total}"))),
             daemon.inspector_open,
-            "收起/展开右侧会话检查器",
+            "收起/展开团队任务面板",
             t,
             cx.listener(|daemon, _, _, cx| {
                 daemon.inspector_open = !daemon.inspector_open;
@@ -275,7 +288,8 @@ pub(crate) fn render(
         .gap_1p5()
         .pr_2()
         .flex_shrink_0()
-        .children(inspector_btn)
+        .children(todo_btn)
+        .children(team_btn)
         .child(terminal_btn)
         .child(theme_btn)
         .child(settings_btn);

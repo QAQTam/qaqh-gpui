@@ -5,19 +5,19 @@
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, Anchor, ClickEvent, Div, FontWeight, Hsla, IntoElement, ParentElement, SharedString,
-    Styled, WeakEntity, Window, div, px,
+    AnyElement, Anchor, ClickEvent, Div, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, SharedString, Styled, WeakEntity, Window, div, px,
 };
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants};
-use gpui_kit::component::input::Textarea;
+use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::{Disableable, Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
 use qaqh_gpui_kit::kit::{
-    RADIUS_CHIP, RADIUS_COMPOSER, RADIUS_CONTROL, RADIUS_POPOVER, shadow_composer, shadow_popover,
-    soft,
+    BtnKind, RADIUS_CARD, RADIUS_CHIP, RADIUS_COMPOSER, RADIUS_CONTROL, RADIUS_POPOVER, button,
+    pill, shadow_composer, shadow_popover, soft,
 };
-use qaqh_gpui_kit::primitives::icon_button;
+use qaqh_gpui_kit::primitives::{icon_button, segmented_button, setting_row};
 use qaqh_gpui_kit::theme::Palette;
 use qaqh_gpui_wire::delivery::DeliveryState;
 use qaqh_ringing_contract::fact::ActivityState;
@@ -276,15 +276,65 @@ fn model_popover(
         .content(move |_state, _window, cx| {
             let popover: WeakEntity<PopoverState> = cx.entity().downgrade();
             let mut card = popover_card(&t, 280.);
+            let manage_row = {
+                let entity = entity.clone();
+                let popover = popover.clone();
+                div()
+                    .pt_1()
+                    .mt_1()
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .child(
+                        div()
+                            .id("composer-model-manage")
+                            .px_2()
+                            .py_1p5()
+                            .rounded(px(RADIUS_CHIP))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(t.dim)
+                            .hover(move |s| s.bg(t.hover).text_color(t.text))
+                            .on_click(move |_, window, cx| {
+                                let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                let _ = entity.update(cx, |store, cx| {
+                                    store.open_model_params(window, cx);
+                                });
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconName::SlidersHorizontal)
+                                            .with_size(Size::XSmall)
+                                            .text_color(t.dim),
+                                    )
+                                    .child("管理模型参数与策略"),
+                            )
+                            .child(
+                                Icon::new(IconName::ChevronRight)
+                                    .with_size(Size::XSmall)
+                                    .text_color(t.faint),
+                            ),
+                    )
+            };
+
             if groups.is_empty() {
-                return card.child(
-                    div()
-                        .px_2()
-                        .py_2()
-                        .text_xs()
-                        .text_color(t.dim)
-                        .child("暂无可用模型，请先在设置中配置服务商。"),
-                );
+                return card
+                    .child(
+                        div()
+                            .px_2()
+                            .py_2()
+                            .text_xs()
+                            .text_color(t.dim)
+                            .child("暂无可用模型，请先在设置中配置服务商。"),
+                    )
+                    .child(manage_row);
             }
             let mut list = div()
                 .id("composer-model-list")
@@ -332,7 +382,7 @@ fn model_popover(
                         )
                     }));
             }
-            card = card.child(list);
+            card = card.child(list).child(manage_row);
             card
         })
         .into_any_element()
@@ -476,6 +526,363 @@ fn tools_popover(
             card
         })
         .into_any_element()
+}
+
+/// Composer 模型选择器「管理」弹出的居中参数与策略卡片。
+pub fn model_params_modal(
+    store: &SessionStore,
+    cx: &mut Context<SessionStore>,
+    t: &Palette,
+) -> Option<AnyElement> {
+    if !store.model_params_open {
+        return None;
+    }
+
+    let settings_meta = store.settings.as_ref().map(|s| &s.meta);
+    let current_model = settings_meta.and_then(|m| m.model_selection.as_ref());
+    let model_def = store
+        .catalog
+        .as_deref()
+        .zip(current_model)
+        .and_then(|(catalog, sel)| {
+            catalog
+                .providers
+                .get(&sel.provider_id)?
+                .models
+                .get(&sel.model_id)
+        });
+
+    let model_text = current_model
+        .map(|m| format!("{} / {}", m.provider_id, m.model_id))
+        .unwrap_or_else(|| "继承全局默认".to_owned());
+    let ctx_badge = model_def.map(|m| format!("{} ctx", token_badge(m.context_window)));
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+
+    // 1. 当前模型信息
+    let model_value = div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .child(
+            div()
+                .font_family("monospace")
+                .text_xs()
+                .text_color(t.text)
+                .truncate()
+                .max_w(px(240.))
+                .child(model_text),
+        )
+        .children(ctx_badge.map(|badge| pill(&badge, t.dim, t)))
+        .into_any_element();
+    rows.push(setting_row("当前模型", "", model_value, t).into_any_element());
+
+    // 2. 推理深度
+    if let Some(sel) = current_model {
+        let levels = store
+            .catalog
+            .as_deref()
+            .map(|catalog| crate::store::model_effort_levels(catalog, sel))
+            .unwrap_or_default();
+        if !levels.is_empty() {
+            let current_effort = sel.options.reasoning_effort.as_deref();
+            let effort_opts: Vec<(Option<String>, String)> =
+                std::iter::once((None, "默认".to_owned()))
+                    .chain(levels.into_iter().map(|l| (Some(l.clone()), l)))
+                    .collect();
+            let effort_btns = effort_opts.into_iter().map(|(val, label)| {
+                let selected = current_effort == val.as_deref();
+                segmented_button(
+                    format!("mp-effort-{label}"),
+                    label,
+                    selected,
+                    t,
+                    cx.listener(move |store, _, _, cx| {
+                        store.patch_effort(val.clone());
+                        cx.notify();
+                    }),
+                )
+            });
+            rows.push(
+                setting_row(
+                    "推理深度",
+                    "",
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(effort_btns)
+                        .into_any_element(),
+                    t,
+                )
+                .into_any_element(),
+            );
+        }
+
+        // 3. 最大输出 Token
+        if let Some(max_out_input) = &store.model_params_max_output {
+            let input_apply = max_out_input.clone();
+            let input_enter = max_out_input.clone();
+            let max_out_ctrl = div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .on_key_down(cx.listener(move |store, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "enter" {
+                        let raw = input_enter.read(cx).value().trim().to_string();
+                        if raw.is_empty() {
+                            store.patch_max_output_tokens(None);
+                        } else if let Ok(v) = raw.parse::<u32>()
+                            && v > 0
+                        {
+                            store.patch_max_output_tokens(Some(v));
+                        } else {
+                            store.operation_error = Some("最大输出 Token 必须为正整数".into());
+                        }
+                        cx.notify();
+                    }
+                }))
+                .child(div().w(px(120.)).child(Input::new(max_out_input).small()))
+                .child(button(
+                    cx,
+                    BtnKind::Soft,
+                    "mp-apply-max-output",
+                    "应用",
+                    t,
+                    cx.listener(move |store, _, _, cx| {
+                        let raw = input_apply.read(cx).value().trim().to_string();
+                        if raw.is_empty() {
+                            store.patch_max_output_tokens(None);
+                        } else if let Ok(v) = raw.parse::<u32>()
+                            && v > 0
+                        {
+                            store.patch_max_output_tokens(Some(v));
+                        } else {
+                            store.operation_error = Some("最大输出 Token 必须为正整数".into());
+                        }
+                        cx.notify();
+                    }),
+                ))
+                .into_any_element();
+            rows.push(setting_row("最大输出 Token", "留空使用模型默认", max_out_ctrl, t).into_any_element());
+        }
+
+        // 4. 原生网页搜索(若模型支持)
+        if model_def.is_some_and(|m| m.capabilities.native_web_search) {
+            let cur_search = sel.options.native_web_search;
+            let search_btns = [
+                (None, "默认", "mp-web-default"),
+                (Some(true), "开启", "mp-web-on"),
+                (Some(false), "关闭", "mp-web-off"),
+            ]
+            .into_iter()
+            .map(|(val, label, id)| {
+                segmented_button(
+                    id.to_owned(),
+                    label,
+                    cur_search == val,
+                    t,
+                    cx.listener(move |store, _, _, cx| {
+                        store.patch_native_web_search(val);
+                        cx.notify();
+                    }),
+                )
+            });
+            rows.push(
+                setting_row(
+                    "原生网页搜索",
+                    "",
+                    div()
+                        .flex()
+                        .gap_1()
+                        .children(search_btns)
+                        .into_any_element(),
+                    t,
+                )
+                .into_any_element(),
+            );
+        }
+    }
+
+    // 5. 工具策略预设
+    let current_tool_mode = settings_meta
+        .map(|m| m.tool_mode.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or(qaqh_types::STANDARD);
+    let tool_btns = [
+        (qaqh_types::STANDARD, "标准"),
+        (qaqh_types::MINIMAL, "精简"),
+        (qaqh_types::MINIMAL_B, "精简 B"),
+        (qaqh_types::MINIMAL_C, "精简 C"),
+    ]
+    .into_iter()
+    .map(|(preset, label)| {
+        segmented_button(
+            format!("mp-tools-{preset}"),
+            label,
+            current_tool_mode == preset,
+            t,
+            cx.listener(move |store, _, _, cx| {
+                store.patch_tools_mode(preset.to_owned());
+                cx.notify();
+            }),
+        )
+    });
+    rows.push(
+        setting_row(
+            "工具策略",
+            if current_tool_mode == qaqh_types::CUSTOM {
+                "当前使用自定义工具名单"
+            } else {
+                ""
+            },
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children(tool_btns)
+                .into_any_element(),
+            t,
+        )
+        .into_any_element(),
+    );
+
+    // 6. 自定义工具名单
+    if let Some(custom_input) = &store.model_params_custom_tools {
+        let input_apply = custom_input.clone();
+        let input_enter = custom_input.clone();
+        let custom_ctrl = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .on_key_down(cx.listener(move |store, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" {
+                    let names: Vec<String> = input_enter
+                        .read(cx)
+                        .value()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if !names.is_empty() {
+                        store.patch_custom_tools(names);
+                        cx.notify();
+                    }
+                }
+            }))
+            .child(div().w(px(180.)).child(Input::new(custom_input).small()))
+            .child(button(
+                cx,
+                BtnKind::Soft,
+                "mp-apply-custom-tools",
+                "应用",
+                t,
+                cx.listener(move |store, _, _, cx| {
+                    let names: Vec<String> = input_apply
+                        .read(cx)
+                        .value()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if !names.is_empty() {
+                        store.patch_custom_tools(names);
+                        cx.notify();
+                    }
+                }),
+            ))
+            .into_any_element();
+        rows.push(setting_row("自定义工具", "英文逗号分隔", custom_ctrl, t).into_any_element());
+    }
+
+    let modal_card = div()
+        .id("model-params-modal-card")
+        .w(px(520.))
+        .max_w(gpui_kit::relative(0.92))
+        .rounded(px(RADIUS_CARD))
+        .bg(t.card)
+        .border_1()
+        .border_color(t.border)
+        .shadow(shadow_popover(t))
+        .overflow_hidden()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .on_key_down(cx.listener(|store, event: &KeyDownEvent, _, cx| {
+            if event.keystroke.key == "escape" {
+                store.model_params_open = false;
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px_4()
+                .py_3()
+                .bg(t.surface_subtle)
+                .border_b_1()
+                .border_color(t.border_subtle)
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::SlidersHorizontal)
+                                .with_size(Size::XSmall)
+                                .text_color(t.accent),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text)
+                                .child("模型参数与策略"),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("close-model-params")
+                        .size(px(24.))
+                        .rounded(px(RADIUS_CHIP))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.hover))
+                        .on_click(cx.listener(|store, _, _, cx| {
+                            store.model_params_open = false;
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::X).with_size(Size::XSmall).text_color(t.dim)),
+                ),
+        )
+        .child(div().px_4().pb_2().flex().flex_col().children(rows));
+
+    Some(
+        div()
+            .id("model-params-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(t.scrim)
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .on_click(cx.listener(|store, _, _, cx| {
+                store.model_params_open = false;
+                cx.notify();
+            }))
+            .child(modal_card)
+            .into_any_element(),
+    )
 }
 
 pub fn render(

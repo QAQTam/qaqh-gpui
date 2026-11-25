@@ -1,6 +1,6 @@
 //! Overcoder v5.0 主导航页面(DESIGN LAW v3.0 · v5.0.0):
 //! - `startup_page`: 内联 StartupView(Antigravity 极简四锚点 + 错峰滑入建议行 + 双层统一 Composer);
-//! - `tools_page`: 「工具」页(daemon `skills.catalog` 分组诊断 + `accordion_reveal` + `MCP / LSP` 只读表);
+//! - `tools_page`: 「工具」页(daemon `skills.catalog` 分组诊断 + `accordion_reveal` + `MCP` 只读表);
 //! - `team_page`: 「团队」页(会话切换 Popover + KPI 统计 + 任务板依赖分析 + 树形花名册与状态光点);
 //! - `access_page`: 「接入」页(全局模型目录概览 + 复用 `settings_ui::accounts` SIWC / DeepSeek 账号管理)。
 
@@ -957,7 +957,7 @@ fn startup_composer_island(
 }
 
 // ============================================================================
-// 2. 「工具」页 (Skills catalog + MCP / LSP 只读视图)
+// 2. 「工具」页 (Skills catalog + MCP 只读视图)
 // ============================================================================
 
 pub(crate) fn tools_page(
@@ -983,7 +983,7 @@ pub(crate) fn tools_page(
             ),
             segmented_item(
                 "tools-tab-mcp",
-                "MCP / LSP",
+                "MCP",
                 daemon.tools_tab == ToolsTab::Mcp,
                 t,
                 cx.listener(|daemon, _, _, cx| {
@@ -1027,7 +1027,7 @@ pub(crate) fn tools_page(
     page_shell(
         "tools-page-scroll",
         "工具",
-        "会话可用的 Skills 与 MCP / LSP 工具能力，由本地 daemon 解析与校验。",
+        "会话可用的 Skills 与 MCP 工具能力，由本地 daemon 解析与校验。",
         header_right,
         body,
         t,
@@ -1398,14 +1398,14 @@ fn tools_mcp_body(
                 .p_4()
                 .text_xs()
                 .text_color(t.dim)
-                .child("正在读取 daemon MCP / LSP 配置…")
+                .child("正在读取 daemon MCP 配置…")
                 .into_any_element(),
         ];
     };
 
     let mut out = Vec::new();
 
-    // 顶部概览两张卡
+    // 顶部概览卡
     let summary_row = div()
         .flex()
         .flex_wrap()
@@ -1445,44 +1445,6 @@ fn tools_mcp_body(
                 .child(pill(
                     if config.mcp.enabled { "已启用" } else { "已停用" },
                     if config.mcp.enabled { t.ok } else { t.dim },
-                    t,
-                )),
-        )
-        .child(
-            card(t)
-                .flex_1()
-                .min_w(px(240.))
-                .p_4()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .child(Icon::new(IconName::Server).with_size(Size::XSmall).text_color(t.dim))
-                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(t.text).child("LSP 语言服务")),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(t.dim)
-                                .child(SharedString::from(format!(
-                                    "{} 个服务 · 空闲 {}s 回收",
-                                    config.lsp.servers.len(),
-                                    config.lsp.idle_shutdown_secs
-                                ))),
-                        ),
-                )
-                .child(pill(
-                    if config.lsp.enabled { "已启用" } else { "已停用" },
-                    if config.lsp.enabled { t.ok } else { t.dim },
                     t,
                 )),
         )
@@ -1593,88 +1555,6 @@ fn tools_mcp_body(
             .gap_2()
             .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.dim).child("MCP Servers"))
             .children(mcp_cards)
-            .into_any_element(),
-    );
-
-    // LSP servers 列表
-    let lsp_total = config.lsp.servers.len();
-    let lsp_cards: Vec<AnyElement> = if config.lsp.servers.is_empty() {
-        vec![
-            card(t)
-                .p_3p5()
-                .text_xs()
-                .text_color(t.dim)
-                .child("未配置 LSP Server（可在 daemon 全局配置中添加语言服务器）。")
-                .into_any_element(),
-        ]
-    } else {
-        config
-            .lsp
-            .servers
-            .iter()
-            .enumerate()
-            .map(|(idx, server)| {
-                let cmd = if server.args.is_empty() {
-                    server.command.clone()
-                } else {
-                    format!("{} {}", server.command, server.args.join(" "))
-                };
-                let exts = if server.extensions.is_empty() {
-                    "全部扩展名".to_owned()
-                } else {
-                    server.extensions.join(", ")
-                };
-                let row = card(t)
-                    .p_3p5()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(t.text)
-                                    .child(server.name.clone()),
-                            )
-                            .child(div().text_xs().text_color(t.faint).child(exts)),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(RADIUS_CHIP))
-                            .bg(t.surface_subtle)
-                            .font_family("monospace")
-                            .text_xs()
-                            .text_color(t.dim)
-                            .truncate()
-                            .child(cmd),
-                    )
-                    .into_any_element();
-                stagger_enter(
-                    format!("lsp-srv-{}-{idx}", daemon.page_epoch),
-                    idx,
-                    lsp_total,
-                    row,
-                    window,
-                    cx,
-                )
-            })
-            .collect()
-    };
-    out.push(
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.dim).child("LSP Servers"))
-            .children(lsp_cards)
             .into_any_element(),
     );
 

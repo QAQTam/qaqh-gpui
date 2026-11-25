@@ -32,6 +32,13 @@ const LINK_ICON_NODE: &str = "qaqh-link-icon";
 const WIDGET_NODE: &str = "qaqh-widget";
 const MAX_PILL_CHARS: usize = 72;
 
+/// 正文阅读轨外框附加宽度(含左右 `px_4` 内边距),与原时间线内容宽保持像素一致。
+pub const PROSE_RAIL_PAD_PX: f32 = 48.0;
+/// 顶层 Markdown 表格对称破栏宽出量(左右各 +120px,4px 网格),充分利用宽屏舞台留白。
+pub const TABLE_BREAKOUT_EXTRA_PX: f32 = 240.0;
+/// 超过该列数才启用横向滚动兜底;常规 2~6 列表格默认积极折行、一屏完整展示。
+const WIDE_TABLE_SCROLL_COLS: usize = 7;
+
 #[derive(Clone, PartialEq, Eq)]
 enum LinkTarget {
     Web(String),
@@ -526,6 +533,7 @@ type CodeBlockHighlighter =
 struct CachedViewTheme {
     key: StyleCacheKey,
     doc_style: TextViewStyle,
+    wide_table_style: TextViewStyle,
     compact_style: TextViewStyle,
     highlighter: CodeBlockHighlighter,
 }
@@ -534,7 +542,7 @@ thread_local! {
     static THEME_CACHE: RefCell<Option<CachedViewTheme>> = const { RefCell::new(None) };
 }
 
-fn build_text_view_style(t: &Palette, compact: bool) -> TextViewStyle {
+fn build_text_view_style(t: &Palette, compact: bool, scroll_tables: bool) -> TextViewStyle {
     let border_subtle = t.border_subtle;
     let inline_code_style = StyleRefinement::default()
         .bg(t.code_bg)
@@ -557,7 +565,9 @@ fn build_text_view_style(t: &Palette, compact: bool) -> TextViewStyle {
     code_block.padding.top = Some(px(34.).into());
 
     let mut table = StyleRefinement::default().rounded(px(RADIUS_CONTROL));
-    table.overflow.x = Some(Overflow::Scroll);
+    if scroll_tables {
+        table.overflow.x = Some(Overflow::Scroll);
+    }
     let table_head = StyleRefinement::default()
         .bg(t.surface_subtle)
         .text_color(t.text);
@@ -592,7 +602,9 @@ fn build_text_view_style(t: &Palette, compact: bool) -> TextViewStyle {
         .with_dark(t.bg.l <= 0.5)
 }
 
-fn cached_theme_assets(t: &Palette) -> (TextViewStyle, TextViewStyle, CodeBlockHighlighter) {
+fn cached_theme_assets(
+    t: &Palette,
+) -> (TextViewStyle, TextViewStyle, TextViewStyle, CodeBlockHighlighter) {
     let key = StyleCacheKey {
         stage: t.stage,
         text: t.text,
@@ -608,13 +620,15 @@ fn cached_theme_assets(t: &Palette) -> (TextViewStyle, TextViewStyle, CodeBlockH
         {
             return (
                 cached.doc_style.clone(),
+                cached.wide_table_style.clone(),
                 cached.compact_style.clone(),
                 cached.highlighter.clone(),
             );
         }
         let palette = *t;
-        let doc_style = build_text_view_style(&palette, false);
-        let compact_style = build_text_view_style(&palette, true);
+        let doc_style = build_text_view_style(&palette, false, false);
+        let wide_table_style = build_text_view_style(&palette, false, true);
+        let compact_style = build_text_view_style(&palette, true, false);
         let highlighter: CodeBlockHighlighter = Arc::new(move |block| {
             let lang = block.lang();
             qaqh_gpui_render::highlight::highlight_spans(
@@ -626,10 +640,11 @@ fn cached_theme_assets(t: &Palette) -> (TextViewStyle, TextViewStyle, CodeBlockH
         *slot = Some(CachedViewTheme {
             key,
             doc_style: doc_style.clone(),
+            wide_table_style: wide_table_style.clone(),
             compact_style: compact_style.clone(),
             highlighter: highlighter.clone(),
         });
-        (doc_style, compact_style, highlighter)
+        (doc_style, wide_table_style, compact_style, highlighter)
     })
 }
 
@@ -648,18 +663,142 @@ fn attach_link_handler(
     })
 }
 
-/// 渲染正文 Markdown 文档(原生跨段选字、行内胶囊代码、标题分割线、图标联动与 AST 代码块)。
-pub fn render_document(
-    id: impl Into<SharedString>,
-    source: &str,
+#[derive(Debug, PartialEq, Eq)]
+enum MarkdownSegment {
+    Prose(String),
+    Table { markdown: String, cols: usize },
+}
+
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return None;
+    }
+    let rest = line.trim_start_matches(' ');
+    let first = rest.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = rest.chars().take_while(|&c| c == first).count();
+    (count >= 3).then_some((first, count))
+}
+
+fn is_fence_close(line: &str, ch: char, min_len: usize) -> bool {
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return false;
+    }
+    let rest = line.trim_start_matches(' ');
+    let count = rest.chars().take_while(|&c| c == ch).count();
+    count >= min_len && rest.chars().skip(count).all(|c| c == ' ' || c == '\t')
+}
+
+fn split_table_cells(line: &str) -> Vec<&str> {
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    trimmed.split('|').collect()
+}
+
+fn parse_table_delimiter_cols(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let cells = split_table_cells(trimmed);
+    if cells.len() < 2 {
+        return None;
+    }
+    for cell in &cells {
+        let cell = cell.trim();
+        if cell.is_empty() {
+            return None;
+        }
+        let inner = cell.strip_prefix(':').unwrap_or(cell);
+        let inner = inner.strip_suffix(':').unwrap_or(inner);
+        if inner.is_empty() || !inner.bytes().all(|b| b == b'-') {
+            return None;
+        }
+    }
+    Some(cells.len())
+}
+
+fn is_table_body_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.contains('|')
+        && !trimmed.starts_with('#')
+        && fence_marker(line).is_none()
+}
+
+/// 将顶层 GFM 表格从 Markdown 文档中拆出,便于主对话舞台对表格做对称破栏宽出。
+/// 代码块(``` / ~~~)内的管道符会被完整跳过,不会被误识别为表格。
+fn split_markdown_tables(source: &str) -> Vec<MarkdownSegment> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut segments = Vec::new();
+    let mut prose: Vec<&str> = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut i = 0;
+
+    let flush_prose = |prose: &mut Vec<&str>, segments: &mut Vec<MarkdownSegment>| {
+        if prose.iter().any(|l| !l.trim().is_empty()) {
+            segments.push(MarkdownSegment::Prose(prose.join("\n")));
+        }
+        prose.clear();
+    };
+
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some((ch, len)) = fence {
+            prose.push(line);
+            if is_fence_close(line, ch, len) {
+                fence = None;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(open) = fence_marker(line) {
+            fence = Some(open);
+            prose.push(line);
+            i += 1;
+            continue;
+        }
+        if line.contains('|')
+            && let Some(next) = lines.get(i + 1)
+            && let Some(cols) = parse_table_delimiter_cols(next)
+            && split_table_cells(line).len() == cols
+        {
+            flush_prose(&mut prose, &mut segments);
+            let mut table_lines = vec![line, *next];
+            i += 2;
+            while i < lines.len() && is_table_body_line(lines[i]) {
+                table_lines.push(lines[i]);
+                i += 1;
+            }
+            segments.push(MarkdownSegment::Table {
+                markdown: table_lines.join("\n"),
+                cols,
+            });
+            continue;
+        }
+        prose.push(line);
+        i += 1;
+    }
+    flush_prose(&mut prose, &mut segments);
+    segments
+}
+
+fn build_document_view(
+    id: SharedString,
+    source: String,
+    style: TextViewStyle,
+    highlighter: CodeBlockHighlighter,
     extensions: &Arc<MarkdownExtensions>,
     session: WeakEntity<SessionStore>,
-    t: &Palette,
     ty: &Typography,
-) -> AnyElement {
-    let (doc_style, _, highlighter) = cached_theme_assets(t);
-    let view = TextView::markdown(id.into(), source.to_owned())
-        .style(doc_style)
+) -> TextView {
+    let view = TextView::markdown(id, source)
+        .style(style)
         .markdown_extensions((**extensions).clone())
         .shared_code_block_highlighter(highlighter)
         .code_block_actions(|block, _, cx| {
@@ -711,7 +850,152 @@ pub fn render_document(
         .text_sm()
         .line_height(relative(ty.prose_line_height));
 
-    attach_link_handler(view, session).into_any_element()
+    attach_link_handler(view, session)
+}
+
+/// 渲染正文 Markdown 文档(原生跨段选字、行内胶囊代码、标题分割线、图标联动与 AST 代码块)。
+pub fn render_document(
+    id: impl Into<SharedString>,
+    source: &str,
+    extensions: &Arc<MarkdownExtensions>,
+    session: WeakEntity<SessionStore>,
+    t: &Palette,
+    ty: &Typography,
+) -> AnyElement {
+    let (doc_style, _, _, highlighter) = cached_theme_assets(t);
+    build_document_view(
+        id.into(),
+        source.to_owned(),
+        doc_style,
+        highlighter,
+        extensions,
+        session,
+        ty,
+    )
+    .into_any_element()
+}
+
+/// 主对话正文 Markdown 渲染(支持顶层表格对称破栏宽出):
+/// - 普通正文守住 `content_width + PROSE_RAIL_PAD_PX` 最佳阅读行宽;
+/// - 顶层表格对称向外借用 `TABLE_BREAKOUT_EXTRA_PX` 舞台留白,窗口窄时自动贴边收缩;
+/// - 2~6 列表格默认积极折行一屏完整可见,7+ 列超宽表启用横向滚动兜底与图标操作条。
+pub fn render_document_breakout(
+    id: impl Into<SharedString>,
+    source: &str,
+    extensions: &Arc<MarkdownExtensions>,
+    session: WeakEntity<SessionStore>,
+    t: &Palette,
+    ty: &Typography,
+) -> AnyElement {
+    let base_id = id.into();
+    let prose_max = px(ty.content_width + PROSE_RAIL_PAD_PX);
+    let table_max = px(ty.content_width + PROSE_RAIL_PAD_PX + TABLE_BREAKOUT_EXTRA_PX);
+    let segments = split_markdown_tables(source);
+
+    if !segments
+        .iter()
+        .any(|seg| matches!(seg, MarkdownSegment::Table { .. }))
+    {
+        return div()
+            .w_full()
+            .max_w(prose_max)
+            .mx_auto()
+            .px_4()
+            .child(render_document(base_id, source, extensions, session, t, ty))
+            .into_any_element();
+    }
+
+    let (doc_style, wide_table_style, _, highlighter) = cached_theme_assets(t);
+    let mut stack = div().w_full().flex().flex_col().gap_1p5();
+
+    for (seg_ix, segment) in segments.into_iter().enumerate() {
+        let seg_id = SharedString::from(format!("{base_id}-seg-{seg_ix}"));
+        match segment {
+            MarkdownSegment::Prose(chunk) => {
+                let view = build_document_view(
+                    seg_id,
+                    chunk,
+                    doc_style.clone(),
+                    highlighter.clone(),
+                    extensions,
+                    session.clone(),
+                    ty,
+                );
+                stack = stack.child(div().w_full().max_w(prose_max).mx_auto().px_4().child(view));
+            }
+            MarkdownSegment::Table { markdown, cols } => {
+                let wide_scroll = cols >= WIDE_TABLE_SCROLL_COLS;
+                let style = if wide_scroll {
+                    wide_table_style.clone()
+                } else {
+                    doc_style.clone()
+                };
+                let copy_md: SharedString = markdown.clone().into();
+                let view = build_document_view(
+                    seg_id,
+                    markdown,
+                    style,
+                    highlighter.clone(),
+                    extensions,
+                    session.clone(),
+                    ty,
+                )
+                .table_actions(move |_, _, cx| {
+                    let t = *cx.colors();
+                    let copy_md = copy_md.clone();
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .children(wide_scroll.then(|| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(t.faint)
+                                .child(
+                                    Icon::new(IconName::MoveHorizontal)
+                                        .with_size(Size::XSmall)
+                                        .text_color(t.faint),
+                                )
+                                .child("Shift+滚轮或触控板横滑")
+                        }))
+                        .child(
+                            div()
+                                .id("copy-md-table")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(24.))
+                                .rounded(px(RADIUS_CHIP))
+                                .cursor_pointer()
+                                .text_color(t.dim)
+                                .hover(|s| s.bg(t.hover).text_color(t.text))
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new("复制 Markdown 表格")
+                                        .build(window, cx)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_md.to_string(),
+                                    ));
+                                })
+                                .child(
+                                    Icon::new(IconName::Copy)
+                                        .with_size(Size::XSmall)
+                                        .text_color(t.dim),
+                                ),
+                        )
+                });
+                stack = stack.child(div().w_full().max_w(table_max).mx_auto().px_4().child(view));
+            }
+        }
+    }
+
+    stack.into_any_element()
 }
 
 /// 渲染紧凑行内 Markdown(带链接图标与点击跳转,可选中),用于 Ask 题干。
@@ -722,7 +1006,7 @@ pub fn render_inline(
     session: WeakEntity<SessionStore>,
     t: &Palette,
 ) -> AnyElement {
-    let (_, compact_style, highlighter) = cached_theme_assets(t);
+    let (_, _, compact_style, highlighter) = cached_theme_assets(t);
     let view = TextView::markdown(id.into(), source.to_owned())
         .style(compact_style)
         .markdown_extensions((**extensions).clone())
@@ -738,7 +1022,7 @@ pub fn render_inline_plain(
     source: &str,
     t: &Palette,
 ) -> AnyElement {
-    let (_, compact_style, highlighter) = cached_theme_assets(t);
+    let (_, _, compact_style, highlighter) = cached_theme_assets(t);
     TextView::markdown(id.into(), source.to_owned())
         .style(compact_style)
         .shared_code_block_highlighter(highlighter)
@@ -791,5 +1075,36 @@ mod tests {
         );
         assert_eq!(widget_line("\u{E200} visualize \u{E202}{oops}\u{E201}"), Some(Err(())));
         assert_eq!(widget_line("\u{E200} visualize \u{E202}{\"path\":"), None);
+    }
+
+    #[test]
+    fn split_markdown_tables_extracts_top_level_tables_and_skips_code_fences() {
+        let doc = "\
+## 标题
+
+前文说明
+
+| # | 材料 | 作用 | 从哪里来 | 备注 |
+|---|---|---|---|---|
+| 1 | 镜像 | 货 | dump | ok |
+
+```markdown
+| fake | table |
+|---|---|
+| 1 | 2 |
+```
+
+后文总结";
+        let segs = split_markdown_tables(doc);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], MarkdownSegment::Prose(p) if p.contains("前文说明")));
+        assert!(matches!(
+            &segs[1],
+            MarkdownSegment::Table { markdown, cols: 5 } if markdown.contains("镜像")
+        ));
+        assert!(matches!(
+            &segs[2],
+            MarkdownSegment::Prose(p) if p.contains("fake") && p.contains("后文总结")
+        ));
     }
 }

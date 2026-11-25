@@ -363,6 +363,14 @@ pub struct SessionStore {
     pub goal_draft: Option<(Entity<InputState>, Entity<InputState>)>,
     /// 待二段确认撤回的 turn_id(conversation.truncate)。
     pub confirm_truncate_turn: Option<String>,
+    /// 当前会话任务清单(内联悬挂在消息区右上角圆角卡片)。
+    pub todos: Vec<TodoRow>,
+    /// 消息区悬挂任务卡片开关(顶部「任务」按钮与卡片 × 均可自由切换)。
+    pub todo_card_open: bool,
+    /// Composer 模型选择器「管理」弹出卡片开关与行内输入框。
+    pub model_params_open: bool,
+    pub model_params_max_output: Option<Entity<InputState>>,
+    pub model_params_custom_tools: Option<Entity<InputState>>,
     pub requests: UnboundedSender<BridgeRequest>,
 }
 
@@ -479,6 +487,11 @@ provider_retry: None,
             ask_hint: None,
             goal_draft: None,
             confirm_truncate_turn: None,
+            todos: Vec::new(),
+            todo_card_open: true,
+            model_params_open: false,
+            model_params_max_output: None,
+            model_params_custom_tools: None,
             requests,
         }
     }
@@ -1073,6 +1086,73 @@ provider_retry: None,
         });
     }
 
+    pub fn open_model_params(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let max_out_val = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.meta.model_selection.as_ref())
+            .and_then(|m| m.options.max_output_tokens)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let custom_tools_val = self
+            .settings
+            .as_ref()
+            .map(|s| s.meta.custom_tools.join(", "))
+            .unwrap_or_default();
+
+        let max_out_input = match &self.model_params_max_output {
+            Some(input) => input.clone(),
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("模型默认"));
+                self.model_params_max_output = Some(input.clone());
+                input
+            }
+        };
+        max_out_input.update(cx, |state, cx| state.set_value(&max_out_val, window, cx));
+
+        let custom_tools_input = match &self.model_params_custom_tools {
+            Some(input) => input.clone(),
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("英文逗号分隔"));
+                self.model_params_custom_tools = Some(input.clone());
+                input
+            }
+        };
+        custom_tools_input.update(cx, |state, cx| state.set_value(&custom_tools_val, window, cx));
+
+        self.model_params_open = true;
+        cx.notify();
+    }
+
+    pub fn patch_max_output_tokens(&mut self, max_output_tokens: Option<u32>) {
+        if let Some(mut model) = self
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.meta.model_selection.clone())
+        {
+            model.options.max_output_tokens = max_output_tokens;
+            self.patch_model(model);
+        }
+    }
+
+    pub fn patch_native_web_search(&mut self, native_web_search: Option<bool>) {
+        if let Some(mut model) = self
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.meta.model_selection.clone())
+        {
+            model.options.native_web_search = native_web_search;
+            self.patch_model(model);
+        }
+    }
+
+    pub fn patch_custom_tools(&mut self, names: Vec<String>) {
+        self.patch_settings(SessionSettingsPatch {
+            tools: Some(ToolsSettingPatch::Custom { names }),
+            ..Default::default()
+        });
+    }
+
     /// 移入目标工作区分组。
     pub fn move_to_workspace(&mut self, workspace_id: String) {
         let _ = self.requests.unbounded_send(BridgeRequest::MoveSession {
@@ -1164,7 +1244,8 @@ pub fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
         .collect()
 }
 
-/// 右栏任务条目。
+/// 会话任务条目。
+#[derive(Clone)]
 pub struct TodoRow {
     pub title: String,
     pub status: String,

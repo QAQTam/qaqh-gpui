@@ -10,7 +10,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, Div, Entity, FollowMode,
     FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, list, px,
+    StatefulInteractiveElement, Styled, Window, div, list, px, relative,
 };
 use gpui_kit::base::{SelectableText, TextSelection};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
@@ -27,7 +27,7 @@ use qaqh_ringing_contract::state::{
 use qaqh_types::{SessionRunStatus, ToolCallOutcome};
 
 use qaqh_gpui_kit::kit::{
-    RADIUS_BUBBLE, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, soft,
+    RADIUS_BUBBLE, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, shadow_popover, soft,
 };
 use qaqh_gpui_kit::motion::{
     accordion_reveal, bottom_fade_mask, effective_motion, live_dot, shimmer_label, spring_chevron,
@@ -37,6 +37,218 @@ use qaqh_gpui_kit::settings::{self, MotionLevel};
 use qaqh_gpui_kit::theme::{ActiveTheme, Palette};
 
 use crate::store::{ArgStream, SessionStore};
+
+/// 自动换行悬停提示卡:用于单行截断的 Todo 条目,悬停展示完整多行内容。
+struct WrappingTooltip {
+    text: SharedString,
+}
+
+impl Render for WrappingTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.colors();
+        div()
+            .max_w(px(320.))
+            .px_2p5()
+            .py_1p5()
+            .rounded(px(RADIUS_CHIP))
+            .bg(t.card)
+            .border_1()
+            .border_color(t.border)
+            .shadow(shadow_popover(&t))
+            .text_xs()
+            .text_color(t.text)
+            .child(self.text.clone())
+    }
+}
+
+/// 内联悬挂于消息区右上角的圆角 Todo 卡片:
+/// - 与可滚动消息列表并列定位(`absolute`),上下翻动消息区不影响此卡片;
+/// - 右边距预留 18px 避让最右侧滚动条;
+/// - 每条 Todo 严格单行省略号截断,鼠标悬停弹出自动换行完整标签;
+/// - 顶部「任务」按钮与卡片右上角 × 均可随时收起/展开。
+fn todo_floating_card(
+    store: &SessionStore,
+    cx: &mut Context<SessionStore>,
+    t: &Palette,
+) -> Option<AnyElement> {
+    if !store.todo_card_open || store.todos.is_empty() {
+        return None;
+    }
+    let total = store.todos.len();
+    let done = store
+        .todos
+        .iter()
+        .filter(|item| item.status == "completed")
+        .count();
+    let ratio = done as f32 / total as f32;
+
+    let header = div()
+        .px_3()
+        .pt_2p5()
+        .pb_2()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .border_b_1()
+        .border_color(t.border_subtle)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::ListChecks)
+                                .with_size(Size::XSmall)
+                                .text_color(if done == total { t.ok } else { t.accent }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text)
+                                .child("任务"),
+                        )
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .text_xs()
+                                .text_color(if done == total { t.ok } else { t.dim })
+                                .child(SharedString::from(format!("{done}/{total}"))),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("close-floating-todo")
+                        .size(px(20.))
+                        .rounded(px(RADIUS_CHIP))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.hover))
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("收起任务卡片")
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(|store, _, _, cx| {
+                            store.todo_card_open = false;
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::X).with_size(Size::XSmall).text_color(t.dim)),
+                ),
+        )
+        .child(
+            div()
+                .h(px(3.))
+                .w_full()
+                .rounded_full()
+                .bg(t.surface_subtle)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(ratio))
+                        .rounded_full()
+                        .bg(if done == total { t.ok } else { t.accent }),
+                ),
+        );
+
+    let mut list = div()
+        .id("floating-todo-list")
+        .max_h(px(220.))
+        .overflow_y_scroll()
+        .p_1p5()
+        .flex()
+        .flex_col()
+        .gap_0p5();
+
+    for (idx, item) in store.todos.iter().enumerate() {
+        let in_progress = item.status == "in_progress";
+        let settled = item.status == "completed" || item.status == "cancelled";
+        let icon_el: AnyElement = match item.status.as_str() {
+            "completed" => Icon::new(IconName::CircleCheck)
+                .with_size(Size::XSmall)
+                .text_color(t.ok)
+                .into_any_element(),
+            "cancelled" => Icon::new(IconName::CircleX)
+                .with_size(Size::XSmall)
+                .text_color(t.bad)
+                .into_any_element(),
+            "in_progress" => Icon::new(IconName::LoaderCircle)
+                .with_size(Size::XSmall)
+                .text_color(t.accent)
+                .with_animation(
+                    SharedString::from(format!("floating-todo-spin-{idx}")),
+                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                    |icon, val| icon.rotate(gpui_kit::Radians(val * std::f32::consts::TAU)),
+                )
+                .into_any_element(),
+            _ => Icon::new(IconName::Circle)
+                .with_size(Size::XSmall)
+                .text_color(t.faint)
+                .into_any_element(),
+        };
+        let full_title = SharedString::from(item.title.clone());
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("floating-todo-row-{idx}")))
+                .px_2()
+                .py_1()
+                .rounded(px(RADIUS_CHIP))
+                .when(in_progress, |row| row.bg(t.accent_soft))
+                .when(!in_progress, |row| row.hover(|s| s.bg(t.hover)))
+                .flex()
+                .items_center()
+                .gap_2()
+                .tooltip(move |_window, cx| {
+                    let text = full_title.clone();
+                    cx.new(move |_| WrappingTooltip { text }).into()
+                })
+                .child(div().flex_shrink_0().child(icon_el))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .font_weight(if in_progress {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if settled { t.dim } else { t.text })
+                        .child(item.title.clone()),
+                ),
+        );
+    }
+
+    Some(
+        div()
+            .id("floating-todo-card")
+            .occlude()
+            .absolute()
+            .top(px(12.))
+            .right(px(18.))
+            .w(px(288.))
+            .rounded(px(RADIUS_CARD))
+            .bg(t.card)
+            .border_1()
+            .border_color(t.border)
+            .shadow(shadow_popover(t))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list)
+            .into_any_element(),
+    )
+}
 
 pub(crate) fn content_text(value: &ContentValue) -> &str {
     match value {
@@ -1032,6 +1244,15 @@ fn assistant_source_text<'a>(store: &'a SessionStore, source: AssistantSource) -
     }
 }
 
+/// 标准正文阅读轨(与原对话宽度像素一致),表格破栏块以外的所有元素统一走此轨道居中。
+fn prose_rail(ty: &settings::Typography) -> Div {
+    div()
+        .w_full()
+        .max_w(px(ty.content_width + crate::markdown::PROSE_RAIL_PAD_PX))
+        .mx_auto()
+        .px_4()
+}
+
 /// 助手块 markdown 区(Reasoning 使用无框思考行 + 左侧 1px 脊柱 MotionReveal 展开)。
 #[allow(clippy::too_many_arguments)]
 fn assistant_section(
@@ -1081,11 +1302,14 @@ fn assistant_section(
             )
         } else if matches!(kind, AssistantBlockKind::ToolCall) {
             Some(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.faint)
-                    .child("工具调用")
+                prose_rail(ty)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.faint)
+                            .child("工具调用"),
+                    )
                     .into_any_element(),
             )
         } else {
@@ -1094,7 +1318,7 @@ fn assistant_section(
         let body = if reasoning {
             None
         } else {
-            Some(crate::markdown::render_document(
+            Some(crate::markdown::render_document_breakout(
                 md_key.clone(),
                 text,
                 &md_extensions,
@@ -1108,6 +1332,7 @@ fn assistant_section(
 
     let mut container = div()
         .id(("mdsec", section))
+        .w_full()
         .flex()
         .flex_col()
         .gap_1p5()
@@ -1153,24 +1378,31 @@ fn assistant_section(
         container = container.child(body);
     }
 
-    container
+    let section_el = container
         .children((live && !reasoning).then(|| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .pt_0p5()
-                .child(live_dot(format!("live-gen-{}", block_id.0), t.accent, true))
-                .child(shimmer_label(
-                    format!("live-shimmer-{}", block_id.0),
-                    "正在生成…",
-                    t,
-                ))
+            prose_rail(ty).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .pt_0p5()
+                    .child(live_dot(format!("live-gen-{}", block_id.0), t.accent, true))
+                    .child(shimmer_label(
+                        format!("live-shimmer-{}", block_id.0),
+                        "正在生成…",
+                        t,
+                    )),
+            )
         }))
         .context_menu(move |menu, window, cx| {
             copy_context_menu(menu, window, cx, &full_text, &weak_entity)
-        })
-        .into_any_element()
+        });
+
+    if reasoning {
+        prose_rail(ty).child(section_el).into_any_element()
+    } else {
+        section_el.into_any_element()
+    }
 }
 
 /// 通知行:左侧呼吸点/色点 + 标签 + 正文。
@@ -1585,22 +1817,34 @@ impl Render for SessionStore {
         let entity = cx.entity();
         let items_for_list = display_items.clone();
         let timeline_list_el = list(list_state, move |index, window, cx| {
-            let row = div().w_full().px_4().when(index == 0, |row| row.pt_4());
+            let row = div().w_full().when(index == 0, |row| row.pt_4());
             let gap = px((10.0 + ty.density_shift).max(4.));
 
             if let Some(item) = items_for_list.get(index) {
                 return match item {
                     TimelineItem::Single(entry_idx) => {
-                        let last_assistant = entity
-                            .read(cx)
-                            .entries
-                            .iter()
-                            .rposition(|entry| matches!(entry, TimelineEntry::AssistantBlock { .. }));
+                        let (is_assistant, last_assistant) = {
+                            let store = entity.read(cx);
+                            let is_assistant = matches!(
+                                store.entries.get(*entry_idx),
+                                Some(TimelineEntry::AssistantBlock { .. })
+                            );
+                            let last_assistant = store
+                                .entries
+                                .iter()
+                                .rposition(|entry| matches!(entry, TimelineEntry::AssistantBlock { .. }));
+                            (is_assistant, last_assistant)
+                        };
                         match timeline_entry(window, cx, &entity, *entry_idx, &t, &ty, tail_max) {
                             Some(content) => {
-                                let row = row.pb(gap).child(content);
+                                let wrapped = if is_assistant {
+                                    content
+                                } else {
+                                    prose_rail(&ty).child(content).into_any_element()
+                                };
+                                let row = row.pb(gap).child(wrapped);
                                 if last_assistant == Some(*entry_idx) {
-                                    row.child(copy_conversation_chip(&entity, &t))
+                                    row.child(prose_rail(&ty).child(copy_conversation_chip(&entity, &t)))
                                         .into_any_element()
                                 } else {
                                     row.into_any_element()
@@ -1611,9 +1855,9 @@ impl Render for SessionStore {
                     }
                     TimelineItem::ToolBurst { group_id, indices } => row
                         .pb(gap)
-                        .child(tool_burst_card(
+                        .child(prose_rail(&ty).child(tool_burst_card(
                             window, cx, &entity, *group_id, indices, &t, tail_max,
-                        ))
+                        )))
                         .into_any_element(),
                 };
             }
@@ -1660,7 +1904,6 @@ impl Render for SessionStore {
 
             div()
                 .w_full()
-                .px_4()
                 .when(index == 0, |row| row.pt_4())
                 .pb_6()
                 .flex()
@@ -1679,7 +1922,8 @@ impl Render for SessionStore {
                     if tool_status_only(tool_name) {
                         let title = tool_summary(tool_name, &ToolCallState::Declared)
                             .map_or_else(|| format!("正在准备 {tool_name}"), str::to_owned);
-                        return tool_status_line(tool_name, title, &ToolCallState::Declared, &t)
+                        return prose_rail(&ty)
+                            .child(tool_status_line(tool_name, title, &ToolCallState::Declared, &t))
                             .into_any_element();
                     }
                     let mut title = format!("正在准备 {tool_name}");
@@ -1693,39 +1937,46 @@ impl Render for SessionStore {
                         title.push_str("  · 参数已就绪");
                     }
                     let expanded = store.expanded_tools.contains(call_id);
-                    div()
-                        .child(tool_toggle(
-                            &entity,
-                            call_id,
-                            expanded,
-                            tool_status_icon(call_id, &ToolCallState::Running, &t),
-                            tool_category_icon(tool_name, tool_name == "exec_command"),
-                            title,
-                            None,
-                            animate_motion,
-                            &t,
-                        ))
-                        .children(expanded.then(|| {
+                    prose_rail(&ty)
+                        .child(
                             div()
-                                .px_3()
-                                .py_1p5()
-                                .rounded(px(RADIUS_CHIP))
-                                .bg(t.code_bg)
-                                .font_family("monospace")
-                                .text_xs()
-                                .text_color(t.dim)
-                                .max_h(px(240.))
-                                .id(SharedString::from(format!("arg-stream-{}", call_id.0)))
-                                .overflow_y_scroll()
-                                .child(SharedString::from(text.clone()))
-                        }))
+                                .child(tool_toggle(
+                                    &entity,
+                                    call_id,
+                                    expanded,
+                                    tool_status_icon(call_id, &ToolCallState::Running, &t),
+                                    tool_category_icon(tool_name, tool_name == "exec_command"),
+                                    title,
+                                    None,
+                                    animate_motion,
+                                    &t,
+                                ))
+                                .children(expanded.then(|| {
+                                    div()
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded(px(RADIUS_CHIP))
+                                        .bg(t.code_bg)
+                                        .font_family("monospace")
+                                        .text_xs()
+                                        .text_color(t.dim)
+                                        .max_h(px(240.))
+                                        .id(SharedString::from(format!("arg-stream-{}", call_id.0)))
+                                        .overflow_y_scroll()
+                                        .child(SharedString::from(text.clone()))
+                                })),
+                        )
                         .into_any_element()
                 }))
                 .children(store.tools.iter().filter_map(|tool| {
                     if referenced_tools.contains(&tool.call_id) {
                         return None;
                     }
-                    Some(tool_card(cx, store, &entity, tool, &t, tail_max).into_any_element())
+                    Some(
+                        prose_rail(&ty)
+                            .child(tool_card(cx, store, &entity, tool, &t, tail_max))
+                            .into_any_element(),
+                    )
                 }))
                 .children(store.subagents.iter().map(|subagent| {
                     let status = subagent
@@ -1754,15 +2005,13 @@ impl Render for SessionStore {
                         let head: String = content_text(result).chars().take(160).collect();
                         row = row.child(div().text_xs().text_color(t.dim).truncate().child(head));
                     }
-                    row.into_any_element()
+                    prose_rail(&ty).child(row).into_any_element()
                 }))
                 .into_any_element()
         })
         .flex_1()
         .min_h_0()
-        .w_full()
-        .max_w(px(ty.content_width + 48.))
-        .mx_auto();
+        .w_full();
 
         let timeline = div()
             .id("timeline-panel")
@@ -1780,7 +2029,8 @@ impl Render for SessionStore {
                     .bottom_0()
                     .left_0()
                     .right_0(),
-            );
+            )
+            .children(todo_floating_card(self, cx, &t));
 
         let mut pending_interactions = Vec::new();
         for interaction in self.interactions.clone().iter() {
@@ -1931,6 +2181,7 @@ impl Render for SessionStore {
             .child(composer);
 
         div()
+            .relative()
             .flex()
             .flex_1()
             .min_w_0()
@@ -1938,5 +2189,6 @@ impl Render for SessionStore {
             .child(conversation)
             .children(crate::code_panel::render(self, &t, &ty, cx))
             .children(crate::terminal_panel::render(self, &t, &ty, cx))
+            .children(crate::composer::model_params_modal(self, cx, &t))
     }
 }
