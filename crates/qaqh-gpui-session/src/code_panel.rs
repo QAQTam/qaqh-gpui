@@ -21,36 +21,6 @@ pub struct Location {
     column: Option<usize>,
 }
 
-fn decode_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes.get(i) == Some(&b'%')
-            && let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2))
-            && let (Some(h), Some(l)) = (decode_hex_nibble(hi), decode_hex_nibble(lo))
-        {
-            out.push((h << 4) | l);
-            i += 3;
-            continue;
-        }
-        if let Some(&b) = bytes.get(i) {
-            out.push(b);
-        }
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
-}
-
 fn strip_file_uri(value: &str) -> Option<String> {
     let prefix = value.get(..7)?;
     if !prefix.eq_ignore_ascii_case("file://") {
@@ -65,7 +35,10 @@ fn strip_file_uri(value: &str) -> Option<String> {
     } else {
         rest
     };
-    let decoded = percent_decode(rest);
+    let decoded = percent_encoding::percent_decode_str(rest)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
     let bytes = decoded.as_bytes();
     if bytes.first() == Some(&b'/')
         && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)

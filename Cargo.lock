@@ -5388,6 +5388,7 @@ dependencies = [
  "alacritty_terminal",
  "futures",
  "gpui-kit",
+ "percent-encoding",
  "pulldown-cmark",
  "qaqh-client",
  "qaqh-config-api",

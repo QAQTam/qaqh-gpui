@@ -65,6 +65,8 @@ tree-sitter-json = "0.24"
 tree-sitter-bash = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# URI percent-decode 复用已锁定的 percent-encoding 2.3.2(零新增传递依赖)。
+percent-encoding = "2"
 # 仅用 tokio::time::sleep(桥线程等待重试);runtime 复用 qaqh-client 的全局运行时。
 tokio = { version = "1", default-features = false, features = ["time"] }
 # 完整 VT100/xterm/ConPTY 虚拟终端内核(Apache-2.0,仅用无头 Term + vte::ansi::Processor,不启本地 PTY)。
