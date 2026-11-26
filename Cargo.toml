@@ -46,7 +46,6 @@ qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
 qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
 # ModelSelection/SettingValue wire 类型(session.settings.patch 组装用,零转换层)。
 qaqh-types = { path = "../qaqh-backend/crates/qaqh-types" }
-qaqh-config-api = { path = "../qaqh-backend/crates/qaqh-config-api" }
 qaqh-profile = { path = "../qaqh-backend/crates/qaqh-profile" }
 
 # ---- 第三方 ----

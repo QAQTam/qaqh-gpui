@@ -21,7 +21,7 @@ use qaqh_gpui_wire::bridge::{
 };
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::WindowExt;
-use qaqh_config_api::ConfigDto;
+use qaqh_profile::ConfigDto;
 use qaqh_profile::ProfilesDocument;
 use qaqh_types::ModelSelection;
 use qaqh_gpui_session::store::{SessionStore, SessionRow, TodoRow, SettingsEditor, AccountService, AccountSignIn, StreamState, rows_from, todos_from, model_options_from};

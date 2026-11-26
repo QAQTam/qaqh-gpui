@@ -11,7 +11,7 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable, Size, WindowExt as _};
 use gpui_kit::assets::IconName;
-use qaqh_config_api::ConfigPatch;
+use qaqh_profile::ConfigPatch;
 use qaqh_gpui_kit::kit::{
     BtnKind, RADIUS_CHIP, RADIUS_CONTROL, button, pill, segmented_item, segmented_strip,
     stage_surface,

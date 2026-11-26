@@ -20,7 +20,7 @@ use qaqh_client::{
 use qaqh_client::ringing_v2::RingingV2CommandAck;
 use qaqh_types::ModelSelection;
 use qaqh_types::SessionListEntry;
-use qaqh_config_api::{ConfigDto, ConfigPatch};
+use qaqh_profile::{ConfigDto, ConfigPatch};
 use qaqh_profile::ProfilesDocument;
 use qaqh_ringing_contract::events::SessionEventFrame;
 use qaqh_ringing_contract::fact::{ContentRef, PermissionGrantScope, TurnId};

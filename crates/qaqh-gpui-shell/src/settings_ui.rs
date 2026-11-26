@@ -15,8 +15,9 @@ use gpui_kit::assets::IconName;
 use qaqh_client::{
     ProviderUpsertDto, RingingCommand, SecretWrite, SessionSettingsPatch, ToolsSettingPatch,
 };
-use qaqh_config_api::{ConfigPatch, ExecPatch, GoalsPatch, SandboxPatch};
-use qaqh_profile::{ModelDef, ProfilesDocument, ProviderDef};
+use qaqh_profile::{
+    ConfigPatch, ExecPatch, GoalsPatch, ModelDef, ProfilesDocument, ProviderDef, SandboxPatch,
+};
 use qaqh_types::{CredentialSource, ModelSelection, Wire};
 
 use qaqh_gpui_kit::kit::{
