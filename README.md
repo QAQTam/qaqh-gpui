@@ -73,3 +73,4 @@ python3 scripts/acceptance.py --client target/release/qaqh-gpui --daemon target/
 
 本项目自有代码可按 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 使用。
 第三方高亮查询沿用 [nvim-treesitter 的 Apache-2.0 许可证](assets/queries/README.md)。
+内嵌字体 Google Sans 与 Google Sans Code 遵循 [SIL Open Font License 1.1](assets/fonts/README.md)（完整授权正文见 [OFL-GoogleSans.txt](assets/fonts/OFL-GoogleSans.txt) 与 [OFL-GoogleSansCode.txt](assets/fonts/OFL-GoogleSansCode.txt)）。

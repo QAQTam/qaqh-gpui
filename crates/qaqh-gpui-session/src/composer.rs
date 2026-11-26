@@ -6,11 +6,12 @@
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, Anchor, ClickEvent, Div, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Styled, WeakEntity, Window, div, px,
+    ParentElement, SharedString, Styled, WeakEntity, Window, div, px, relative,
 };
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::popover::{Popover, PopoverState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable, Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
 use qaqh_gpui_kit::kit::{
@@ -39,6 +40,196 @@ fn token_badge(tokens: u32) -> String {
     } else {
         format!("{}k", tokens / 1_000)
     }
+}
+
+fn format_tokens_compact(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        let tenths = (tokens as f64 / 100_000.0).round() as u64;
+        if tenths.is_multiple_of(10) {
+            format!("{}M", tenths / 10)
+        } else {
+            format!("{:.1}M", tenths as f64 / 10.0)
+        }
+    } else if tokens >= 1_000 {
+        let tenths = (tokens as f64 / 100.0).round() as u64;
+        if tenths.is_multiple_of(10) {
+            format!("{}k", tenths / 10)
+        } else {
+            format!("{:.1}k", tenths as f64 / 10.0)
+        }
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_tokens_exact(tokens: u64) -> String {
+    let digits: Vec<char> = tokens.to_string().chars().collect();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.iter().enumerate() {
+        if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*ch);
+    }
+    out
+}
+
+fn telemetry_footer(store: &SessionStore, t: &Palette) -> Option<AnyElement> {
+    let tel = store.telemetry()?;
+
+    let ctx_color = if tel.used_pct.is_some_and(|pct| pct >= 90) {
+        t.bad
+    } else if tel.used_pct.is_some_and(|pct| pct >= 75) {
+        t.warn
+    } else {
+        t.dim
+    };
+    let bar_fill = if tel.used_pct.is_some_and(|pct| pct >= 90) {
+        t.bad
+    } else if tel.used_pct.is_some_and(|pct| pct >= 75) {
+        t.warn
+    } else {
+        t.text
+    };
+
+    let used_compact = format_tokens_compact(u64::from(tel.used_tokens));
+    let ctx_label = match (tel.context_window, tel.used_pct) {
+        (Some(window), Some(pct)) => format!(
+            "{pct}% · {used_compact} / {}",
+            format_tokens_compact(u64::from(window))
+        ),
+        _ => format!("{used_compact} ctx"),
+    };
+    let used_exact = format_tokens_exact(u64::from(tel.used_tokens));
+    let mut ctx_tip = match (tel.context_window, tel.used_pct) {
+        (Some(window), Some(pct)) => format!(
+            "当前上下文占用: {used_exact} / {} tokens ({pct}%)",
+            format_tokens_exact(u64::from(window))
+        ),
+        _ => format!("当前上下文占用: {used_exact} tokens (模型窗口未知)"),
+    };
+    ctx_tip.push_str(&format!(
+        "\n最近请求: 输入 {} · 输出 {}",
+        format_tokens_exact(u64::from(tel.prompt_tokens)),
+        format_tokens_exact(u64::from(tel.completion_tokens)),
+    ));
+    if tel.reasoning_tokens > 0 {
+        ctx_tip.push_str(&format!(
+            " · 思考 {}",
+            format_tokens_exact(u64::from(tel.reasoning_tokens))
+        ));
+    }
+    let ctx_tip: SharedString = ctx_tip.into();
+
+    let (cache_color, cache_label, mut cache_tip) = match &tel.latest_cache {
+        Some(stats) => {
+            let color = if stats.hit_pct >= 60 {
+                t.ok
+            } else if stats.hit_pct > 0 {
+                t.dim
+            } else {
+                t.warn
+            };
+            let label = format!(
+                "缓存 {}% · {}",
+                stats.hit_pct,
+                format_tokens_compact(stats.hit_tokens)
+            );
+            let tip = format!(
+                "最近请求缓存命中: {}% (命中 {} / {} tokens)",
+                stats.hit_pct,
+                format_tokens_exact(stats.hit_tokens),
+                format_tokens_exact(stats.total_tokens),
+            );
+            (color, label, tip)
+        }
+        None => (
+            t.faint,
+            "缓存 —".to_owned(),
+            "最近请求缓存命中: 服务商未上报缓存统计".to_owned(),
+        ),
+    };
+    if tel.usage_requests > 1
+        && let Some(cum) = &tel.cumulative_cache
+    {
+        cache_tip.push_str(&format!(
+            "\n本会话累计命中: {}% (命中 {} / {} · 共 {} 次请求)",
+            cum.hit_pct,
+            format_tokens_exact(cum.hit_tokens),
+            format_tokens_exact(cum.total_tokens),
+            tel.usage_requests,
+        ));
+    }
+    let cache_tip: SharedString = cache_tip.into();
+
+    let ctx_meter = div()
+        .id("composer-ctx-meter")
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .min_w_0()
+        .tooltip(move |window, cx| Tooltip::new(ctx_tip.clone()).build(window, cx))
+        .child(
+            Icon::new(IconName::Gauge)
+                .with_size(Size::XSmall)
+                .text_color(ctx_color),
+        )
+        .children(tel.used_pct.map(|pct| {
+            let ratio = (f32::from(pct) / 100.0).clamp(0.0, 1.0);
+            div()
+                .w(px(44.))
+                .h(px(4.))
+                .rounded_full()
+                .bg(soft(t.border, 0.7))
+                .overflow_hidden()
+                .child(div().h_full().w(relative(ratio)).rounded_full().bg(bar_fill))
+        }))
+        .child(
+            div()
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                .text_size(px(10.))
+                .text_color(ctx_color)
+                .truncate()
+                .child(SharedString::from(ctx_label)),
+        );
+
+    let cache_meter = div()
+        .id("composer-cache-meter")
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .flex_shrink_0()
+        .tooltip(move |window, cx| Tooltip::new(cache_tip.clone()).build(window, cx))
+        .child(
+            Icon::new(IconName::DatabaseZap)
+                .with_size(Size::XSmall)
+                .text_color(cache_color),
+        )
+        .child(
+            div()
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                .text_size(px(10.))
+                .text_color(cache_color)
+                .child(SharedString::from(cache_label)),
+        );
+
+    Some(
+        div()
+            .id("composer-telemetry-footer")
+            .h(px(26.))
+            .px_3()
+            .bg(t.surface_subtle)
+            .border_t_1()
+            .border_color(t.border_subtle)
+            .rounded_b(px(RADIUS_COMPOSER - 1.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(ctx_meter)
+            .child(cache_meter)
+            .into_any_element(),
+    )
 }
 
 fn tools_mode_label(mode: &str) -> &'static str {
@@ -566,7 +757,7 @@ pub fn model_params_modal(
         .gap_1p5()
         .child(
             div()
-                .font_family("monospace")
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                 .text_xs()
                 .text_color(t.text)
                 .truncate()
@@ -1201,12 +1392,18 @@ pub fn render(
                     t.border
                 })
                 .shadow(shadow_composer(t, running))
-                .px_2p5()
-                .pt_2()
-                .pb_1p5()
-                .child(Textarea::new(&store.composer).appearance(false).bordered(false))
-                .children(strip)
-                .child(toolbar),
+                .child(
+                    div()
+                        .px_2p5()
+                        .pt_2()
+                        .pb_1p5()
+                        .flex()
+                        .flex_col()
+                        .child(Textarea::new(&store.composer).appearance(false).bordered(false))
+                        .children(strip)
+                        .child(toolbar),
+                )
+                .children(telemetry_footer(store, t)),
         )
 }
 

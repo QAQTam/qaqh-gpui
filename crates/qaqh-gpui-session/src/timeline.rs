@@ -116,7 +116,7 @@ fn todo_floating_card(
                         )
                         .child(
                             div()
-                                .font_family("monospace")
+                                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                                 .text_xs()
                                 .text_color(if done == total { t.ok } else { t.dim })
                                 .child(SharedString::from(format!("{done}/{total}"))),
@@ -729,7 +729,7 @@ fn tool_toggle(
                 .py(px(1.))
                 .rounded(px(RADIUS_CHIP))
                 .bg(t.surface_subtle)
-                .font_family("monospace")
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                 .text_xs()
                 .child(div().text_color(t.ok).child(format!("+{added}")))
                 .child(div().text_color(t.bad).child(format!("−{removed}")))
@@ -881,7 +881,7 @@ fn tool_card(
                 .py_1()
                 .rounded(px(RADIUS_CHIP))
                 .bg(t.surface_subtle)
-                .font_family("monospace")
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                 .text_xs()
                 .text_color(t.dim)
                 .truncate()
@@ -919,7 +919,7 @@ fn tool_card(
                 .id(SharedString::from(format!("tool-output-{}", tool.call_id.0)))
                 .max_h(px(240.))
                 .overflow_y_scroll()
-                .font_family("monospace")
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                 .text_xs()
                 .px_3()
                 .py_2()
@@ -1957,7 +1957,7 @@ impl Render for SessionStore {
                                         .py_1p5()
                                         .rounded(px(RADIUS_CHIP))
                                         .bg(t.code_bg)
-                                        .font_family("monospace")
+                                        .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                                         .text_xs()
                                         .text_color(t.dim)
                                         .max_h(px(240.))
@@ -2188,7 +2188,7 @@ impl Render for SessionStore {
             .min_h_0()
             .child(conversation)
             .children(crate::code_panel::render(self, &t, &ty, cx))
-            .children(crate::terminal_panel::render(self, &t, &ty, cx))
+            .children(crate::terminal_panel::render(self, &t, &ty, window, cx))
             .children(crate::composer::model_params_modal(self, cx, &t))
     }
 }

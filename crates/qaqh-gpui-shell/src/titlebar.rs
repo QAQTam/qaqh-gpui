@@ -140,7 +140,7 @@ pub(crate) fn render(
                             .py_0p5()
                             .rounded_full()
                             .bg(t.accent_soft)
-                            .font_family("monospace")
+                            .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                             .text_xs()
                             .text_color(t.accent)
                             .child(SharedString::from(format!("{:.0} tok/s", rate.max(1.))))

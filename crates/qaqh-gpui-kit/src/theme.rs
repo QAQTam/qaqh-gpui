@@ -5,6 +5,7 @@
 use gpui_kit::App;
 use gpui_kit::Global;
 use gpui_kit::Hsla;
+use gpui_kit::SharedString;
 use gpui_kit::WindowAppearance;
 use gpui_kit::hsla;
 use gpui_kit::rgb;
@@ -327,6 +328,7 @@ pub fn init(cx: &mut App) {
         preset,
         palette: mode.resolve(appearance, preset),
     });
+    crate::fonts::init(cx);
     sync_component_theme(cx);
 }
 
@@ -394,7 +396,16 @@ pub fn sync_component_theme(cx: &mut App) {
     };
     let light_theme = p.bg.l > 0.5;
     let danger_step = if light_theme { -0.06 } else { 0.06 };
+    let custom_ui_font = crate::settings::get(cx).typography.ui_font_family.trim().to_owned();
+    let ui_font = if custom_ui_font.is_empty() {
+        crate::fonts::ui_font_family()
+    } else {
+        SharedString::from(custom_ui_font)
+    };
+    let mono_font = crate::fonts::mono_font_family();
     gpui_kit::component::Theme::update(cx, |theme| {
+        theme.font_family = ui_font;
+        theme.mono_font_family = mono_font;
         theme.radius = px_val(crate::kit::RADIUS_CONTROL);
         let c = &mut theme.colors;
         c.background = p.stage;

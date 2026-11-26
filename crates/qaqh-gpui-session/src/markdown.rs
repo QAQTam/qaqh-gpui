@@ -316,7 +316,7 @@ impl MarkdownPlugin for LinkIconPlugin {
                 .bg(t.code_bg)
                 .border_1()
                 .border_color(t.border_subtle)
-                .font_family("monospace")
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                 .text_color(t.code_fg)
                 .child(SharedString::from(data.label))
                 .into_any_element()
@@ -818,7 +818,7 @@ fn build_document_view(
                         .py(px(1.))
                         .rounded(px(RADIUS_CHIP))
                         .bg(t.btn)
-                        .font_family("monospace")
+                        .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                         .text_xs()
                         .text_color(t.dim)
                         .child(lang),

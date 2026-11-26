@@ -34,10 +34,40 @@ use crate::terminal::{
     DEFAULT_COLS, DEFAULT_ROWS, TerminalEmulator, encode_keystroke, encode_paste,
 };
 
-#[cfg(target_os = "windows")]
-const MONO_FONT: &str = "Consolas";
-#[cfg(not(target_os = "windows"))]
-const MONO_FONT: &str = "monospace";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColsMode {
+    AutoFit,
+    FixedCols(usize),
+}
+
+fn mono_font(weight: FontWeight, style: FontStyle) -> Font {
+    Font {
+        family: qaqh_gpui_kit::fonts::mono_font_family(),
+        features: Default::default(),
+        fallbacks: qaqh_gpui_kit::fonts::mono_font_fallbacks(),
+        weight,
+        style,
+    }
+}
+
+/// 测量等宽字体在指定字号下的单格宽度(10 字符均摊,避免 10px 小字号下钳制 6px 导致列漂移)。
+pub fn measure_mono_cell_width(font_size_px: f32, window: &mut Window) -> f32 {
+    let font_size = px(font_size_px.clamp(8.5, 24.0));
+    let probe = window.text_system().shape_line(
+        SharedString::from("MMMMMMMMMM"),
+        font_size,
+        &[TextRun {
+            len: 10,
+            font: mono_font(FontWeight::NORMAL, FontStyle::Normal),
+            color: gpui_kit::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    );
+    (f32::from(probe.width()) / 10.0).max(4.0)
+}
 
 type InputCallback = Arc<dyn Fn(Vec<u8>, &mut App) + Send + Sync>;
 type ResizeCallback = Arc<dyn Fn(u16, u16, &mut App) + Send + Sync>;
@@ -46,6 +76,8 @@ type ResizeCallback = Arc<dyn Fn(u16, u16, &mut App) + Send + Sync>;
 struct TerminalMetrics {
     origin_x: f32,
     origin_y: f32,
+    viewport_width: f32,
+    scroll_x_px: f32,
     cell_width: f32,
     line_height: f32,
     cols: usize,
@@ -59,6 +91,8 @@ impl Default for TerminalMetrics {
         Self {
             origin_x: 0.0,
             origin_y: 0.0,
+            viewport_width: 640.0,
+            scroll_x_px: 0.0,
             cell_width: 8.0,
             line_height: 18.0,
             cols: DEFAULT_COLS,
@@ -74,11 +108,14 @@ pub struct TerminalView {
     id: SharedString,
     emulator: TerminalEmulator,
     interactive: bool,
+    cols_mode: ColsMode,
+    font_size_override: Option<f32>,
     focus_handle: FocusHandle,
     metrics: Rc<Cell<TerminalMetrics>>,
     marked_text: Option<String>,
     selecting: bool,
     scroll_remainder_px: f32,
+    scroll_x_px: f32,
     on_input: Option<InputCallback>,
     on_resize: Option<ResizeCallback>,
 }
@@ -94,11 +131,14 @@ impl TerminalView {
             id: id.into(),
             emulator: TerminalEmulator::new(DEFAULT_COLS, DEFAULT_ROWS),
             interactive: true,
+            cols_mode: ColsMode::AutoFit,
+            font_size_override: None,
             focus_handle,
             metrics: Rc::new(Cell::new(TerminalMetrics::default())),
             marked_text: None,
             selecting: false,
             scroll_remainder_px: 0.0,
+            scroll_x_px: 0.0,
             on_input: Some(Arc::new(on_input)),
             on_resize: Some(Arc::new(on_resize)),
         }
@@ -109,14 +149,37 @@ impl TerminalView {
             id: id.into(),
             emulator: TerminalEmulator::new(DEFAULT_COLS, DEFAULT_ROWS),
             interactive: false,
+            cols_mode: ColsMode::AutoFit,
+            font_size_override: None,
             focus_handle,
             metrics: Rc::new(Cell::new(TerminalMetrics::default())),
             marked_text: None,
             selecting: false,
             scroll_remainder_px: 0.0,
+            scroll_x_px: 0.0,
             on_input: None,
             on_resize: None,
         }
+    }
+
+    pub fn set_cols_mode(&mut self, mode: ColsMode) {
+        if self.cols_mode == mode {
+            return;
+        }
+        self.cols_mode = mode;
+        if let ColsMode::FixedCols(cols) = mode {
+            let rows = self.emulator.size().1 as usize;
+            self.emulator.resize(cols, rows);
+        }
+    }
+
+    pub fn set_font_size(&mut self, size: Option<f32>) {
+        self.font_size_override = size.map(|v| v.clamp(8.5, 24.0));
+    }
+
+    pub fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.emulator.scroll_to_bottom();
+        cx.notify();
     }
 
     /// 喂入终端字节流,并将终端生成的应答序列(`CSI 6 n` 等)立刻回写远端 PTY。
@@ -154,6 +217,7 @@ impl TerminalView {
         self.marked_text = None;
         self.selecting = false;
         self.scroll_remainder_px = 0.0;
+        self.scroll_x_px = 0.0;
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -195,7 +259,7 @@ impl TerminalView {
         let m = self.metrics.get();
         let cw = m.cell_width.max(1.0);
         let lh = m.line_height.max(1.0);
-        let rel_x = (f32::from(position.x) - m.origin_x).max(0.0);
+        let rel_x = (f32::from(position.x) - m.origin_x + m.scroll_x_px).max(0.0);
         let rel_y = (f32::from(position.y) - m.origin_y).max(0.0);
         let col = ((rel_x / cw).floor() as usize).min(m.cols.saturating_sub(1));
         let row = ((rel_y / lh).floor() as usize).min(m.rows.saturating_sub(1));
@@ -326,7 +390,7 @@ impl EntityInputHandler for TerminalView {
         let m = self.metrics.get();
         Some(Bounds::new(
             point(
-                px(m.origin_x + m.cursor_col as f32 * m.cell_width),
+                px(m.origin_x - m.scroll_x_px + m.cursor_col as f32 * m.cell_width),
                 px(m.origin_y + m.cursor_row as f32 * m.line_height),
             ),
             size(px(m.cell_width), px(m.line_height)),
@@ -411,7 +475,35 @@ impl Render for TerminalView {
                 }),
             )
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                let lh = this.metrics.get().line_height.max(12.0);
+                let m = this.metrics.get();
+                let cw = m.cell_width.max(4.0);
+                let lh = m.line_height.max(11.0);
+                let max_scroll_x = (m.cols as f32 * cw - m.viewport_width).max(0.0);
+                if max_scroll_x > 0.5 {
+                    let raw_x_px = match event.delta {
+                        ScrollDelta::Lines(delta) => delta.x * cw * 3.0,
+                        ScrollDelta::Pixels(delta) => f32::from(delta.x),
+                    };
+                    let shift_y_px = if event.modifiers.shift && raw_x_px.abs() < 0.01 {
+                        match event.delta {
+                            ScrollDelta::Lines(delta) => delta.y * cw * 3.0,
+                            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+                        }
+                    } else {
+                        0.0
+                    };
+                    let delta_x_px = if raw_x_px.abs() >= 0.01 {
+                        raw_x_px
+                    } else {
+                        shift_y_px
+                    };
+                    if delta_x_px.abs() >= 0.01 {
+                        this.scroll_x_px = (this.scroll_x_px - delta_x_px).clamp(0.0, max_scroll_x);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 let delta_lines = match event.delta {
                     ScrollDelta::Lines(delta) => delta.y.round() as i32,
                     ScrollDelta::Pixels(delta) => {
@@ -518,6 +610,7 @@ struct TerminalCanvasPrepaint {
     ime_quads: Vec<PaintQuad>,
     ime_text: Option<ShapedTextAt>,
     scrollbar_quad: Option<PaintQuad>,
+    h_scrollbar_quad: Option<PaintQuad>,
 }
 
 struct TerminalCanvasElement {
@@ -528,13 +621,7 @@ struct TerminalCanvasElement {
 
 impl TerminalCanvasElement {
     fn mono_font(weight: FontWeight, style: FontStyle) -> Font {
-        Font {
-            family: SharedString::from(MONO_FONT),
-            features: Default::default(),
-            fallbacks: None,
-            weight,
-            style,
-        }
+        mono_font(weight, style)
     }
 }
 
@@ -642,55 +729,67 @@ impl Element for TerminalCanvasElement {
         let t = *cx.colors();
         let term = terminal_palette(app_settings.appearance.terminal_scheme, &t);
 
-        let font_size = px(ty.code_font_size.max(10.0));
-        let line_height = px((f32::from(font_size) * 1.38).round()).max(px(12.0));
-        let probe = window.text_system().shape_line(
-            SharedString::from("M"),
-            font_size,
-            &[TextRun {
-                len: 1,
-                font: Self::mono_font(FontWeight::NORMAL, FontStyle::Normal),
-                color: term.fg,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            }],
-            None,
-        );
-        let cell_width = probe.width().max(px(6.0));
-        let cw = f32::from(cell_width);
+        let font_override = self.view.read(cx).font_size_override;
+        let font_size_f32 = font_override.unwrap_or(ty.code_font_size).clamp(8.5, 24.0);
+        let font_size = px(font_size_f32);
+        let line_height = px((font_size_f32 * 1.35).round()).max(px(11.0));
+        let cw = measure_mono_cell_width(font_size_f32, window);
         let lh = f32::from(line_height);
         let ox = f32::from(bounds.origin.x);
         let oy = f32::from(bounds.origin.y);
+        let viewport_w = f32::from(bounds.size.width).max(0.0);
 
-        let (snapshot, marked_text) = self.view.update(cx, |view, cx| {
-            if bounds.size.width >= px(120.0) && bounds.size.height >= px(48.0) {
-                let cols = ((f32::from(bounds.size.width) / cw).floor() as usize).clamp(20, 500);
+        let (snapshot, marked_text, scroll_x_px, max_scroll_x, content_w) =
+            self.view.update(cx, |view, cx| {
                 let rows = ((f32::from(bounds.size.height) / lh).floor() as usize).clamp(4, 200);
-                if view.emulator.resize(cols, rows)
-                    && let Some(on_resize) = view.on_resize.clone()
-                {
-                    cx.defer(move |cx| {
-                        on_resize(cols as u16, rows as u16, cx);
-                    });
+                let can_resize = bounds.size.height >= px(48.0)
+                    && (matches!(view.cols_mode, ColsMode::FixedCols(_))
+                        || bounds.size.width >= px(120.0));
+                if can_resize {
+                    let cols = match view.cols_mode {
+                        ColsMode::AutoFit => {
+                            ((f32::from(bounds.size.width) / cw).floor() as usize).clamp(20, 500)
+                        }
+                        ColsMode::FixedCols(fixed) => fixed.clamp(20, 500),
+                    };
+                    if view.emulator.resize(cols, rows)
+                        && let Some(on_resize) = view.on_resize.clone()
+                    {
+                        cx.defer(move |cx| {
+                            on_resize(cols as u16, rows as u16, cx);
+                        });
+                    }
                 }
-            }
-            let snapshot = view.emulator.render_snapshot(&term);
-            let cursor_col = (snapshot.cursor.point.column.0).min(snapshot.cols.saturating_sub(1));
-            let cursor_row = (snapshot.cursor.point.line.0.max(0) as usize)
-                .min(snapshot.rows.saturating_sub(1));
-            view.metrics.set(TerminalMetrics {
-                origin_x: ox,
-                origin_y: oy,
-                cell_width: cw,
-                line_height: lh,
-                cols: snapshot.cols,
-                rows: snapshot.rows,
-                cursor_col,
-                cursor_row,
+                let snapshot = view.emulator.render_snapshot(&term);
+                let content_w = snapshot.cols as f32 * cw;
+                let max_scroll_x = (content_w - viewport_w).max(0.0);
+                view.scroll_x_px = view.scroll_x_px.clamp(0.0, max_scroll_x);
+                let scroll_x_px = view.scroll_x_px;
+                let cursor_col =
+                    (snapshot.cursor.point.column.0).min(snapshot.cols.saturating_sub(1));
+                let cursor_row = (snapshot.cursor.point.line.0.max(0) as usize)
+                    .min(snapshot.rows.saturating_sub(1));
+                view.metrics.set(TerminalMetrics {
+                    origin_x: ox,
+                    origin_y: oy,
+                    viewport_width: viewport_w,
+                    scroll_x_px,
+                    cell_width: cw,
+                    line_height: lh,
+                    cols: snapshot.cols,
+                    rows: snapshot.rows,
+                    cursor_col,
+                    cursor_row,
+                });
+                (
+                    snapshot,
+                    view.marked_text.clone(),
+                    scroll_x_px,
+                    max_scroll_x,
+                    content_w,
+                )
             });
-            (snapshot, view.marked_text.clone())
-        });
+        let draw_ox = ox - scroll_x_px;
 
         // 1. 背景与选区矩形:同行相邻同色格合并为单个 Quad。
         let mut bg_quads = Vec::new();
@@ -699,7 +798,7 @@ impl Element for TerminalCanvasElement {
             if let Some((row, start_col, span, color)) = run {
                 quads.push(fill(
                     Bounds::new(
-                        point(px(ox + start_col as f32 * cw), px(oy + row as f32 * lh)),
+                        point(px(draw_ox + start_col as f32 * cw), px(oy + row as f32 * lh)),
                         size(px(span as f32 * cw), line_height),
                     ),
                     color,
@@ -754,7 +853,7 @@ impl Element for TerminalCanvasElement {
                     None,
                 );
                 out.push(ShapedTextAt {
-                    origin: point(px(ox + p.start_col as f32 * cw), px(oy + p.row as f32 * lh)),
+                    origin: point(px(draw_ox + p.start_col as f32 * cw), px(oy + p.row as f32 * lh)),
                     line: shaped,
                 });
             }
@@ -814,7 +913,7 @@ impl Element for TerminalCanvasElement {
                     None,
                 );
                 text_runs.push(ShapedTextAt {
-                    origin: point(px(ox + cell.col as f32 * cw), px(oy + cell.row as f32 * lh)),
+                    origin: point(px(draw_ox + cell.col as f32 * cw), px(oy + cell.row as f32 * lh)),
                     line: shaped,
                 });
             }
@@ -832,7 +931,7 @@ impl Element for TerminalCanvasElement {
             && (cursor_row_i32 as usize) < snapshot.rows
             && cursor_col_usize < snapshot.cols;
         let cursor_origin = point(
-            px(ox + cursor_col_usize as f32 * cw),
+            px(draw_ox + cursor_col_usize as f32 * cw),
             px(oy + cursor_row_i32.max(0) as f32 * lh),
         );
         if cursor_visible {
@@ -954,6 +1053,23 @@ impl Element for TerminalCanvasElement {
             None
         };
 
+        // 6. 底部轻量横向滚动条(仅 FixedCols 视口窄于内容时绘)。
+        let h_scrollbar_quad = if max_scroll_x > 1.0 && content_w > 0.0 {
+            let track_w = viewport_w;
+            let thumb_w = ((viewport_w / content_w) * track_w).clamp(24.0, track_w);
+            let progress = (scroll_x_px / max_scroll_x).clamp(0.0, 1.0);
+            let thumb_x = ox + (track_w - thumb_w) * progress;
+            Some(fill(
+                Bounds::new(
+                    point(px(thumb_x), bounds.origin.y + bounds.size.height - px(4.0)),
+                    size(px(thumb_w), px(3.0)),
+                ),
+                soft(term.fg, 0.28),
+            ))
+        } else {
+            None
+        };
+
         TerminalCanvasPrepaint {
             line_height,
             bg_quads,
@@ -963,6 +1079,7 @@ impl Element for TerminalCanvasElement {
             ime_quads,
             ime_text,
             scrollbar_quad,
+            h_scrollbar_quad,
         }
     }
 
@@ -1025,6 +1142,9 @@ impl Element for TerminalCanvasElement {
                 );
             }
             if let Some(quad) = prepaint.scrollbar_quad.take() {
+                window.paint_quad(quad);
+            }
+            if let Some(quad) = prepaint.h_scrollbar_quad.take() {
                 window.paint_quad(quad);
             }
         });

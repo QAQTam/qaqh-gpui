@@ -125,6 +125,8 @@ pub struct TypographyContent {
     pub ui_font_family: String,
     /// 代码块字号(绝对 px,不随 rem)。
     pub code_font_size: f32,
+    /// 后台执行观察窗终端字号(绝对 px,默认 10px 以高密度对齐 80 列)。
+    pub exec_font_size: f32,
     /// 消息段落行高倍数。
     pub prose_line_height: f32,
     /// 时间线内容列宽(px)。
@@ -137,6 +139,7 @@ impl Default for TypographyContent {
             ui_font_size: 16.0,
             ui_font_family: String::new(),
             code_font_size: 12.0,
+            exec_font_size: 10.0,
             prose_line_height: 1.55,
             content_width: 760.0,
         }
@@ -174,6 +177,7 @@ impl SettingsContent {
     pub fn typography(&self) -> Typography {
         Typography {
             code_font_size: self.typography.code_font_size,
+            exec_font_size: self.typography.exec_font_size,
             prose_line_height: self.typography.prose_line_height,
             content_width: self.typography.content_width,
             density_shift: self.appearance.density.shift(),
@@ -185,6 +189,7 @@ impl SettingsContent {
 #[derive(Clone, Copy, Debug)]
 pub struct Typography {
     pub code_font_size: f32,
+    pub exec_font_size: f32,
     pub prose_line_height: f32,
     pub content_width: f32,
     pub density_shift: f32,
@@ -273,6 +278,7 @@ mod tests {
         let legacy = "{}";
         let parsed: SettingsContent = serde_json::from_str(legacy).expect("legacy parse");
         assert_eq!(parsed, default, "缺字段未落默认");
+        assert_eq!(parsed.typography.exec_font_size, 10.0);
 
         let partial = r#"{"typography": {"ui_font_size": 18.0}}"#;
         let parsed: SettingsContent = serde_json::from_str(partial).expect("partial parse");

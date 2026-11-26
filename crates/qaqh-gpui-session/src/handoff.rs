@@ -850,7 +850,7 @@ pub fn render_seal_card(
                 .border_1()
                 .border_color(t.border_subtle)
                 .text_xs()
-                .font_family("monospace")
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                 .text_color(t.dim)
                 .child(occ)
         }));
@@ -1223,7 +1223,7 @@ pub fn render_open_card(
             .bg(t.surface_subtle)
             .p_3()
             .text_xs()
-            .font_family("monospace")
+            .font_family(qaqh_gpui_kit::fonts::mono_font_family())
             .text_color(t.text)
             .child(
                 SelectableText::new("handoff-open-raw-sel", doc.to_owned())

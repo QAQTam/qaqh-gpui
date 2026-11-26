@@ -626,6 +626,11 @@ impl Render for DaemonStore {
         );
 
         let family = settings.typography.ui_font_family;
+        let root_font = if family.trim().is_empty() {
+            qaqh_gpui_kit::fonts::ui_font_family()
+        } else {
+            SharedString::from(family)
+        };
         let main_area = div()
             .flex_1()
             .min_w_0()
@@ -634,6 +639,38 @@ impl Render for DaemonStore {
             .flex_col()
             .child(div().flex_1().min_h_0().flex().child(main))
             .children(crate::shell_panel::dock(self, window, cx));
+
+        let active_session = (self.section == PrimarySection::Home && !self.new_session_open)
+            .then(|| self.current.clone())
+            .flatten();
+        let exec_expanded = active_session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).terminal_panel.is_expanded());
+        let exec_sample = presence_overlay("exec-observer-modal", exec_expanded, 200, window, cx);
+        if let Some(current) = &self.current {
+            let active_matches = active_session
+                .as_ref()
+                .is_some_and(|active| active.entity_id() == current.entity_id());
+            current
+                .read(cx)
+                .terminal_panel
+                .set_modal_visible(active_matches && exec_sample.should_render());
+        }
+        let exec_modal = exec_sample
+            .should_render()
+            .then(|| {
+                active_session.as_ref().and_then(|session| {
+                    qaqh_gpui_session::terminal_panel::render_modal(
+                        session,
+                        exec_sample.progress.clamp(0.0, 1.0),
+                        exec_expanded,
+                        &t,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .flatten();
 
         let settings_sample = presence_overlay("settings-modal", self.settings_open, 200, window, cx);
         let settings_modal = settings_sample.should_render().then(|| {
@@ -684,9 +721,7 @@ impl Render for DaemonStore {
             .flex_col()
             .bg(t.chrome)
             .text_color(t.text)
-            .when(!family.is_empty(), |root| {
-                root.font_family(SharedString::from(family))
-            })
+            .font_family(root_font)
             .on_key_down(cx.listener(|daemon, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if daemon.ctx_menu.is_some() {
@@ -698,6 +733,16 @@ impl Render for DaemonStore {
                     if daemon.settings_open {
                         daemon.settings_open = false;
                         daemon.settings_form = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if let Some(current) = &daemon.current
+                        && current.read(cx).terminal_panel.is_expanded()
+                    {
+                        current.update(cx, |store, cx| {
+                            qaqh_gpui_session::terminal_panel::set_expanded(store, false, cx);
+                        });
                         cx.stop_propagation();
                         cx.notify();
                         return;
@@ -755,6 +800,7 @@ impl Render for DaemonStore {
                     .child(main_area),
             )
             .children(settings_modal)
+            .children(exec_modal)
             .children(
                 self.ctx_menu
                     .as_ref()

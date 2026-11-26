@@ -619,13 +619,13 @@ pub fn review_button(
                     .child(div().text_color(t.text).child("查看本轮代码改动"))
                     .child(
                         div()
-                            .font_family("monospace")
+                            .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                             .text_color(t.ok)
                             .child(SharedString::from(format!("+{added}"))),
                     )
                     .child(
                         div()
-                            .font_family("monospace")
+                            .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                             .text_color(t.bad)
                             .child(SharedString::from(format!("−{removed}"))),
                     )
@@ -946,7 +946,7 @@ pub fn render(
                     .flex_1()
                     .overflow_scroll()
                     .p_3p5()
-                    .font_family("monospace")
+                    .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                     .text_size(px(ty.code_font_size))
                     .child(body)
                     .context_menu(move |menu, window, cx| {

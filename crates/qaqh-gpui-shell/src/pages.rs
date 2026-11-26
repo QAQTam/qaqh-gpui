@@ -1350,7 +1350,7 @@ fn skill_group_section(
                         )
                         .child(
                             div()
-                                .font_family("monospace")
+                                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                                 .text_xs()
                                 .text_color(t_copy.dim)
                                 .child(detail_path),
@@ -1530,7 +1530,7 @@ fn tools_mcp_body(
                             .py_1()
                             .rounded(px(RADIUS_CHIP))
                             .bg(t.surface_subtle)
-                            .font_family("monospace")
+                            .font_family(qaqh_gpui_kit::fonts::mono_font_family())
                             .text_xs()
                             .text_color(t.dim)
                             .truncate()

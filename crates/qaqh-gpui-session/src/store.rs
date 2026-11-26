@@ -1191,6 +1191,183 @@ provider_retry: None,
         self.activity == Some(ActivityState::Running)
     }
 
+    /// 当前会话的上下文占用与请求缓存命中统计(直读 RingingV2 块/回合 usage 与模型目录窗口,零转换层)。
+    pub fn telemetry(&self) -> Option<SessionTelemetry> {
+        use qaqh_ringing_contract::state::TurnOutcome;
+
+        let last_block = self.entries.iter().rev().find_map(|entry| match entry {
+            TimelineEntry::AssistantBlock {
+                turn_id,
+                model,
+                usage: Some(usage),
+                ..
+            } => Some((turn_id, model.as_str(), usage)),
+            _ => None,
+        });
+        let last_turn = self.turns.iter().rev().find_map(|turn| match &turn.outcome {
+            Some(TurnOutcome::Finished {
+                usage: Some(usage), ..
+            }) => Some((&turn.turn_id, usage)),
+            _ => None,
+        });
+
+        let turn_pos = |id: &TurnId| self.turns.iter().position(|turn| &turn.turn_id == id);
+        let (latest_usage, latest_model): (&qaqh_ringing_contract::fact::UsageInfo, Option<&str>) =
+            match (last_block, last_turn) {
+                (Some((b_turn, b_model, b_usage)), Some((t_turn, t_usage))) => {
+                    match (turn_pos(b_turn), turn_pos(t_turn)) {
+                        (Some(bi), Some(ti)) if ti > bi => (t_usage, None),
+                        _ => (b_usage, Some(b_model)),
+                    }
+                }
+                (Some((_, b_model, b_usage)), None) => (b_usage, Some(b_model)),
+                (None, Some((_, t_usage))) => (t_usage, None),
+                (None, None) => return None,
+            };
+
+        let context_window = self.catalog.as_deref().and_then(|catalog| {
+            let from_settings = self
+                .settings
+                .as_ref()
+                .and_then(|s| s.meta.model_selection.as_ref())
+                .and_then(|sel| {
+                    catalog
+                        .providers
+                        .get(&sel.provider_id)
+                        .and_then(|provider| provider.models.get(&sel.model_id))
+                        .map(|model| model.context_window)
+                })
+                .filter(|&window| window > 0);
+            from_settings.or_else(|| {
+                let model_id = latest_model.filter(|id| !id.is_empty())?;
+                catalog
+                    .providers
+                    .values()
+                    .find_map(|provider| provider.models.get(model_id))
+                    .map(|model| model.context_window)
+                    .filter(|&window| window > 0)
+            })
+        });
+
+        let used_tokens = usage_total_input(latest_usage);
+        let used_pct = context_window
+            .and_then(|window| qaqh_types::ContextUsage::new(used_tokens, window))
+            .map(|ctx| ctx.used_pct());
+        let latest_cache = usage_cache_stats(latest_usage);
+
+        // 同一回合末轮的 usage 会同时落到末个 AssistantBlock 与 TurnOutcome 上,按 turn_id 去重。
+        let mut turns_with_block_usage: HashSet<&TurnId> = HashSet::new();
+        let mut usage_requests: usize = 0;
+        let mut cum_hit: u64 = 0;
+        let mut cum_total: u64 = 0;
+        for entry in &self.entries {
+            if let TimelineEntry::AssistantBlock {
+                turn_id,
+                usage: Some(usage),
+                ..
+            } = entry
+            {
+                turns_with_block_usage.insert(turn_id);
+                usage_requests += 1;
+                if let Some(stats) = usage_cache_stats(usage) {
+                    cum_hit = cum_hit.saturating_add(stats.hit_tokens);
+                    cum_total = cum_total.saturating_add(stats.total_tokens);
+                }
+            }
+        }
+        for turn in &self.turns {
+            if !turns_with_block_usage.contains(&turn.turn_id)
+                && let Some(TurnOutcome::Finished {
+                    usage: Some(usage), ..
+                }) = &turn.outcome
+            {
+                usage_requests += 1;
+                if let Some(stats) = usage_cache_stats(usage) {
+                    cum_hit = cum_hit.saturating_add(stats.hit_tokens);
+                    cum_total = cum_total.saturating_add(stats.total_tokens);
+                }
+            }
+        }
+        let cumulative_cache = (cum_total > 0).then(|| CacheHitStats {
+            hit_tokens: cum_hit,
+            total_tokens: cum_total,
+            hit_pct: ((cum_hit as f64 / cum_total as f64) * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as u8,
+        });
+
+        Some(SessionTelemetry {
+            used_tokens,
+            context_window,
+            used_pct,
+            prompt_tokens: latest_usage.prompt_tokens,
+            completion_tokens: latest_usage.completion_tokens,
+            reasoning_tokens: latest_usage.reasoning_tokens,
+            latest_cache,
+            cumulative_cache,
+            usage_requests,
+        })
+    }
+
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheHitStats {
+    pub hit_tokens: u64,
+    pub total_tokens: u64,
+    pub hit_pct: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTelemetry {
+    pub used_tokens: u32,
+    pub context_window: Option<u32>,
+    pub used_pct: Option<u8>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub latest_cache: Option<CacheHitStats>,
+    pub cumulative_cache: Option<CacheHitStats>,
+    pub usage_requests: usize,
+}
+
+/// 单次请求输入上下文总量(与后端 `qaqh_agent_runtime::handoff::total_input` 同口径)。
+pub fn usage_total_input(usage: &qaqh_ringing_contract::fact::UsageInfo) -> u32 {
+    let cached = usage
+        .prompt_cache_hit_tokens
+        .saturating_add(usage.prompt_cache_miss_tokens);
+    if cached > 0 {
+        cached
+    } else {
+        usage.prompt_tokens
+    }
+}
+
+/// 缓存命中率统计(仅在服务商明确上报缓存字段或命中/未命中非零时返回 `Some`,区分 0% 命中与未上报)。
+pub fn usage_cache_stats(usage: &qaqh_ringing_contract::fact::UsageInfo) -> Option<CacheHitStats> {
+    let cache_total = u64::from(usage.prompt_cache_hit_tokens)
+        .saturating_add(u64::from(usage.prompt_cache_miss_tokens));
+    let reported = usage.cache_usage_reported == Some(true) || cache_total > 0;
+    if !reported {
+        return None;
+    }
+    let denom = if cache_total > 0 {
+        cache_total
+    } else {
+        u64::from(usage.prompt_tokens)
+    };
+    if denom == 0 {
+        return None;
+    }
+    let hit = u64::from(usage.prompt_cache_hit_tokens);
+    let hit_pct = ((hit as f64 / denom as f64) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u8;
+    Some(CacheHitStats {
+        hit_tokens: hit,
+        total_tokens: denom,
+        hit_pct,
+    })
 }
 
 pub fn model_options_from(catalog: &ProfilesDocument) -> Vec<ModelSelection> {
@@ -1396,6 +1573,54 @@ mod tests {
         let grouped = groups(&[old, new], &[]);
         let ids: Vec<_> = grouped[0].rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["ses_a", "ses_b"]);
+    }
+
+    #[test]
+    fn telemetry_usage_input_and_cache_stats_contract() {
+        use qaqh_ringing_contract::fact::UsageInfo;
+
+        let unreported = UsageInfo {
+            prompt_tokens: 1_200,
+            completion_tokens: 300,
+            total_tokens: 1_500,
+            ..Default::default()
+        };
+        assert_eq!(usage_total_input(&unreported), 1_200);
+        assert_eq!(usage_cache_stats(&unreported), None);
+
+        let zero_hit = UsageInfo {
+            prompt_tokens: 1_000,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 1_000,
+            cache_usage_reported: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(usage_total_input(&zero_hit), 1_000);
+        assert_eq!(
+            usage_cache_stats(&zero_hit),
+            Some(CacheHitStats {
+                hit_tokens: 0,
+                total_tokens: 1_000,
+                hit_pct: 0,
+            })
+        );
+
+        let high_hit = UsageInfo {
+            prompt_tokens: 100_000,
+            prompt_cache_hit_tokens: 85_000,
+            prompt_cache_miss_tokens: 15_000,
+            cache_usage_reported: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(usage_total_input(&high_hit), 100_000);
+        assert_eq!(
+            usage_cache_stats(&high_hit),
+            Some(CacheHitStats {
+                hit_tokens: 85_000,
+                total_tokens: 100_000,
+                hit_pct: 85,
+            })
+        );
     }
 }
 
