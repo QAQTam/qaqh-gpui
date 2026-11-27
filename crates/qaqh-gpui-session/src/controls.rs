@@ -13,13 +13,9 @@ pub fn conversation_text(store: &SessionStore) -> String {
     store
         .entries
         .iter()
-        .filter_map(|entry| match entry {
-            qaqh_ringing_contract::state::TimelineEntry::Input { content, .. }
-            | qaqh_ringing_contract::state::TimelineEntry::AssistantBlock { content, .. } => {
-                Some(crate::timeline::content_text(content))
-            }
-            _ => None,
-        })
+        .filter(|block| !matches!(block.kind, qaqh_ringing_v3::BlockKind::ToolResult))
+        .map(|block| crate::timeline::content_text(store, &block.content))
+        .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -35,14 +31,14 @@ pub fn search(store: &SessionStore, cx: &mut Context<SessionStore>) -> Option<gp
         .entries
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| {
-            let text = match entry {
-                qaqh_ringing_contract::state::TimelineEntry::Input { content, .. }
-                | qaqh_ringing_contract::state::TimelineEntry::AssistantBlock { content, .. } => {
-                    crate::timeline::content_text(content)
-                }
-                _ => return None,
-            };
+        .filter_map(|(index, block)| {
+            if matches!(
+                block.kind,
+                qaqh_ringing_v3::BlockKind::ToolResult | qaqh_ringing_v3::BlockKind::ToolCall
+            ) {
+                return None;
+            }
+            let text = crate::timeline::content_text(store, &block.content);
             (!query.is_empty() && text.to_lowercase().contains(&query))
                 .then_some((index, text.chars().take(72).collect::<String>()))
         })

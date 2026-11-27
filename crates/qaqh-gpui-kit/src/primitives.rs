@@ -152,7 +152,7 @@ pub fn step_button(
 pub fn action_button(
     cx: &gpui_kit::App,
     id: String,
-    label: &'static str,
+    label: impl Into<SharedString>,
     color: Hsla,
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
     t: &Palette,
@@ -167,7 +167,7 @@ pub fn action_button(
                 .hover(t.hover)
                 .active(t.hover),
         )
-        .label(label)
+        .label(label.into())
         .on_click(listener)
 }
 

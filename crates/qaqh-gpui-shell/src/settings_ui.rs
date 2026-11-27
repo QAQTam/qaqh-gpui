@@ -12,13 +12,14 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable, Size, WindowExt as _};
 use gpui_kit::assets::IconName;
-use qaqh_client::{
-    ProviderUpsertDto, RingingCommand, SecretWrite, SessionSettingsPatch, ToolsSettingPatch,
-};
 use qaqh_profile::{
     ConfigPatch, ExecPatch, GoalsPatch, ModelDef, ProfilesDocument, ProviderDef, SandboxPatch,
 };
-use qaqh_types::{CredentialSource, EndpointCompat, ModelSelection, Wire};
+use qaqh_core_vocab::{CredentialSource, JsonText, ModelSelection, SettingOverride, Wire};
+use qaqh_ringing_v3::{
+    ConfigRequest, ProviderPresetView, SessionRequest, SessionSettingsPatch, ToolsSettingPatch,
+    WorkspaceRequest,
+};
 
 use qaqh_gpui_kit::kit::{
     BtnKind, RADIUS_CHIP, RADIUS_CONTROL, button, card, card_padded, pill, relative_time, soft,
@@ -28,7 +29,7 @@ use qaqh_gpui_kit::primitives::{
 };
 use qaqh_gpui_kit::settings;
 use qaqh_gpui_kit::theme::Palette;
-use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState, ProviderPresetView};
+use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
 use qaqh_gpui_wire::diagnostics;
 
 use crate::daemon::{DaemonStore, clean_session_title};
@@ -162,15 +163,11 @@ fn send(daemon: &mut DaemonStore, request: BridgeRequest) -> Result<(), String> 
 
 fn save(daemon: &mut DaemonStore, patch: ConfigPatch) -> Result<(), String> {
     patch.validate()?;
-    send(daemon, BridgeRequest::SaveConfig(patch))
+    send(daemon, crate::daemon::config_patch_request(&patch))
 }
 
-fn catalog_command(
-    daemon: &mut DaemonStore,
-    revision: u64,
-    command: RingingCommand,
-) -> Result<(), String> {
-    send(daemon, BridgeRequest::ManageCatalog { command, revision })
+fn catalog_command(daemon: &mut DaemonStore, request: ConfigRequest) -> Result<(), String> {
+    send(daemon, BridgeRequest::Config(request))
 }
 
 fn report(daemon: &mut DaemonStore, result: Result<(), String>) {
@@ -200,11 +197,11 @@ fn token_label(tokens: u32) -> String {
     }
 }
 
-fn credential_label(credential: qaqh_types::CredentialSource) -> &'static str {
+fn credential_label(credential: CredentialSource) -> &'static str {
     match credential {
-        qaqh_types::CredentialSource::ApiKey => "API 密钥",
-        qaqh_types::CredentialSource::ChatgptPlan => "ChatGPT 套餐",
-        qaqh_types::CredentialSource::DeepseekAccount => "DeepSeek 账号",
+        CredentialSource::ApiKey => "API 密钥",
+        CredentialSource::ChatgptPlan => "ChatGPT 套餐",
+        CredentialSource::DeepseekAccount => "DeepSeek 账号",
     }
 }
 
@@ -238,13 +235,12 @@ fn dim_confirm_command(
     t: &Palette,
     id: String,
     title: String,
-    revision: u64,
-    command: RingingCommand,
+    request: ConfigRequest,
 ) -> AnyElement {
     dim_button(cx, t, id, "删除", move |daemon, _, _| {
-        let command = command.clone();
+        let request = request.clone();
         begin(daemon, title.clone(), vec![], move |_, daemon, _| {
-            catalog_command(daemon, revision, command.clone())
+            catalog_command(daemon, request.clone())
         });
     })
 }
@@ -285,10 +281,7 @@ fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) 
                         if !path.is_empty() {
                             let res = send(
                                 daemon,
-                                BridgeRequest::Command {
-                                    target: qaqh_client::CommandTarget::Global,
-                                    command: RingingCommand::WorkspaceCreate { path },
-                                },
+                                BridgeRequest::Workspace(WorkspaceRequest::Create { path }),
                             );
                             if res.is_ok() {
                                 daemon
@@ -355,10 +348,7 @@ fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) 
                         }
                         let res = send(
                             daemon,
-                            BridgeRequest::Command {
-                                target: qaqh_client::CommandTarget::Global,
-                                command: RingingCommand::WorkspaceCreate { path },
-                            },
+                            BridgeRequest::Workspace(WorkspaceRequest::Create { path }),
                         );
                         if res.is_ok() {
                             daemon
@@ -472,14 +462,10 @@ fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) 
                                     move |fields, daemon, cx| {
                                         send(
                                             daemon,
-                                            BridgeRequest::Command {
-                                                target: qaqh_client::CommandTarget::Workspace {
-                                                    workspace_id: id.clone(),
-                                                },
-                                                command: RingingCommand::WorkspaceRename {
-                                                    title: fields[0].required(cx)?,
-                                                },
-                                            },
+                                            BridgeRequest::Workspace(WorkspaceRequest::Rename {
+                                                workspace_id: id.clone(),
+                                                title: fields[0].required(cx)?,
+                                            }),
                                         )
                                     },
                                 );
@@ -495,12 +481,9 @@ fn workspaces(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) 
                             cx.listener(move |daemon, _, _, cx| {
                                 let result = send(
                                     daemon,
-                                    BridgeRequest::Command {
-                                        target: qaqh_client::CommandTarget::Workspace {
-                                            workspace_id: id.clone(),
-                                        },
-                                        command: RingingCommand::WorkspaceDelete {},
-                                    },
+                                    BridgeRequest::Workspace(WorkspaceRequest::Delete {
+                                        workspace_id: id.clone(),
+                                    }),
                                 );
                                 report(daemon, result);
                                 cx.notify();
@@ -536,7 +519,7 @@ pub(crate) fn accounts(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &
 }
 
 fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
-    use qaqh_client::service_types as st;
+    use qaqh_ringing_v3::SiwcConnectionState as st;
     let base = card_padded(t).flex().flex_col().gap_3();
     let Some(status) = &daemon.siwc else {
         return base.child(
@@ -547,11 +530,11 @@ fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -
         );
     };
     let (state, color) = match status.status {
-        st::SiwcConnectionState::Connected if status.sharing => ("已登录，套餐直连可用", t.ok),
-        st::SiwcConnectionState::Connected => ("已登录，未授予套餐直连", t.warn),
-        st::SiwcConnectionState::Connecting => ("登录流程进行中", t.warn),
-        st::SiwcConnectionState::ReauthRequired => ("凭据已失效，请重新登录", t.bad),
-        st::SiwcConnectionState::Disconnected => ("未登录", t.dim),
+        st::Connected if status.sharing => ("已登录，套餐直连可用", t.ok),
+        st::Connected => ("已登录，未授予套餐直连", t.warn),
+        st::Connecting => ("登录流程进行中", t.warn),
+        st::ReauthRequired => ("凭据已失效，请重新登录", t.bad),
+        st::Disconnected => ("未登录", t.dim),
     };
     let who = status
         .email
@@ -578,7 +561,7 @@ fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -
         ));
     } else {
         match status.status {
-            st::SiwcConnectionState::Connected | st::SiwcConnectionState::ReauthRequired => {
+            st::Connected | st::ReauthRequired => {
                 actions = actions
                     .child(button(
                         cx,
@@ -603,7 +586,7 @@ fn siwc_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -
                             cx.notify();
                         }),
                     ));
-                if status.status == st::SiwcConnectionState::ReauthRequired {
+                if status.status == st::ReauthRequired {
                     actions = actions.child(button(
                         cx,
                         BtnKind::Primary,
@@ -683,7 +666,10 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
     };
     let (state, color) = if status.signed_in {
         ("已登录", t.ok)
-    } else if status.flow.state.is_running() {
+    } else if matches!(
+        status.flow.state,
+        qaqh_ringing_v3::DsFlowState::Authorizing | qaqh_ringing_v3::DsFlowState::Exchanging
+    ) {
         ("登录流程进行中", t.warn)
     } else {
         ("未登录", t.dim)
@@ -950,7 +936,10 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
             catalog
                 .providers
                 .iter()
-                .find(|(_, provider)| provider.credential == CredentialSource::DeepseekAccount)
+                .find(|(_, provider)| {
+                    qaqh_gpui_wire::profile_vocab::credential_kind(provider)
+                        == CredentialSource::DeepseekAccount
+                })
                 .map(|(provider_id, provider)| (catalog, provider_id, provider))
         });
         match ds_entry {
@@ -996,7 +985,11 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                         .default_model_selection
                         .as_ref()
                         .is_some_and(|m| m.provider_id == *provider_id && m.model_id == *model_id);
-                    let valid = qaqh_profile::resolve_model_selection(catalog, &selection).is_ok();
+                    let valid = qaqh_profile::resolve_model_selection(
+                        catalog,
+                        &qaqh_gpui_session::store::profile_selection(&selection),
+                    )
+                    .is_ok();
                     let name = model.display_name.as_deref().unwrap_or(model_id);
                     let mut meta_parts = vec![format!("{} ctx", token_label(model.context_window))];
                     if !model.reasoning_levels.is_empty() {
@@ -1036,13 +1029,11 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                             format!("ds-model-default-{provider_id}-{model_id}"),
                             "设为默认",
                             move |daemon, _, _| {
-                                let result = catalog_command(
-                                    daemon,
-                                    revision,
-                                    RingingCommand::ModelSelectionSetDefault {
+                                let result =
+                                    catalog_command(daemon, ConfigRequest::SetDefaultModel {
                                         selection: sel.clone(),
-                                    },
-                                );
+                                        expected_revision: revision,
+                                    });
                                 report(daemon, result);
                             },
                         )
@@ -1116,7 +1107,7 @@ fn archived(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) ->
             .map(|w| w.title.clone())
             .or_else(|| row.cwd.clone())
             .unwrap_or_else(|| "默认目录".to_owned());
-        let when = relative_time(row.updated_at);
+        let when = relative_time(row.updated_at_ms / 1000);
         let id_view = row.id.clone();
         let id_restore = row.id.clone();
         let id_delete = row.id.clone();
@@ -1177,12 +1168,9 @@ fn archived(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) ->
                         cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
                             let res = send(
                                 daemon,
-                                BridgeRequest::Command {
-                                    target: qaqh_client::CommandTarget::Session {
-                                        session_id: id_restore.clone(),
-                                    },
-                                    command: RingingCommand::SessionUnarchive {},
-                                },
+                                BridgeRequest::Session(SessionRequest::Unarchive {
+                                    session_id: id_restore.clone(),
+                                }),
                             );
                             report(daemon, res);
                             cx.notify();
@@ -1202,7 +1190,9 @@ fn archived(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) ->
                                 move |_, daemon, _| {
                                     send(
                                         daemon,
-                                        BridgeRequest::DeleteSession { seed: seed.clone() },
+                                        BridgeRequest::Session(SessionRequest::Delete {
+                                            session_id: seed.clone(),
+                                        }),
                                     )
                                 },
                             );
@@ -1216,18 +1206,17 @@ fn archived(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) ->
 
 fn about(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> Div {
     let conn_text = match &daemon.connection {
-        ConnectionState::Ready { client_session_id } => {
-            format!("已连接 · 客户端会话 {client_session_id}")
+        ConnectionState::Ready {
+            server_instance_id,
+            build_id,
+        } => {
+            format!("已连接 · server {server_instance_id} · build {build_id}")
         }
         ConnectionState::Connecting => "正在连接本地 daemon…".to_owned(),
         ConnectionState::Failed { detail } => format!("连接异常：{detail}"),
     };
     let arch_text = format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH);
-    let rev_text = format!(
-        "Commands Rev {} · Session Rev {}",
-        qaqh_client::ringing::COMMAND_CONTRACT_REVISION,
-        qaqh_client::ringing::SESSION_CONTRACT_REVISION,
-    );
+    let rev_text = format!("RingingV3 Protocol Rev {}", qaqh_ringing_v3::PROTOCOL_REV);
     let config_path = settings::config_path().display().to_string();
     let diag_path = diagnostics::path().display().to_string();
 
@@ -1850,12 +1839,16 @@ fn provider_form(
 ) {
     let provider = existing.as_ref().map(|(_, provider)| provider);
     let wire = provider
-        .map(|provider| provider.wire.as_str())
-        .or_else(|| preset.as_ref().map(|p| p.wire.as_str()))
+        .map(qaqh_gpui_wire::profile_vocab::wire_label_of)
+        .or_else(|| {
+            preset
+                .as_ref()
+                .map(|p| qaqh_gpui_wire::profile_vocab::wire_label(p.wire))
+        })
         .unwrap_or("chat");
     let credential = credential_label(
         provider
-            .map(|provider| provider.credential)
+            .map(qaqh_gpui_wire::profile_vocab::credential_kind)
             .or_else(|| preset.as_ref().map(|p| p.credential))
             .unwrap_or_default(),
     );
@@ -1928,8 +1921,10 @@ fn provider_form(
             "DeepSeek 账号" => CredentialSource::DeepseekAccount,
             _ => CredentialSource::ApiKey,
         };
-        let wire = Wire::parse(&Field::find(fields, "wire")?.value(cx))
-            .ok_or("请选择接口协议")?;
+        let wire = qaqh_gpui_wire::profile_vocab::wire_from_label(
+            &Field::find(fields, "wire")?.value(cx),
+        )
+        .ok_or("请选择接口协议")?;
         let base_url = Field::find(fields, "base_url")?.required(cx)?;
         if credential == CredentialSource::DeepseekAccount {
             if wire != Wire::Responses {
@@ -1944,13 +1939,13 @@ fn provider_form(
                 Field::find(fields, "api_key")?.value(cx).as_str(),
                 Field::find(fields, "clear_key")?.value(cx).as_str(),
             ) {
-                ("", "是") => SecretWrite::Clear,
-                ("", _) => SecretWrite::Keep,
+                ("", "是") => serde_json::json!({"operation": "clear"}),
+                ("", _) => serde_json::json!({"operation": "keep"}),
                 (_, "是") => return Err("请在设置新密钥与清除密钥之间选择一项".into()),
-                (key, _) => SecretWrite::Set(key.into()),
+                (key, _) => serde_json::json!({"operation": "set", "value": key}),
             }
         } else {
-            SecretWrite::Keep
+            serde_json::json!({"operation": "keep"})
         };
         let mut compat = provider.and_then(|p| p.compat.clone());
         if credential == CredentialSource::DeepseekAccount {
@@ -1958,27 +1953,28 @@ fn provider_form(
             if official_web || compat.is_some() {
                 let mut next = compat.unwrap_or_default();
                 next.official_web_tools = official_web;
-                compat = if next == EndpointCompat::default() {
-                    None
-                } else {
-                    Some(next)
-                };
+                compat = (next != Default::default()).then_some(next);
             }
         }
+        let compat = compat
+            .as_ref()
+            .map(|compat| serde_json::to_value(compat).expect("EndpointCompat 序列化不可能失败"))
+            .unwrap_or(serde_json::Value::Null);
+        let payload = serde_json::json!({
+            "id": id,
+            "name": Field::find(fields, "name")?.required(cx)?,
+            "base_url": base_url,
+            "wire": qaqh_gpui_wire::profile_vocab::wire_label(wire),
+            "credential": qaqh_gpui_wire::profile_vocab::credential_label(credential),
+            "headers": provider.map(|p| p.headers.clone()).unwrap_or_default(),
+            "compat": compat,
+            "api_key": api_key,
+        });
         catalog_command(
             daemon,
-            revision,
-            RingingCommand::ProviderUpsert {
-                id,
-                provider: ProviderUpsertDto {
-                    name: Field::find(fields, "name")?.required(cx)?,
-                    base_url,
-                    wire,
-                    credential,
-                    headers: provider.map(|p| p.headers.clone()).unwrap_or_default(),
-                    compat,
-                    api_key,
-                },
+            ConfigRequest::UpsertProvider {
+                provider: JsonText::new(payload.to_string()),
+                expected_revision: revision,
             },
         )
     });
@@ -2094,13 +2090,16 @@ fn model_form(
             .transpose()?;
         model.defaults.native_web_search =
             Field::find(fields, "default_native_web_search")?.value(cx) == "是";
+        let mut payload = serde_json::to_value(&model).expect("ModelDef 序列化不可能失败");
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("id".into(), serde_json::Value::String(model_id));
+        }
         catalog_command(
             daemon,
-            revision,
-            RingingCommand::ProviderModelUpsert {
+            ConfigRequest::UpsertProviderModel {
                 provider_id: provider_id.clone(),
-                model_id,
-                model,
+                model: JsonText::new(payload.to_string()),
+                expected_revision: revision,
             },
         )
     });
@@ -2198,7 +2197,7 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                     div()
                         .text_xs()
                         .text_color(t.faint)
-                        .child(preset.wire.as_str()),
+                        .child(qaqh_gpui_wire::profile_vocab::wire_label(preset.wire)),
                 )
         });
         body = body.child(
@@ -2232,7 +2231,8 @@ fn provider_card(
     t: &Palette,
 ) -> Div {
     let revision = catalog.revision;
-    let is_ds_oauth = provider.credential == CredentialSource::DeepseekAccount;
+    let is_ds_oauth =
+        qaqh_gpui_wire::profile_vocab::credential_kind(provider) == CredentialSource::DeepseekAccount;
     let sync_models = is_ds_oauth.then(|| {
         button(
             cx,
@@ -2281,14 +2281,16 @@ fn provider_card(
         t,
         format!("provider-delete-{id}"),
         format!("删除服务商「{}」及其全部模型？", provider.name),
-        revision,
-        RingingCommand::ProviderDelete { id: id.into() },
+        ConfigRequest::DeleteProvider {
+            provider_id: id.to_owned(),
+            expected_revision: revision,
+        },
     );
     let meta = format!(
         "{} · {} · {}",
         provider.base_url,
-        provider.wire.as_str(),
-        credential_label(provider.credential)
+        qaqh_gpui_wire::profile_vocab::wire_label_of(provider),
+        credential_label(qaqh_gpui_wire::profile_vocab::credential_kind(provider))
     );
     let mut header_badges = div()
         .flex()
@@ -2406,7 +2408,11 @@ fn model_row(
         .as_ref()
         .is_some_and(|m| m.provider_id == provider_id && m.model_id == model_id);
     let id = format!("{provider_id}/{model_id}");
-    let valid = qaqh_profile::resolve_model_selection(catalog, &selection).is_ok();
+    let valid = qaqh_profile::resolve_model_selection(
+        catalog,
+        &qaqh_gpui_session::store::profile_selection(&selection),
+    )
+    .is_ok();
     let existing = (model_id.to_owned(), model.clone());
     let provider = provider_id.to_owned();
     let edit = dim_button(
@@ -2430,10 +2436,10 @@ fn model_row(
         t,
         format!("model-delete-{id}"),
         format!("删除模型「{id}」？"),
-        revision,
-        RingingCommand::ProviderModelDelete {
-            provider_id: provider_id.into(),
-            model_id: model_id.into(),
+        ConfigRequest::DeleteProviderModel {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+            expected_revision: revision,
         },
     );
     let mut actions = div().flex().items_center().gap_1();
@@ -2444,13 +2450,10 @@ fn model_row(
             format!("model-default-{id}"),
             "设为默认",
             move |daemon, _, _| {
-                let result = catalog_command(
-                    daemon,
-                    revision,
-                    RingingCommand::ModelSelectionSetDefault {
-                        selection: selection.clone(),
-                    },
-                );
+                let result = catalog_command(daemon, ConfigRequest::SetDefaultModel {
+                    selection: selection.clone(),
+                    expected_revision: revision,
+                });
                 report(daemon, result);
             },
         ));
@@ -2512,12 +2515,12 @@ fn model_row(
 fn patch_session(
     daemon: &DaemonStore,
     cx: &mut Context<DaemonStore>,
-    session_id: &str,
+    session_id: &qaqh_core_vocab::SessionId,
     patch: SessionSettingsPatch,
 ) -> Result<(), String> {
     let current = daemon.current.as_ref().ok_or("请先选择会话")?;
     let store = current.read(cx);
-    if store.session_id != session_id || store.settings.is_none() || store.settings_pending {
+    if &store.session_id != session_id || store.settings.is_none() || store.settings_pending {
         return Err("会话设置暂不可写，请确认当前会话并等待同步完成".into());
     }
     current.update(cx, |store, cx| {
@@ -2539,7 +2542,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
     let Some(settings) = &store.settings else {
         return card_padded(t).child(div().text_xs().text_color(t.dim).child("正在读取会话设置…"));
     };
-    let meta = settings.meta.clone();
+    let meta = settings;
     let title_text = store.display_title();
     let mut rows = Vec::new();
     let current_model = meta.model_selection.as_ref();
@@ -2570,9 +2573,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                                 cx,
                                 &target,
                                 SessionSettingsPatch {
-                                    model_selection: Some(qaqh_types::SettingValue::Use {
-                                        value: model,
-                                    }),
+                                    model_selection: Some(SettingOverride::Use(model)),
                                     ..Default::default()
                                 },
                             )
@@ -2614,9 +2615,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                             cx,
                             &target,
                             SessionSettingsPatch {
-                                model_selection: Some(qaqh_types::SettingValue::Use {
-                                    value: model.clone(),
-                                }),
+                                model_selection: Some(SettingOverride::Use(model.clone())),
                                 ..Default::default()
                             },
                         );
@@ -2640,17 +2639,14 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
     }
 
     let tools = [
-        (qaqh_types::STANDARD, "标准"),
-        (qaqh_types::MINIMAL, "精简"),
-        (qaqh_types::MINIMAL_B, "精简 B"),
-        (qaqh_types::MINIMAL_C, "精简 C"),
+        (qaqh_core_vocab::ToolMode::Standard, ToolsSettingPatch::Standard, "标准"),
+        (qaqh_core_vocab::ToolMode::Core, ToolsSettingPatch::Core, "精简"),
     ]
-    .map(|(preset, label)| {
+    .map(|(mode, patch, label)| {
         let target = meta.session_id.clone();
-        let active = meta.tool_mode == preset
-            || (meta.tool_mode.is_empty() && preset == qaqh_types::STANDARD);
+        let active = meta.tool_mode == mode;
         segmented_button(
-            format!("session-tools-{preset}"),
+            format!("session-tools-{label}"),
             label,
             active,
             t,
@@ -2660,9 +2656,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                     cx,
                     &target,
                     SessionSettingsPatch {
-                        tools: Some(ToolsSettingPatch::Preset {
-                            name: preset.into(),
-                        }),
+                        tools: Some(patch.clone()),
                         ..Default::default()
                     },
                 );
@@ -2673,7 +2667,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
     });
     rows.push(setting_row(
         "工具预设",
-        if meta.tool_mode == qaqh_types::CUSTOM {
+        if meta.tool_mode == qaqh_core_vocab::ToolMode::Custom {
             "当前正在使用自定义工具名单"
         } else {
             ""
@@ -2720,7 +2714,7 @@ fn session(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                             cx,
                             &target,
                             SessionSettingsPatch {
-                                tools: Some(ToolsSettingPatch::Custom { names }),
+                                tools: Some(ToolsSettingPatch::Custom { tools: names }),
                                 ..Default::default()
                             },
                         )

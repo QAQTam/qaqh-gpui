@@ -27,8 +27,8 @@ use qaqh_gpui_kit::motion::{accordion_reveal, bottom_fade_mask, effective_motion
 use qaqh_gpui_kit::primitives::action_button;
 use qaqh_gpui_kit::settings::{MotionLevel, Typography};
 use qaqh_gpui_kit::theme::Palette;
-use qaqh_ringing_contract::fact::ToolCallId;
-use qaqh_ringing_contract::state::TimelineEntry;
+use qaqh_core_vocab::ToolCallId;
+use qaqh_ringing_v3::{BlockKind, BlockView};
 
 use crate::store::{HandoffFacts, SessionStore, now_ms};
 
@@ -41,7 +41,7 @@ pub const FLY_BOX_SECS: f32 = 0.68;
 /// B 侧开箱出处三件套（来源会话 + 工作简述 + 封箱时刻）。
 #[derive(Clone, Debug)]
 pub struct HandoffOpenSource {
-    pub parent_session_id: String,
+    pub parent_session_id: qaqh_core_vocab::SessionId,
     pub work_summary: String,
     pub at_ms: u64,
 }
@@ -127,22 +127,22 @@ pub fn detect_open_source(store: &SessionStore, entry_index: usize) -> Option<Ha
     let first_input = store
         .entries
         .iter()
-        .position(|entry| matches!(entry, TimelineEntry::Input { .. }))?;
+        .position(|block| block.kind == BlockKind::User)?;
     if entry_index != first_input {
         return None;
     }
-    let TimelineEntry::Input {
+    let BlockView {
+        kind: BlockKind::User,
         turn_id, content, ..
     } = store.entries.get(entry_index)?
     else {
         return None;
     };
-    if crate::timeline::content_text(content).trim().is_empty() {
+    if crate::timeline::content_text(store, content).trim().is_empty() {
         return None;
     }
 
     if let Some(incoming) = &store.handoff_incoming
-        && !incoming.parent_session_id.is_empty()
         && incoming.parent_session_id != store.session_id
     {
         return Some(incoming.clone());
@@ -153,12 +153,14 @@ pub fn detect_open_source(store: &SessionStore, entry_index: usize) -> Option<Ha
             .turns
             .iter()
             .find(|turn| &turn.turn_id == tid)
-            .and_then(|turn| turn.input_id.as_ref().map(|id| id.0.as_str()))
+            .and_then(|turn| turn.input_id.as_ref().map(|id| id.as_str()))
             .and_then(handoff_doc_source)
     });
 
-    let parent = from_input_id.or_else(|| store.handoff_from_session_id.clone())?;
-    if parent.is_empty() || parent == store.session_id {
+    let parent = from_input_id
+        .and_then(|raw| qaqh_core_vocab::SessionId::new(raw).ok())
+        .or_else(|| store.handoff_from_session_id.clone())?;
+    if parent == store.session_id {
         return None;
     }
 
@@ -767,7 +769,7 @@ pub fn render_seal_card(
     ) = {
         let store = entity.read(cx);
         (
-            store.session_id.clone(),
+            store.session_id.as_str().to_owned(),
             store.handoff_anchors.clone(),
             store.handoff_seal.is_some(),
             store.handoff_stay,
@@ -961,7 +963,7 @@ pub fn render_seal_card(
                 .child(div().text_xs().text_color(t.dim).child(label))
                 .child(action_button(
                     cx,
-                    format!("handoff-cancel-{}", facts.call_id.0),
+                    format!("handoff-cancel-{}", facts.call_id.as_str()),
                     "取消自动",
                     t.dim,
                     move |_, _, cx: &mut gpui_kit::App| {
@@ -979,7 +981,7 @@ pub fn render_seal_card(
     let primary_btn = if has_seal {
         action_button(
             cx,
-            format!("handoff-open-child-{}", facts.call_id.0),
+            format!("handoff-open-child-{}", facts.call_id.as_str()),
             "打开后继会话 →",
             t.accent,
             move |_, _, cx: &mut gpui_kit::App| {
@@ -993,7 +995,7 @@ pub fn render_seal_card(
     } else if facts.sealed {
         action_button(
             cx,
-            format!("handoff-eager-{}", facts.call_id.0),
+            format!("handoff-eager-{}", facts.call_id.as_str()),
             if handoff_eager {
                 "正在前往后继…"
             } else {
@@ -1014,12 +1016,12 @@ pub fn render_seal_card(
         let doc_fork = facts.doc.clone();
         action_button(
             cx,
-            format!("handoff-fork-{}", facts.call_id.0),
+            format!("handoff-fork-{}", facts.call_id.as_str()),
             "继续这条交接 →",
             t.accent,
             move |_, _, cx: &mut gpui_kit::App| {
-                let _ = weak_primary.update(cx, |store, _| {
-                    store.fork_handoff(summary_fork.clone(), doc_fork.clone());
+                let _ = weak_primary.update(cx, |store, cx| {
+                    store.fork_handoff(summary_fork.clone(), doc_fork.clone(), cx);
                 });
             },
             t,
@@ -1032,7 +1034,7 @@ pub fn render_seal_card(
     let doc_toggle = div()
         .id(SharedString::from(format!(
             "handoff-doc-toggle-{}",
-            facts.call_id.0
+            facts.call_id.as_str()
         )))
         .px_2p5()
         .py_1()
@@ -1059,7 +1061,7 @@ pub fn render_seal_card(
             "查看交接文档"
         })
         .child(spring_chevron(
-            SharedString::from(format!("handoff-doc-chev-{}", facts.call_id.0)),
+            SharedString::from(format!("handoff-doc-chev-{}", facts.call_id.as_str())),
             doc_open,
             t.dim,
             motion != MotionLevel::Off,
@@ -1075,7 +1077,7 @@ pub fn render_seal_card(
     );
 
     let doc_text = facts.doc.clone();
-    let doc_cid = facts.call_id.0.clone();
+    let doc_cid = facts.call_id.as_str().to_owned();
     let weak_doc = entity.downgrade();
     if let Some(panel) = accordion_reveal(
         SharedString::from(format!("handoff-doc-panel-{doc_cid}")),
@@ -1147,7 +1149,7 @@ pub fn render_open_card(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let short_parent: String = source.parent_session_id.chars().take(12).collect();
+    let short_parent: String = source.parent_session_id.as_str().chars().take(12).collect();
 
     let mut meta = div().flex().flex_wrap().items_center().gap_2().text_xs().text_color(t.dim);
     if source.at_ms > 0 {

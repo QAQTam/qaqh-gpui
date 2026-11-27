@@ -11,8 +11,8 @@ workspace = true
 [dependencies]
 qaqh-gpui-kit = { workspace = true }
 gpui-kit = { workspace = true }
-qaqh-client = { workspace = true }
-base64 = { workspace = true }
+qaqh-ringing-v3 = { workspace = true }
+qaqh-core-vocab = { workspace = true }
 tree-sitter-highlight = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-python = { workspace = true }

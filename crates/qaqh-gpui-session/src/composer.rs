@@ -21,8 +21,8 @@ use qaqh_gpui_kit::kit::{
 use qaqh_gpui_kit::primitives::{icon_button, segmented_button, setting_row};
 use qaqh_gpui_kit::theme::Palette;
 use qaqh_gpui_wire::delivery::DeliveryState;
-use qaqh_ringing_contract::fact::ActivityState;
-use qaqh_types::ModelSelection;
+use qaqh_core_vocab::{ActivityState, ToolMode};
+use qaqh_core_vocab::ModelSelection;
 
 use crate::store::SessionStore;
 
@@ -92,7 +92,7 @@ fn telemetry_footer(store: &SessionStore, t: &Palette) -> Option<AnyElement> {
         t.text
     };
 
-    let used_compact = format_tokens_compact(u64::from(tel.used_tokens));
+    let used_compact = format_tokens_compact(tel.used_tokens);
     let ctx_label = match (tel.context_window, tel.used_pct) {
         (Some(window), Some(pct)) => format!(
             "{pct}% · {used_compact} / {}",
@@ -100,7 +100,7 @@ fn telemetry_footer(store: &SessionStore, t: &Palette) -> Option<AnyElement> {
         ),
         _ => format!("{used_compact} ctx"),
     };
-    let used_exact = format_tokens_exact(u64::from(tel.used_tokens));
+    let used_exact = format_tokens_exact(tel.used_tokens);
     let mut ctx_tip = match (tel.context_window, tel.used_pct) {
         (Some(window), Some(pct)) => format!(
             "当前上下文占用: {used_exact} / {} tokens ({pct}%)",
@@ -110,13 +110,13 @@ fn telemetry_footer(store: &SessionStore, t: &Palette) -> Option<AnyElement> {
     };
     ctx_tip.push_str(&format!(
         "\n最近请求: 输入 {} · 输出 {}",
-        format_tokens_exact(u64::from(tel.prompt_tokens)),
-        format_tokens_exact(u64::from(tel.completion_tokens)),
+        format_tokens_exact(tel.input_tokens),
+        format_tokens_exact(tel.output_tokens),
     ));
     if tel.reasoning_tokens > 0 {
         ctx_tip.push_str(&format!(
             " · 思考 {}",
-            format_tokens_exact(u64::from(tel.reasoning_tokens))
+            format_tokens_exact(tel.reasoning_tokens)
         ));
     }
     let ctx_tip: SharedString = ctx_tip.into();
@@ -232,17 +232,11 @@ fn telemetry_footer(store: &SessionStore, t: &Palette) -> Option<AnyElement> {
     )
 }
 
-fn tools_mode_label(mode: &str) -> &'static str {
-    if mode == qaqh_types::MINIMAL {
-        "精简"
-    } else if mode == qaqh_types::MINIMAL_B {
-        "精简 B"
-    } else if mode == qaqh_types::MINIMAL_C {
-        "精简 C"
-    } else if mode == qaqh_types::CUSTOM {
-        "自定义"
-    } else {
-        "标准"
+fn tools_mode_label(mode: ToolMode) -> &'static str {
+    match mode {
+        ToolMode::Core => "精简",
+        ToolMode::Standard => "标准",
+        ToolMode::Custom => "自定义",
     }
 }
 
@@ -436,7 +430,7 @@ fn model_popover(
                             model_id: mid.clone(),
                             options: Default::default(),
                         };
-                        if qaqh_profile::resolve_model_selection(catalog, &selection).is_ok() {
+                        if qaqh_profile::resolve_model_selection(catalog, &crate::store::profile_selection(&selection)).is_ok() {
                             let display = model
                                 .display_name
                                 .as_deref()
@@ -692,17 +686,12 @@ fn tools_popover(
     cx: &gpui_kit::App,
     t: &Palette,
 ) -> AnyElement {
-    let current = store
-        .settings
-        .as_ref()
-        .map(|s| s.meta.tool_mode.clone())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| qaqh_types::STANDARD.to_owned());
+    let current = store.tool_mode;
     let trigger = popover_trigger(
         cx,
         "composer-tools-btn",
         IconName::Wrench,
-        tools_mode_label(&current),
+        tools_mode_label(current),
         "切换会话工具权限预设",
         t,
     );
@@ -714,10 +703,9 @@ fn tools_popover(
         .content(move |_state, _window, cx| {
             let popover = cx.entity().downgrade();
             let presets = [
-                (qaqh_types::STANDARD, "标准工具", "完整工程读写、搜索与终端"),
-                (qaqh_types::MINIMAL, "精简", "基础文件读写与命令执行"),
-                (qaqh_types::MINIMAL_B, "精简 B", "轻量只读检查与检索"),
-                (qaqh_types::MINIMAL_C, "精简 C", "最小对话工具集"),
+                (ToolMode::Standard, "标准工具", "完整工程读写、搜索与终端"),
+                (ToolMode::Core, "精简", "基础文件读写与命令执行"),
+                (ToolMode::Custom, "自定义", "只开放白名单里的工具"),
             ];
             let mut card = popover_card(cx, &t, 224.);
             card = card.child(
@@ -734,14 +722,14 @@ fn tools_popover(
                 let entity = entity.clone();
                 let popover = popover.clone();
                 card = card.child(popover_option_row(
-                    SharedString::from(format!("pick-tools-{preset}")),
+                    SharedString::from(format!("pick-tools-{preset:?}")),
                     SharedString::from(title),
                     Some(SharedString::from(desc)),
                     is_selected,
                     &t,
                     move |window, cx| {
                         let _ = entity.update(cx, |store, cx| {
-                            store.patch_tools_mode(preset.to_string());
+                            store.patch_tool_mode(preset);
                             cx.notify();
                         });
                         let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
@@ -763,7 +751,7 @@ pub fn model_params_modal(
         return None;
     }
 
-    let settings_meta = store.settings.as_ref().map(|s| &s.meta);
+    let settings_meta = store.settings.as_ref();
     let effective_model = store.effective_model_selection();
     let current_model = effective_model.as_ref();
     let is_inherited = settings_meta.and_then(|m| m.model_selection.as_ref()).is_none();
@@ -934,25 +922,21 @@ pub fn model_params_modal(
     }
 
     // 5. 工具策略预设
-    let current_tool_mode = settings_meta
-        .map(|m| m.tool_mode.as_str())
-        .filter(|m| !m.is_empty())
-        .unwrap_or(qaqh_types::STANDARD);
+    let current_tool_mode = settings_meta.map(|m| m.tool_mode).unwrap_or(ToolMode::Standard);
     let tool_btns = [
-        (qaqh_types::STANDARD, "标准"),
-        (qaqh_types::MINIMAL, "精简"),
-        (qaqh_types::MINIMAL_B, "精简 B"),
-        (qaqh_types::MINIMAL_C, "精简 C"),
+        (ToolMode::Standard, "标准"),
+        (ToolMode::Core, "精简"),
+        (ToolMode::Custom, "自定义"),
     ]
     .into_iter()
     .map(|(preset, label)| {
         segmented_button(
-            format!("mp-tools-{preset}"),
+            format!("mp-tools-{preset:?}"),
             label,
             current_tool_mode == preset,
             t,
             cx.listener(move |store, _, _, cx| {
-                store.patch_tools_mode(preset.to_owned());
+                store.patch_tool_mode(preset);
                 cx.notify();
             }),
         )
@@ -960,7 +944,7 @@ pub fn model_params_modal(
     rows.push(
         setting_row(
             "工具策略",
-            if current_tool_mode == qaqh_types::CUSTOM {
+            if current_tool_mode == ToolMode::Custom {
                 "当前使用自定义工具名单"
             } else {
                 ""
@@ -1201,7 +1185,7 @@ pub fn render(
             );
     }
 
-    let running = store.activity == Some(ActivityState::Running);
+    let running = store.activity == ActivityState::Running;
     let blocked = (!running).then(|| store.send_block_reason()).flatten();
     let entity = cx.entity().downgrade();
 
@@ -1214,7 +1198,7 @@ pub fn render(
             .px_1()
             .pb_1p5()
             .children(store.images.iter().enumerate().map(|(index, block)| {
-                image_chip(cx, index, block, t)
+                image_chip(cx, index, block, store.blobs.get(&block.hash), t)
             }))
             .children(
                 store
@@ -1255,7 +1239,7 @@ pub fn render(
                             if store
                                 .requests()
                                 .unbounded_send(qaqh_gpui_wire::bridge::BridgeRequest::AttachFile {
-                                    seed: store.session_id.clone(),
+                                    session_id: store.session_id.clone(),
                                     path,
                                 })
                                 .is_err()
@@ -1278,15 +1262,8 @@ pub fn render(
                 toolbar = toolbar.child(status_icon(IconName::LoaderCircle, t.accent));
             }
             DeliveryState::Accepted => {
-                toolbar = toolbar.child(icon_button(
-                    cx,
-                    "composer-receipt",
-                    IconName::ReceiptText,
-                    t.accent,
-                    "查回执",
-                    cx.listener(|store, _, _, _| store.check_receipt()),
-                    t,
-                ));
+                // V3 没有回执查询:受理后等事件流宣告结果;此处只给状态点。
+                toolbar = toolbar.child(status_icon(IconName::ReceiptText, t.accent));
             }
             DeliveryState::Succeeded => {
                 toolbar = toolbar.child(status_icon(IconName::CircleCheck, t.ok));
@@ -1307,15 +1284,6 @@ pub fn render(
             }
             DeliveryState::Uncertain => {
                 toolbar = toolbar
-                    .child(icon_button(
-                        cx,
-                        "composer-receipt",
-                        IconName::ReceiptText,
-                        t.accent,
-                        "查回执",
-                        cx.listener(|store, _, _, _| store.check_receipt()),
-                        t,
-                    ))
                     .child(icon_button(
                         cx,
                         "composer-retry",
@@ -1448,12 +1416,13 @@ pub fn render(
 fn image_chip(
     cx: &mut Context<SessionStore>,
     index: usize,
-    block: &qaqh_client::ImageBlock,
+    image: &qaqh_ringing_v3::ImageRefView,
+    bytes: Option<std::sync::Arc<[u8]>>,
     t: &Palette,
 ) -> AnyElement {
     div()
         .relative()
-        .child(qaqh_gpui_render::media::thumb(block))
+        .child(qaqh_gpui_render::media::thumb(image, bytes))
         .child(
             div()
                 .id(SharedString::from(format!("composer-image-remove-{index}")))
@@ -1480,7 +1449,7 @@ fn image_chip(
 fn file_chip(
     cx: &mut Context<SessionStore>,
     index: usize,
-    reference: &qaqh_client::ContentRef,
+    reference: &qaqh_core_vocab::ContentRef,
     t: &Palette,
 ) -> AnyElement {
     div()
@@ -1502,7 +1471,18 @@ fn file_chip(
                 .whitespace_nowrap()
                 .max_w(px(120.))
                 .child(SharedString::from(
-                    reference.0.as_str().chars().take(14).collect::<String>(),
+                    match reference {
+                        qaqh_core_vocab::ContentRef::Inline { text } => text
+                            .chars()
+                            .take(14)
+                            .collect::<String>(),
+                        qaqh_core_vocab::ContentRef::Windowed {
+                            total_bytes, ..
+                        } => format!("尾窗 {total_bytes} B"),
+                        qaqh_core_vocab::ContentRef::Blob { hash, len } => {
+                            format!("{}… {len} B", &hash.to_hex()[..10])
+                        }
+                    },
                 )),
         )
         .child(

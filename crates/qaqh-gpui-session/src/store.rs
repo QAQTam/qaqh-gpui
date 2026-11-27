@@ -1,4 +1,4 @@
-//! GPUI 实体状态(M3):字段直持 RingingV2 契约类型,零前端 DTO。
+//! GPUI 实体状态(M3):字段直持 RingingV3 契约类型,零前端 DTO。
 //! 多会话:visited store 常驻缓存、事件按 seed 路由;输入框统一走
 //! gpui-component 的 InputState/TextareaState(InputState::new 需要
 //! &mut Window,故实体构造一律在窗口上下文内完成)。
@@ -18,33 +18,21 @@ use gpui_kit::ScrollHandle;
 use gpui_kit::Subscription;
 use gpui_kit::Window;
 use gpui_kit::{ListAlignment, ListState, px};
-use qaqh_ringing_contract::fact::ActivityState;
-use qaqh_ringing_contract::fact::AssistantBlockKind;
-use qaqh_ringing_contract::fact::BlockId;
-use qaqh_ringing_contract::fact::ExecSessionId;
-use qaqh_ringing_contract::fact::InteractionId;
-use qaqh_ringing_contract::fact::ToolCallId;
-use qaqh_ringing_contract::fact::TurnId;
-use qaqh_ringing_contract::state::ExecSessionView;
-use qaqh_ringing_contract::state::GoalStatus;
-use qaqh_ringing_contract::state::GoalView;
-use qaqh_ringing_contract::state::InteractionView;
-use qaqh_ringing_contract::state::SubagentView;
-use qaqh_ringing_contract::state::TimelineEntry;
-use qaqh_ringing_contract::state::ToolCallView;
-use qaqh_ringing_contract::state::TurnView;
-use qaqh_ringing_contract::workspace::WorkspaceEntry;
-
+use qaqh_core_vocab::{
+    ActivityState, BlockId, ContentRef, ExecSessionId, GoalStatus, InputId, InteractionId,
+    ModelSelection, SessionId, SettingOverride, ToolCallId, ToolMode, TurnId, UsageInfo,
+    WorkspaceId,
+};
 use qaqh_gpui_wire::bridge::BridgeRequest;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
-use qaqh_client::{
-    CommandTarget, RingingCommand, SessionSettingsPatch, ToolsSettingPatch,
-};
 use qaqh_profile::ProfilesDocument;
-use qaqh_types::{CredentialSource, ModelSelection, SessionListEntry, SessionRunStatus, SettingValue};
-use qaqh_ringing_contract::state::ToolCallState;
+use qaqh_ringing_v3::{
+    AccountRequest, AskAnswer, BlockKind, BlockView, CompactionSummary, ExecSessionSnapshot,
+    GoalView, ImageRefView, InteractionView, SessionEventFrame, SessionRequest, SessionSummary,
+    SessionSettingsPatch, SubagentSummary, ToolCallView, TurnSummary, WorkspaceEntry,
+};
 
-/// 单会话 SSE 流状态(由 `V2StreamStatus` 映射,避免 store 依赖 SDK 内部枚举形状)。
+/// 单会话事件流状态(由 V3 `StreamProgress` 映射,避免 store 依赖传输细节)。
 pub enum StreamState {
     Connecting,
     Open,
@@ -88,13 +76,20 @@ pub struct ArgStream {
 #[derive(Clone, Debug)]
 pub enum SessionNavEvent {
     OpenSession {
-        session_id: String,
-        fly_from_session: Option<String>,
+        session_id: SessionId,
+        fly_from_session: Option<SessionId>,
     },
     SidePanelOpenChanged {
         open: bool,
     },
     OpenAccess,
+    /// 交接分叉:壳层建会话并在 `Created` 回执后投递首条 `SendPrompt`(交接文档)。
+    HandoffFork {
+        title: Option<String>,
+        doc: String,
+    },
+    /// 会话已被 daemon 删除(壳层据此关闭/淘汰对应 store)。
+    SessionRemoved { session_id: SessionId },
 }
 
 impl gpui_kit::EventEmitter<SessionNavEvent> for SessionStore {}
@@ -139,15 +134,14 @@ pub fn now_ms() -> u64 {
 
 /// handoff 工具调用 → 交接事实。主判据 = 机器面 `handed_off === true`;
 /// 文档正文优先取 args(output 里的同名字段只作冗余兜底),没有正文不配叫交接。
-pub fn handoff_facts(tool: &ToolCallView) -> Option<HandoffFacts> {
-    if tool.tool_name.as_deref() != Some("handoff") {
+pub fn handoff_facts(tool: &ToolCallView, text_of: impl Fn(&ContentRef) -> String) -> Option<HandoffFacts> {
+    if tool.tool_name.as_str() != "handoff" {
         return None;
     }
-    let success = matches!(&tool.state, ToolCallState::Finished { outcome } if outcome.is_success());
-    if !success {
+    if tool.status != qaqh_ringing_v3::ToolCallStatus::Succeeded {
         return None;
     }
-    let args = tool.args.as_ref()?;
+    let args: serde_json::Value = serde_json::from_str(&text_of(tool.args.as_ref()?)).ok()?;
     let doc = args.get("handoff_doc")?.as_str()?.to_string();
     if doc.trim().is_empty() {
         return None;
@@ -160,7 +154,7 @@ pub fn handoff_facts(tool: &ToolCallView) -> Option<HandoffFacts> {
     let payload = tool
         .output
         .as_ref()
-        .and_then(|output| extract_machine_json(crate::timeline::content_text(output)));
+        .and_then(|output| extract_machine_json(&text_of(output)));
     let sealed = payload
         .as_ref()
         .is_some_and(|payload| payload.get("handed_off") == Some(&serde_json::Value::Bool(true)));
@@ -185,7 +179,7 @@ pub fn handoff_facts(tool: &ToolCallView) -> Option<HandoffFacts> {
         modified_files = string_list(args.get("modified_files"));
     }
     Some(HandoffFacts {
-        call_id: tool.call_id.clone(),
+        call_id: tool.tool_call_id.clone(),
         summary,
         doc,
         sealed,
@@ -267,15 +261,72 @@ pub struct ProviderRetry {
     pub error: String,
 }
 
+/// blob 缓存条目上限(图片与全文共用);超限按插入序淘汰。
+const BLOB_CACHE_LIMIT: usize = 64;
+
+/// 向上翻页单页块数。
+pub const TAIL_PAGE: u32 = 200;
+
+/// 待确认的用户输入(`SendPrompt` 的载荷)。
+///
+/// V3 的 `Outbox` 只留幂等键与投递态(投递态是 UI 自己的状态机),输入内容由这里
+/// 保存:重试必须复用同一个 `input_id` 与同一组内容,被拒时要把原文回填输入框。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingSend {
+    pub input_id: InputId,
+    pub text: String,
+    pub attachments: Vec<ContentRef>,
+    pub images: Vec<ImageRefView>,
+}
+
+/// 内容寻址 blob 缓存:图片字节与文本全文同一来源,按 sha256 去重。
+///
+/// V3 的大内容一律走 `BlobTransfer`(禁止 base64 内联),渲染层只能拿到
+/// `ContentRef::Blob { hash, len }`;这里保存已到货的字节,未到货的哈希登记为
+/// `pending`,由 `SessionStore::prefetch_blobs` 发一次 `FetchBlob`。
+#[derive(Default)]
+pub struct BlobCache {
+    entries: HashMap<qaqh_core_vocab::ContentHash, Arc<[u8]>>,
+    order: std::collections::VecDeque<qaqh_core_vocab::ContentHash>,
+    pending: HashSet<qaqh_core_vocab::ContentHash>,
+}
+
+impl BlobCache {
+    pub fn get(&self, hash: &qaqh_core_vocab::ContentHash) -> Option<Arc<[u8]>> {
+        self.entries.get(hash).cloned()
+    }
+
+    pub fn put(&mut self, hash: qaqh_core_vocab::ContentHash, bytes: Vec<u8>) {
+        self.pending.remove(&hash);
+        if self.entries.insert(hash, Arc::from(bytes.into_boxed_slice())).is_some() {
+            return;
+        }
+        self.order.push_back(hash);
+        while self.order.len() > BLOB_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    /// 首次见到该哈希时登记并返回 `true`(调用方据此发一次 `FetchBlob`)。
+    pub fn want(&mut self, hash: &qaqh_core_vocab::ContentHash) -> bool {
+        !self.entries.contains_key(hash) && self.pending.insert(*hash)
+    }
+}
+
 pub struct SessionStore {
     pub snapshot_pending: bool,
-    pub buffered_frames: Vec<qaqh_ringing_contract::events::SessionEventFrame>,
+    pub buffered_frames: Vec<SessionEventFrame>,
     pub outbox: Option<qaqh_gpui_wire::delivery::Outbox>,
-    pub images: Vec<qaqh_client::ImageBlock>,
-    pub attachments: Vec<qaqh_client::ContentRef>,
+    /// 与 `outbox` 成对的输入载荷(重试/回填用)。
+    pub pending_send: Option<PendingSend>,
+    /// 新会话的首条消息(交接文档/启动页输入):快照落定后自动投递。
+    pub pending_first_message: Option<String>,
+    pub images: Vec<ImageRefView>,
+    pub attachments: Vec<ContentRef>,
     pub attachment_pending: bool,
     pub operation_error: Option<String>,
-    pub client_session_id: Option<String>,
     pub output_budget: usize,
     pub search: Entity<InputState>,
     pub search_open: bool,
@@ -285,16 +336,20 @@ pub struct SessionStore {
     pub turn_rail_hovered_idx: Option<usize>,
     pub turn_rail_last_idx: Option<usize>,
     pub code_panel: crate::code_panel::CodePanel,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub title: Option<String>,
-    pub activity: Option<ActivityState>,
+    /// 活动状态。(V3 只有四态,不存在"未运行/未加载";快照到达前按 `Idle`。)
+    pub activity: ActivityState,
     pub current_turn_id: Option<TurnId>,
-    /// 已覆盖水位(互斥上界):快照 seq 与随后每帧 seq+1。
+    /// 已收到的最后事件序号(`attach_session(since_seq)` 的入参)。
     pub seq: u64,
-    pub turns: Vec<TurnView>,
-    pub entries: Vec<TimelineEntry>,
-    /// 未 seal 的助手流式块:block_id → (kind, 累计替换文本)。
-    pub streaming: Vec<(BlockId, AssistantBlockKind, String)>,
+    /// 时间线代际(翻页校验;`TimelineTruncated` 递增)。
+    pub timeline_epoch: u64,
+    pub turns: Vec<TurnSummary>,
+    /// 前端合并态:快照尾部窗口 + `TimelineAppended` + 翻页,按 `ord` 升序。
+    pub entries: Vec<BlockView>,
+    /// 未 seal 的助手流式块:block_id → (kind, 累计追加文本)。
+    pub streaming: Vec<(BlockId, BlockKind, String)>,
     /// 工具调用业务状态(单一权威,与 timeline 的 ToolCall 条目按 call_id 关联)。
     pub tools: Vec<ToolCallView>,
     pub expanded_tools: HashSet<ToolCallId>,
@@ -325,9 +380,19 @@ pub struct SessionStore {
     /// 运行中工具的输出尾窗:call_id → 累计文本。
     pub output_tail: Vec<(ToolCallId, String)>,
     pub interactions: Vec<InteractionView>,
-    pub subagents: Vec<SubagentView>,
+    pub subagents: Vec<SubagentSummary>,
     /// 会话目标(ADR-0015):bootstrap + goal_updated 事件维护。
     pub goal: Option<GoalView>,
+    /// 固定压缩摘要(独立于回合窗口)。
+    pub pinned_compaction: Option<CompactionSummary>,
+    /// 当前驱动权客户端实例 id 与定序序号(多端联动)。
+    pub driver_client_instance_id: Option<String>,
+    pub driver_ordinal: u64,
+    /// 内容寻址 blob 缓存(图片字节与全文同源)。
+    pub blobs: BlobCache,
+    /// 向上翻页游标(`None` = 还没翻过,首屏窗口就是最新)。
+    pub transcript_before_ord: Option<u64>,
+    pub transcript_loading: bool,
     /// 封箱事实(ADR-0016):HandoffSealed 事件维护;UI 投影(封箱标记/后继入口)读此。
     pub handoff_seal: Option<HandoffSeal>,
     /// 开箱机器面(ADR-016/5fa1762d):handoff 工具终态成功时解析;倒计时投影。
@@ -340,7 +405,7 @@ pub struct SessionStore {
     /// 跨组件飞箱坐标锚点表(壳层与 SessionStore 共享)。
     pub handoff_anchors: crate::handoff::HandoffAnchors,
     /// 来自目录血缘的前驱会话 id(ADR-016 切片 2)。
-    pub handoff_from_session_id: Option<String>,
+    pub handoff_from_session_id: Option<SessionId>,
     /// 本会话创建时刻(unix ms;开箱卡兜底时间源)。
     pub session_created_at_ms: u64,
     /// 通过 HandoffSealed 双发到达的后继线权威开箱来源。
@@ -365,7 +430,7 @@ pub struct SessionStore {
     pub handoff_open_ritual_done: bool,
     /// Provider 请求重试中(ADR-0018):横幅投影;权威帧到达即清。
     pub provider_retry: Option<ProviderRetry>,
-    pub exec_sessions: Vec<ExecSessionView>,
+    pub exec_sessions: Vec<ExecSessionSnapshot>,
     /// 执行会话输出:exec_session_id → (已收 offset 上界, 累计文本)。
     pub exec_output_tail: Vec<(ExecSessionId, u64, String)>,
     pub stream: StreamState,
@@ -378,8 +443,14 @@ pub struct SessionStore {
     pub tok_samples: std::collections::VecDeque<(std::time::Instant, i64)>,
     pub timeline_list: ListState,
     pub timeline_follow_setting: Option<bool>,
-    pub settings: Option<SessionListEntry>,
+    pub settings: Option<SessionSummary>,
     pub settings_pending: bool,
+    /// 会话当前工具模式(composer 模式切换的权威值)。
+    pub tool_mode: ToolMode,
+    /// 当前会话工具目录单一真相源(`ToolCatalogRequest::Get`)。
+    pub tool_catalog: Option<Arc<qaqh_core_vocab::ToolCatalog>>,
+    /// 置顶压缩摘要卡片是否展开全文。
+    pub compaction_expanded: bool,
     pub catalog: Option<Arc<ProfilesDocument>>,
     pub siwc_ready: bool,
     pub dsaccount_signed_in: bool,
@@ -417,7 +488,7 @@ impl SessionStore {
     }
     pub fn requests(&self) -> &UnboundedSender<BridgeRequest> { &self.requests }
     pub fn new(
-        session_id: String,
+        session_id: SessionId,
         requests: UnboundedSender<BridgeRequest>,
         draft: crate::persist::Draft,
         window: &mut Window,
@@ -459,11 +530,12 @@ impl SessionStore {
             buffered_frames: Vec::new(),
             code_panel: crate::code_panel::CodePanel::with_root(draft.local_root),
             outbox: draft.outbox,
+            pending_send: draft.pending_send,
+            pending_first_message: None,
             images: draft.images,
             attachments: draft.attachments,
             attachment_pending: false,
             operation_error: None,
-            client_session_id: None,
             output_budget: qaqh_gpui_kit::settings::get(cx).behavior.output_tail_max,
             search,
             search_open: false,
@@ -473,9 +545,10 @@ impl SessionStore {
             turn_rail_last_idx: None,
             session_id,
             title: None,
-            activity: None,
+            activity: ActivityState::Idle,
             current_turn_id: None,
             seq: 0,
+            timeline_epoch: 0,
             turns: Vec::new(),
             entries: Vec::new(),
             streaming: Vec::new(),
@@ -497,6 +570,12 @@ impl SessionStore {
             interactions: Vec::new(),
             subagents: Vec::new(),
             goal: None,
+            pinned_compaction: None,
+            driver_client_instance_id: None,
+            driver_ordinal: 0,
+            blobs: BlobCache::default(),
+            transcript_before_ord: None,
+            transcript_loading: false,
             handoff_seal: None,
             handoff_open: None,
             handoff_auto_jump: None,
@@ -525,6 +604,9 @@ provider_retry: None,
             timeline_follow_setting: None,
             settings: None,
             settings_pending: false,
+            tool_mode: ToolMode::Standard,
+            tool_catalog: None,
+            compaction_expanded: false,
             catalog: None,
             siwc_ready: false,
             dsaccount_signed_in: false,
@@ -546,10 +628,10 @@ provider_retry: None,
         self.catalog
             .as_ref()
             .and_then(|catalog| catalog.providers.get(provider_id))
-            .is_some_and(|provider| match provider.credential {
-                CredentialSource::ApiKey => false,
-                CredentialSource::ChatgptPlan => !self.siwc_ready,
-                CredentialSource::DeepseekAccount => !self.dsaccount_signed_in,
+            .is_some_and(|provider| match qaqh_gpui_wire::profile_vocab::credential_kind(provider) {
+                qaqh_core_vocab::CredentialSource::ApiKey => false,
+                qaqh_core_vocab::CredentialSource::ChatgptPlan => !self.siwc_ready,
+                qaqh_core_vocab::CredentialSource::DeepseekAccount => !self.dsaccount_signed_in,
             })
     }
 
@@ -563,12 +645,12 @@ provider_retry: None,
         if self.attachment_pending { return Some("附件正在准备"); }
         if self.outbox.as_ref().is_some_and(|o| matches!(o.state,
             qaqh_gpui_wire::delivery::DeliveryState::Sending | qaqh_gpui_wire::delivery::DeliveryState::Accepted | qaqh_gpui_wire::delivery::DeliveryState::Uncertain)) {
-            return Some("上一条消息尚未确认，请先查回执");
+            return Some("上一条消息尚未确认，请先重试或撤回");
         }
-        if self.interactions.iter().any(|i| i.resolution.is_none()) {
+        if !self.interactions.is_empty() {
             return Some("有待应答的交互");
         }
-        if self.activity == Some(ActivityState::Running) {
+        if self.activity == ActivityState::Running {
             return Some("回合运行中,可先中断");
         }
         None
@@ -578,7 +660,7 @@ provider_retry: None,
         &self,
         turn: TurnId,
         request: usize,
-        references: Vec<qaqh_ringing_contract::fact::ContentRef>,
+        references: Vec<ContentRef>,
     ) {
         let _ = self.requests.unbounded_send(BridgeRequest::ReviewContent {
             session_id: self.session_id.clone(),
@@ -597,19 +679,25 @@ provider_retry: None,
         if text.is_empty() && self.images.is_empty() && self.attachments.is_empty() {
             return None;
         }
-        let outbox = qaqh_gpui_wire::delivery::Outbox {
-            command_id: qaqh_ringing_contract::ulid::generate_ulid(),
-            message: qaqh_client::ConversationSendMessage {
-                text, images: self.images.clone(), attachments: Some(self.attachments.clone()),
-                message_id: None, input_purpose: Default::default(), as_system: false,
-                inter_agent: None, subagent_terminal: None, widget_context: None,
-            },
-            state: qaqh_gpui_wire::delivery::DeliveryState::Sending, detail: String::new(),
+        let command_id = qaqh_gpui_wire::ids::new_id("cmd");
+        let input_id = match InputId::new(qaqh_gpui_wire::ids::new_id("inp")) {
+            Ok(input_id) => input_id,
+            Err(error) => {
+                self.operation_error = Some(format!("输入 id 生成失败：{error}"));
+                return Some("消息未能发送");
+            }
         };
-        self.outbox = Some(outbox);
+        self.pending_send = Some(PendingSend {
+            input_id,
+            text,
+            attachments: std::mem::take(&mut self.attachments),
+            images: std::mem::take(&mut self.images),
+        });
+        self.outbox = Some(qaqh_gpui_wire::delivery::Outbox::new(command_id));
         if let Err(error) = self.persist_draft(cx) {
             self.operation_error = Some(format!("发送前保存失败：{error}"));
             self.outbox = None;
+            self.pending_send = None;
             return Some("草稿未能保存，消息尚未发送");
         }
         self.retry_message();
@@ -618,63 +706,76 @@ provider_retry: None,
 
     pub fn draft(&self, cx: &App) -> crate::persist::Draft {
         crate::persist::Draft {
-            text: self.composer.read(cx).value().to_string(), images: self.images.clone(),
-            attachments: self.attachments.clone(), outbox: self.outbox.clone(),
+            text: self.composer.read(cx).value().to_string(),
+            images: self.images.clone(),
+            attachments: self.attachments.clone(),
+            pending_send: self.pending_send.clone(),
+            outbox: self.outbox.clone(),
             local_root: self.code_panel.local_root(),
         }
     }
     pub fn persist_draft(&self, cx: &App) -> Result<(), String> {
         let mut state = crate::persist::load()?;
-        state.drafts.insert(self.session_id.clone(), self.draft(cx));
+        state.drafts.insert(self.session_id.as_str().to_owned(), self.draft(cx));
         crate::persist::save(&state)
     }
     pub fn retry_message(&mut self) {
-        if let Some(outbox) = &mut self.outbox {
-            outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Sending;
-            if self.requests.unbounded_send(BridgeRequest::SendMessage { seed: self.session_id.clone(), outbox: outbox.clone() }).is_err() {
-                outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Uncertain;
-                outbox.detail = "连接已关闭，请重新连接".into();
-            }
-        }
-    }
-    pub fn check_receipt(&self) {
-        if let Some(outbox) = &self.outbox {
-            let _ = self.requests.unbounded_send(BridgeRequest::Receipt { seed: self.session_id.clone(), command_id: outbox.command_id.clone() });
+        let (Some(outbox), Some(pending)) = (&mut self.outbox, &self.pending_send) else {
+            return;
+        };
+        outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Sending;
+        let request = qaqh_ringing_v3::CommandRequest::SendPrompt {
+            session_id: self.session_id.clone(),
+            input_id: pending.input_id.clone(),
+            text: pending.text.clone(),
+            attachments: pending.attachments.clone(),
+            images: pending.images.clone(),
+        };
+        if self
+            .requests
+            .unbounded_send(BridgeRequest::Command {
+                command_id: outbox.command_id.clone(),
+                request,
+            })
+            .is_err()
+        {
+            outbox.state = qaqh_gpui_wire::delivery::DeliveryState::Uncertain;
+            outbox.detail = "连接已关闭，请重新连接".into();
         }
     }
 
     /// 被拒/失败的消息恢复为草稿:outbox 清空,文本/图片/附件回填 composer。
     pub fn restore_outbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(outbox) = self.outbox.take() {
-            let text = outbox.message.text.clone();
+        self.outbox = None;
+        if let Some(pending) = self.pending_send.take() {
             self.composer.update(cx, |composer, cx| {
-                composer.set_value(text.as_str(), window, cx)
+                composer.set_value(pending.text.as_str(), window, cx)
             });
-            self.images = outbox.message.images;
-            self.attachments = outbox.message.attachments.unwrap_or_default();
+            self.images = pending.images;
+            self.attachments = pending.attachments;
         }
     }
 
-    pub fn respond_permission(
+    /// 交互处置(V3:审批/Ask 走同一条 `RespondInteraction` 命令)。
+    pub fn respond_interaction(
         &mut self,
-        tool_call_id: String,
-        approved: bool,
-        scope: Option<qaqh_ringing_contract::fact::PermissionGrantScope>,
+        interaction_id: &InteractionId,
+        resolution: qaqh_ringing_v3::CommandInteractionResolution,
     ) {
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::RespondPermission {
-                seed: self.session_id.clone(),
-                tool_call_id,
-                approved,
-                scope,
-            });
+        let _ = self.requests.unbounded_send(BridgeRequest::Command {
+            command_id: qaqh_gpui_wire::ids::new_id("cmd"),
+            request: qaqh_ringing_v3::CommandRequest::RespondInteraction {
+                session_id: self.session_id.clone(),
+                interaction_id: interaction_id.clone(),
+                resolution,
+            },
+        });
     }
 
     /// 撤回并重编辑(conversation.truncate):截断含指定回合及其后的所有历史,并回填输入框。
     pub fn truncate_turn(
         &mut self,
-        turn_id: String,
+        turn_id: TurnId,
         prefill_text: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -685,12 +786,12 @@ provider_retry: None,
             cx.notify();
             return;
         }
-        let _ = self.requests.unbounded_send(BridgeRequest::Command {
-            target: CommandTarget::Session {
+        let _ = self.requests.unbounded_send(BridgeRequest::Session(
+            SessionRequest::Truncate {
                 session_id: self.session_id.clone(),
+                turn_id,
             },
-            command: RingingCommand::ConversationTruncate { turn_id },
-        });
+        ));
         if let Some(text) = prefill_text {
             self.composer.update(cx, |composer, cx| {
                 composer.set_value(text.as_str(), window, cx);
@@ -701,20 +802,30 @@ provider_retry: None,
         cx.notify();
     }
 
-    /// goal 控制(ADR-0015):objective=创建/改目标;status=状态迁移;
-    /// token_budget 双层语义由命令面表达(这里 None = 不动)。
-    pub fn goal_set(&mut self, objective: Option<String>, status: Option<GoalStatus>, token_budget: Option<Option<u64>>) {
-        let _ = self.requests.unbounded_send(BridgeRequest::Command {
-            target: CommandTarget::Session { session_id: self.session_id.clone() },
-            command: RingingCommand::GoalSet { objective, status, token_budget },
-        });
+    /// goal 控制(ADR-0015):`SetGoal` 一次给齐正文/状态/预算(V3 语义)。
+    pub fn goal_set(&mut self, objective: String, status: GoalStatus, token_budget: Option<u64>) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Session(
+            SessionRequest::SetGoal {
+                session_id: self.session_id.clone(),
+                objective,
+                status: Some(status),
+                token_budget,
+            },
+        ));
+    }
+
+    /// 状态迁移:沿用当前目标正文,只改状态(`SetGoal` 是全量写)。
+    pub fn goal_transition(&mut self, status: GoalStatus) {
+        let Some(goal) = self.goal.clone() else { return };
+        self.goal_set(goal.objective, status, goal.token_budget);
     }
 
     pub fn goal_clear(&mut self) {
-        let _ = self.requests.unbounded_send(BridgeRequest::Command {
-            target: CommandTarget::Session { session_id: self.session_id.clone() },
-            command: RingingCommand::GoalClear {},
-        });
+        let _ = self.requests.unbounded_send(BridgeRequest::Session(
+            SessionRequest::ClearGoal {
+                session_id: self.session_id.clone(),
+            },
+        ));
     }
     fn new_ask_draft(
         interaction_id: &InteractionId,
@@ -955,7 +1066,7 @@ provider_retry: None,
         &mut self,
         interaction_id: &InteractionId,
         cx: &Context<Self>,
-    ) -> Option<Vec<qaqh_client::AskAnswer>> {
+    ) -> Option<Vec<AskAnswer>> {
         let index = self
             .ask_drafts
             .iter()
@@ -973,66 +1084,72 @@ provider_retry: None,
             } else {
                 draft.answers.get(position).cloned().flatten()?
             };
-            answers.push(qaqh_client::AskAnswer {
+            answers.push(AskAnswer {
                 question_id: id.clone(),
                 answer,
             });
         }
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::RespondAsk {
-                seed: self.session_id.clone(),
-                interaction_id: interaction_id.0.clone(),
+        self.respond_interaction(
+            interaction_id,
+            qaqh_ringing_v3::CommandInteractionResolution::Answer {
                 answers: answers.clone(),
-            });
+            },
+        );
         self.ask_hint = None;
         Some(answers)
     }
 
     pub fn ask_dismiss(&mut self, interaction_id: &InteractionId) {
         self.ask_hint = None;
-        let _ = self
-            .requests
-            .unbounded_send(BridgeRequest::DismissAsk {
-                seed: self.session_id.clone(),
-                interaction_id: interaction_id.0.clone(),
-            });
+        self.respond_interaction(
+            interaction_id,
+            qaqh_ringing_v3::CommandInteractionResolution::Dismiss,
+        );
     }
 
-    pub fn exec_control(&mut self, exec_id: String, terminate: bool) {
-        let _ = self.requests.unbounded_send(BridgeRequest::ExecControl {
-            exec_id,
-            terminate,
+    pub fn exec_control(&mut self, exec_id: ExecSessionId, terminate: bool) {
+        let request = if terminate {
+            qaqh_ringing_v3::CommandRequest::ExecTerminate {
+                exec_session_id: exec_id,
+            }
+        } else {
+            qaqh_ringing_v3::CommandRequest::ExecInterrupt {
+                exec_session_id: exec_id,
+            }
+        };
+        let _ = self.requests.unbounded_send(BridgeRequest::Command {
+            command_id: qaqh_gpui_wire::ids::new_id("cmd"),
+            request,
         });
     }
 
     /// handoff fork(v3.1a):从本会话的 handoff 工具事实创建交接会话。
     /// 载荷抄本会话 meta 的 cwd/model_selection(electron forkHandoffSession 同口径),
     /// title = work_summary,首消息 = 交接文档,handoff_from = 本会话(goal 工作链接缝)。
-    pub fn fork_handoff(&mut self, summary: Option<String>, doc: String) {
-        let meta = self.settings.as_ref().map(|settings| &settings.meta);
-        let _ = self.requests.unbounded_send(BridgeRequest::CreateSession {
-            cwd: meta.and_then(|meta| meta.cwd.clone()),
-            model_selection: meta.and_then(|meta| meta.model_selection.clone()),
-            tool_mode: None,
+    pub fn fork_handoff(&mut self, summary: Option<String>, doc: String, cx: &mut Context<Self>) {
+        // V3 的 `Create` 不带首消息:交接文档作为新会话的第一条 `SendPrompt`,
+        // 由壳层在 `Created` 回执后投递(`SessionNavEvent::HandoffFork`)。
+        cx.emit(SessionNavEvent::HandoffFork {
             title: summary,
-            first_message: Some(doc),
-            handoff_from: Some(self.session_id.clone()),
+            doc,
         });
     }
 
     /// ADR-0016 投影切换:跳后继会话(先通知壳层播飞箱，落位后再 Select)。
     pub fn open_handoff_successor(&mut self, cx: &mut Context<Self>) {
         if let Some(seal) = &self.handoff_seal {
+            let Ok(session_id) = SessionId::new(seal.successor_session_id.clone()) else {
+                return;
+            };
             cx.emit(SessionNavEvent::OpenSession {
-                session_id: seal.successor_session_id.clone(),
+                session_id,
                 fly_from_session: Some(self.session_id.clone()),
             });
         }
     }
 
     /// 跨会话导航(例如 B 侧「去源头」跳回 A 会话)。
-    pub fn open_session(&mut self, session_id: String, fly: bool, cx: &mut Context<Self>) {
+    pub fn open_session(&mut self, session_id: SessionId, fly: bool, cx: &mut Context<Self>) {
         cx.emit(SessionNavEvent::OpenSession {
             session_id,
             fly_from_session: fly.then(|| self.session_id.clone()),
@@ -1058,16 +1175,18 @@ provider_retry: None,
     }
 
     pub fn cancel_turn(&mut self) {
-        let _ = self.requests.unbounded_send(BridgeRequest::Cancel {
-            seed: self.session_id.clone(),
-            turn_id: self.current_turn_id.as_ref().map(|id| id.0.clone()),
+        let _ = self.requests.unbounded_send(BridgeRequest::Command {
+            command_id: qaqh_gpui_wire::ids::new_id("cmd"),
+            request: qaqh_ringing_v3::CommandRequest::CancelTurn {
+                session_id: self.session_id.clone(),
+            },
         });
     }
 
     /// 取消看门狗:after_ms 内无终态则桥线程通知 UI 本地收口 + 重灌快照。
     pub fn arm_cancel_watchdog(&self, after_ms: u64) {
         let _ = self.requests.unbounded_send(BridgeRequest::Watchdog {
-            seed: self.session_id.clone(),
+            label: self.session_id.as_str().to_owned(),
             after_ms,
         });
     }
@@ -1107,21 +1226,21 @@ provider_retry: None,
     /// 侧栏终态着色:本会话最近一回合的权威结果。Finished 无错 = ok(true),
     /// Interrupted 或带错 = bad(false);无终态回合 = None(保持 run-status 点)。
     pub fn last_turn_tone(&self) -> Option<bool> {
-        let outcome = &self.turns.iter().rev().find(|turn| turn.outcome.is_some())?.outcome;
-        outcome.as_ref().map(|outcome| match outcome {
-            qaqh_ringing_contract::state::TurnOutcome::Finished { error: None, .. } => true,
-            _ => false,
-        })
+        let terminal = &self.turns.iter().rev().find(|turn| turn.terminal.is_some())?.terminal;
+        terminal.as_ref().map(|terminal| terminal.is_success())
     }
 
     pub fn patch_settings(&mut self, patch: SessionSettingsPatch) {
         if let Some(settings) = &self.settings
             && !self.settings_pending
-            && self.requests.unbounded_send(BridgeRequest::PatchSessionSettings {
-                seed: self.session_id.clone(),
-                patch,
-                revision: settings.meta.settings_revision,
-            }).is_ok()
+            && self
+                .requests
+                .unbounded_send(BridgeRequest::Session(SessionRequest::PatchSettings {
+                    session_id: self.session_id.clone(),
+                    patch,
+                    expected_revision: settings.settings_revision,
+                }))
+                .is_ok()
         {
             self.settings_pending = true;
         }
@@ -1131,11 +1250,12 @@ provider_retry: None,
     pub fn effective_model_selection(&self) -> Option<ModelSelection> {
         self.settings
             .as_ref()
-            .and_then(|settings| settings.meta.model_selection.clone())
+            .and_then(|settings| settings.model_selection.clone())
             .or_else(|| {
                 self.catalog
                     .as_deref()
-                    .and_then(|catalog| catalog.default_model_selection.clone())
+                    .and_then(|catalog| catalog.default_model_selection.as_ref())
+                    .map(|m| selection_from_profile(m))
             })
     }
 
@@ -1146,16 +1266,19 @@ provider_retry: None,
         }
     }
 
-    pub fn patch_tools_mode(&mut self, name: String) {
-        self.patch_settings(SessionSettingsPatch {
-            tools: Some(ToolsSettingPatch::Preset { name }),
-            ..Default::default()
-        });
+    /// 工具模式切换(三档:Core/Standard/Custom;V3 不认压测档)。
+    pub fn patch_tool_mode(&mut self, mode: ToolMode) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Session(
+            SessionRequest::SetToolMode {
+                session_id: self.session_id.clone(),
+                mode,
+            },
+        ));
     }
 
     pub fn patch_model(&mut self, model: ModelSelection) {
         self.patch_settings(SessionSettingsPatch {
-            model_selection: Some(SettingValue::Use { value: model }),
+            model_selection: Some(SettingOverride::Use(model)),
             ..Default::default()
         });
     }
@@ -1169,7 +1292,7 @@ provider_retry: None,
         let custom_tools_val = self
             .settings
             .as_ref()
-            .map(|s| s.meta.custom_tools.join(", "))
+            .map(|s| s.custom_tools.join(", "))
             .unwrap_or_default();
 
         let max_out_input = match &self.model_params_max_output {
@@ -1212,24 +1335,26 @@ provider_retry: None,
 
     pub fn patch_custom_tools(&mut self, names: Vec<String>) {
         self.patch_settings(SessionSettingsPatch {
-            tools: Some(ToolsSettingPatch::Custom { names }),
+            tools: Some(qaqh_ringing_v3::ToolsSettingPatch::Custom { tools: names }),
             ..Default::default()
         });
     }
 
     /// 移入目标工作区分组。
-    pub fn move_to_workspace(&mut self, workspace_id: String) {
-        let _ = self.requests.unbounded_send(BridgeRequest::MoveSession {
-            seed: self.session_id.clone(),
-            workspace_id,
-        });
+    pub fn move_to_workspace(&mut self, workspace_id: WorkspaceId) {
+        let _ = self.requests.unbounded_send(BridgeRequest::Workspace(
+            qaqh_ringing_v3::WorkspaceRequest::MoveSession {
+                session_id: self.session_id.clone(),
+                workspace_id,
+            },
+        ));
     }
 
     /// 工作区目录尾段(供 TitleBar 面包屑与无标题降级)。
     pub fn workspace_tail(&self) -> Option<gpui_kit::SharedString> {
         self.settings
             .as_ref()
-            .and_then(|entry| entry.meta.cwd.as_deref())
+            .and_then(|entry| entry.cwd.as_deref())
             .filter(|cwd| !cwd.is_empty())
             .map(|cwd| {
                 let trimmed = cwd.trim_end_matches(['/', '\\']);
@@ -1252,31 +1377,89 @@ provider_retry: None,
     }
 
     pub fn is_running(&self) -> bool {
-        self.activity == Some(ActivityState::Running)
+        self.activity == ActivityState::Running
     }
 
-    /// 当前会话的上下文占用与请求缓存命中统计(直读 RingingV2 块/回合 usage 与模型目录窗口,零转换层)。
-    pub fn telemetry(&self) -> Option<SessionTelemetry> {
-        use qaqh_ringing_contract::state::TurnOutcome;
+    /// 向上翻页:以快照/上一页给出的最早 `ord` 为游标,请求更早的一页。
+    ///
+    /// `timeline_epoch` 由快照给出;失配时服务端回 `StaleCursor`,前端一律重取快照
+    /// (禁止拼接——拼出来的历史是错位的假历史)。
+    pub fn request_older(&mut self) {
+        if self.transcript_loading {
+            return;
+        }
+        let Some(before_ord) = self.transcript_before_ord else {
+            return;
+        };
+        if before_ord == 0 {
+            self.transcript_before_ord = None;
+            return;
+        }
+        self.transcript_loading = true;
+        let _ = self.requests.unbounded_send(BridgeRequest::LoadTranscript {
+            session_id: self.session_id.clone(),
+            before_ord,
+            limit: TAIL_PAGE,
+            timeline_epoch: self.timeline_epoch,
+        });
+    }
 
+    /// 内容引用 → 可渲染文本。
+    ///
+    /// `Inline` 直接给正文;`Windowed` 只给有界尾窗(权威全文另有出处);
+    /// `Blob` 未到货时给占位符并保持原样——到货后 `BridgeMsg::Blob` 会触发重渲染。
+    pub fn content_text(&self, content: &ContentRef) -> String {
+        match content {
+            ContentRef::Inline { text } => text.clone(),
+            ContentRef::Windowed {
+                preview,
+                total_bytes,
+                ..
+            } => format!("{preview}\n…（尾窗预览，共 {total_bytes} 字节）"),
+            ContentRef::Blob { hash, .. } => match self.blobs.get(hash) {
+                Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                None => crate::timeline::CONTENT_LOADING.to_owned(),
+            },
+        }
+    }
+
+    /// 扫描块/工具/待发图片/执行会话里的大内容引用,对首次见到的哈希发一次 `FetchBlob`。
+    /// 快照、增量块、工具视图更新后调用;重复调用无副作用(幂等)。
+    pub fn prefetch_blobs(&mut self) {
+        let wanted = collect_blob_hashes(
+            &self.entries,
+            &self.tools,
+            &self.images,
+            &self.attachments,
+            &self.exec_sessions,
+        );
+        for hash in wanted {
+            if self.blobs.want(&hash) {
+                let _ = self.requests.unbounded_send(BridgeRequest::FetchBlob(hash));
+            }
+        }
+    }
+
+    /// 当前会话的上下文占用与请求缓存命中统计(直读 V3 块/回合 usage 与模型目录窗口,零转换层)。
+    pub fn telemetry(&self) -> Option<SessionTelemetry> {
         let last_block = self.entries.iter().rev().find_map(|entry| match entry {
-            TimelineEntry::AssistantBlock {
-                turn_id,
-                model,
+            BlockView {
+                turn_id: Some(turn_id),
+                kind: BlockKind::Answer | BlockKind::Reasoning,
+                model: Some(model),
                 usage: Some(usage),
                 ..
             } => Some((turn_id, model.as_str(), usage)),
             _ => None,
         });
-        let last_turn = self.turns.iter().rev().find_map(|turn| match &turn.outcome {
-            Some(TurnOutcome::Finished {
-                usage: Some(usage), ..
-            }) => Some((&turn.turn_id, usage)),
-            _ => None,
-        });
+        let last_turn = self
+            .turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.usage.as_ref().map(|usage| (&turn.turn_id, usage)));
 
         let turn_pos = |id: &TurnId| self.turns.iter().position(|turn| &turn.turn_id == id);
-        let (latest_usage, latest_model): (&qaqh_ringing_contract::fact::UsageInfo, Option<&str>) =
+        let (latest_usage, latest_model): (&UsageInfo, Option<&str>) =
             match (last_block, last_turn) {
                 (Some((b_turn, b_model, b_usage)), Some((t_turn, t_usage))) => {
                     match (turn_pos(b_turn), turn_pos(t_turn)) {
@@ -1293,7 +1476,7 @@ provider_retry: None,
             let from_settings = self
                 .settings
                 .as_ref()
-                .and_then(|s| s.meta.model_selection.as_ref())
+                .and_then(|s| s.model_selection.as_ref())
                 .and_then(|sel| {
                     catalog
                         .providers
@@ -1315,18 +1498,23 @@ provider_retry: None,
 
         let used_tokens = usage_total_input(latest_usage);
         let used_pct = context_window
-            .and_then(|window| qaqh_types::ContextUsage::new(used_tokens, window))
-            .map(|ctx| ctx.used_pct());
+            .filter(|&window| window > 0)
+            .map(|window| {
+                ((used_tokens as f64 / window as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as u8
+            });
         let latest_cache = usage_cache_stats(latest_usage);
 
-        // 同一回合末轮的 usage 会同时落到末个 AssistantBlock 与 TurnOutcome 上,按 turn_id 去重。
+        // 同一回合末轮的 usage 会同时落到末个助手块与回合摘要上,按 turn_id 去重。
         let mut turns_with_block_usage: HashSet<&TurnId> = HashSet::new();
         let mut usage_requests: usize = 0;
         let mut cum_hit: u64 = 0;
         let mut cum_total: u64 = 0;
         for entry in &self.entries {
-            if let TimelineEntry::AssistantBlock {
-                turn_id,
+            if let BlockView {
+                turn_id: Some(turn_id),
+                kind: BlockKind::Answer | BlockKind::Reasoning,
                 usage: Some(usage),
                 ..
             } = entry
@@ -1341,9 +1529,7 @@ provider_retry: None,
         }
         for turn in &self.turns {
             if !turns_with_block_usage.contains(&turn.turn_id)
-                && let Some(TurnOutcome::Finished {
-                    usage: Some(usage), ..
-                }) = &turn.outcome
+                && let Some(usage) = &turn.usage
             {
                 usage_requests += 1;
                 if let Some(stats) = usage_cache_stats(usage) {
@@ -1364,9 +1550,9 @@ provider_retry: None,
             used_tokens,
             context_window,
             used_pct,
-            prompt_tokens: latest_usage.prompt_tokens,
-            completion_tokens: latest_usage.completion_tokens,
-            reasoning_tokens: latest_usage.reasoning_tokens,
+            input_tokens: latest_usage.input_tokens,
+            output_tokens: latest_usage.output_tokens,
+            reasoning_tokens: latest_usage.reasoning_tokens.unwrap_or_default(),
             latest_cache,
             cumulative_cache,
             usage_requests,
@@ -1384,46 +1570,30 @@ pub struct CacheHitStats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTelemetry {
-    pub used_tokens: u32,
+    pub used_tokens: u64,
     pub context_window: Option<u32>,
     pub used_pct: Option<u8>,
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub reasoning_tokens: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
     pub latest_cache: Option<CacheHitStats>,
     pub cumulative_cache: Option<CacheHitStats>,
     pub usage_requests: usize,
 }
 
-/// 单次请求输入上下文总量(与后端 `qaqh_agent_runtime::handoff::total_input` 同口径)。
-pub fn usage_total_input(usage: &qaqh_ringing_contract::fact::UsageInfo) -> u32 {
-    let cached = usage
-        .prompt_cache_hit_tokens
-        .saturating_add(usage.prompt_cache_miss_tokens);
-    if cached > 0 {
-        cached
-    } else {
-        usage.prompt_tokens
-    }
+/// 单次请求输入上下文总量(V3 `UsageInfo.input_tokens` 即权威口径)。
+pub fn usage_total_input(usage: &UsageInfo) -> u64 {
+    usage.input_tokens
 }
 
-/// 缓存命中率统计(仅在服务商明确上报缓存字段或命中/未命中非零时返回 `Some`,区分 0% 命中与未上报)。
-pub fn usage_cache_stats(usage: &qaqh_ringing_contract::fact::UsageInfo) -> Option<CacheHitStats> {
-    let cache_total = u64::from(usage.prompt_cache_hit_tokens)
-        .saturating_add(u64::from(usage.prompt_cache_miss_tokens));
-    let reported = usage.cache_usage_reported == Some(true) || cache_total > 0;
-    if !reported {
-        return None;
-    }
-    let denom = if cache_total > 0 {
-        cache_total
-    } else {
-        u64::from(usage.prompt_tokens)
-    };
+/// 缓存命中率统计(仅在服务商明确上报 `cached_input_tokens` 时返回 `Some`,
+/// 从而区分「0% 命中」与「未上报」)。
+pub fn usage_cache_stats(usage: &UsageInfo) -> Option<CacheHitStats> {
+    let hit = usage.cached_input_tokens?;
+    let denom = usage.input_tokens;
     if denom == 0 {
         return None;
     }
-    let hit = u64::from(usage.prompt_cache_hit_tokens);
     let hit_pct = ((hit as f64 / denom as f64) * 100.0)
         .round()
         .clamp(0.0, 100.0) as u8;
@@ -1434,54 +1604,82 @@ pub fn usage_cache_stats(usage: &qaqh_ringing_contract::fact::UsageInfo) -> Opti
     })
 }
 
+/// 会话模型选项(目录里能被解析的模型;会话绑定本身用 V3 `ModelSelection`)。
 pub fn model_options_from(catalog: &ProfilesDocument) -> Vec<ModelSelection> {
-    catalog.providers.iter().flat_map(|(provider_id, provider)| {
-        provider.models.keys().map(move |model_id| ModelSelection {
-            provider_id: provider_id.clone(),
-            model_id: model_id.clone(),
-            options: Default::default(),
+    catalog
+        .providers
+        .iter()
+        .flat_map(|(provider_id, provider)| {
+            provider
+                .models
+                .keys()
+                .map(move |model_id| ModelSelection {
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
+                    options: Default::default(),
+                })
         })
-    }).filter(|model| qaqh_profile::resolve_model_selection(catalog, model).is_ok()).collect()
+        .filter(|model| {
+            qaqh_profile::resolve_model_selection(catalog, &profile_selection(model)).is_ok()
+        })
+        .collect()
 }
 
-/// `session.list` 侧栏条目:契约类型直用,status/updated_at 不经字符串化。
+/// 配置文档的模型选择 → V3 会话绑定(同名字段跨 crate 的唯二接缝之一)。
+pub fn selection_from_profile(selection: &qaqh_profile::ModelSelection) -> ModelSelection {
+    ModelSelection {
+        provider_id: selection.provider_id.clone(),
+        model_id: selection.model_id.clone(),
+        options: qaqh_core_vocab::ModelSelectionOptions {
+            max_output_tokens: selection.options.max_output_tokens,
+            reasoning_effort: selection.options.reasoning_effort.clone(),
+            native_web_search: selection.options.native_web_search,
+        },
+    }
+}
+
+/// V3 会话绑定 → 配置文档的模型选择(目录解析/预设匹配用)。
+pub fn profile_selection(selection: &ModelSelection) -> qaqh_profile::ModelSelection {
+    qaqh_profile::ModelSelection {
+        provider_id: selection.provider_id.clone(),
+        model_id: selection.model_id.clone(),
+        options: qaqh_profile::model::ModelSelectionOptions {
+            max_output_tokens: selection.options.max_output_tokens,
+            reasoning_effort: selection.options.reasoning_effort.clone(),
+            native_web_search: selection.options.native_web_search,
+        },
+    }
+}
+
+/// `session.list` 侧栏条目:V3 `SessionSummary` 直读,只为分组排序保留需要的字段。
 #[derive(Clone)]
 pub struct SessionRow {
-    pub id: String,
+    pub id: SessionId,
     pub title: String,
-    /// meta.updated_at 原样。注意:**后端给的是秒**(list 投影把
-    /// updated_at_ms/1000),只可同单位比较,不能当毫秒展示——侧栏
-    /// 「N 天前」的老 bug 就是把它当毫秒算的单位错位。
-    pub updated_at: u64,
-    /// 创建时刻(Unix 毫秒):DB `created_at_ms` 真值优先,`ses_<ULID>`
-    /// 自解码兜底;0 = 两者皆不可得。仅排序用。
     pub created_at_ms: u64,
-    pub status: SessionRunStatus,
-    pub workspace_id: Option<String>,
+    /// V3 已修正为毫秒(`SessionSummary.updated_at_ms`)。
+    pub updated_at_ms: u64,
+    pub activity: ActivityState,
+    pub workspace_id: Option<WorkspaceId>,
     pub cwd: Option<String>,
     pub archived: bool,
-    pub handoff_from_session_id: Option<String>,
+    pub handoff_from: Option<SessionId>,
 }
 
-pub fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
-    entries.iter()
-        .map(|entry| SessionRow {
-            id: entry.meta.session_id.clone(),
-            title: entry.meta.title.clone().unwrap_or_else(|| "(无标题)".into()),
-            updated_at: entry.meta.updated_at,
-            created_at_ms: entry
-                .meta
-                .created_at_ms
-                .filter(|ms| *ms > 0)
-                .or_else(|| session_created_at_ms(&entry.meta.session_id))
-                .unwrap_or(0),
-            status: entry.status,
-            workspace_id: entry.workspace_id.clone(),
-            cwd: entry.meta.cwd.clone(),
-            archived: entry.meta.archived,
-            handoff_from_session_id: entry.meta.handoff_from_session_id.clone(),
+pub fn rows_from(sessions: &[SessionSummary]) -> Vec<SessionRow> {
+    sessions
+        .iter()
+        .map(|session| SessionRow {
+            id: session.session_id.clone(),
+            title: session.title.clone().unwrap_or_else(|| "(无标题)".into()),
+            created_at_ms: session.created_at_ms,
+            updated_at_ms: session.updated_at_ms,
+            activity: session.activity,
+            workspace_id: session.workspace_id.clone(),
+            cwd: session.cwd.clone(),
+            archived: session.archived,
+            handoff_from: session.handoff_from.clone(),
         })
-        .filter(|row| !row.id.is_empty())
         .collect()
 }
 
@@ -1494,7 +1692,7 @@ pub struct TodoRow {
     pub evidence: Option<String>,
 }
 
-pub fn todos_from(value: &qaqh_ringing_contract::todo::TodoListSnapshot) -> Vec<TodoRow> {
+pub fn todos_from(value: &qaqh_ringing_v3::TodoListSnapshot) -> Vec<TodoRow> {
     value.items.iter()
         .map(|item| TodoRow {
             title: item.title.clone(),
@@ -1507,7 +1705,7 @@ pub fn todos_from(value: &qaqh_ringing_contract::todo::TodoListSnapshot) -> Vec<
 
 /// 侧栏分组:workspace order 决定组序,组内 updated_at 降序;未分组兜底。
 pub struct WorkspaceGroup {
-    pub id: Option<String>,
+    pub id: Option<WorkspaceId>,
     pub title: String,
     pub rows: Vec<SessionRow>,
 }
@@ -1517,8 +1715,8 @@ pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<Wor
     for row in sessions {
         let workspace = row
             .workspace_id
-            .as_deref()
-            .and_then(|id| workspaces.iter().find(|entry| entry.id == id));
+            .as_ref()
+            .and_then(|id| workspaces.iter().find(|entry| &entry.id == id));
         match ordered
             .iter_mut()
             .find(|(entry, _)| *entry == workspace)
@@ -1532,17 +1730,12 @@ pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<Wor
         .into_iter()
         .map(|(entry, rows)| {
             let mut rows: Vec<SessionRow> = rows.into_iter().cloned().collect();
-            // 组内新→旧:优先毫秒创建时刻(id 自解码兜底),旧数据退回
-            // updated_at(秒 ×1000 归一到毫秒量纲);决胜键 session_id 字典序
-            // (electron 同款绝对确定性排序)。
-            let recency = |row: &SessionRow| {
-                if row.created_at_ms > 0 {
-                    row.created_at_ms
-                } else {
-                    row.updated_at.saturating_mul(1000)
-                }
-            };
-            rows.sort_by(|a, b| recency(b).cmp(&recency(a)).then_with(|| a.id.cmp(&b.id)));
+            // 组内新→旧:创建时刻(毫秒)降序,决胜键 session_id 字典序(绝对确定性排序)。
+            rows.sort_by(|a, b| {
+                b.created_at_ms
+                    .cmp(&a.created_at_ms)
+                    .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+            });
             WorkspaceGroup {
                 id: entry.map(|entry| entry.id.clone()),
                 title: entry.map(|entry| entry.title.clone()).unwrap_or_else(|| "未分组".into()),
@@ -1552,116 +1745,134 @@ pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<Wor
         .collect()
 }
 
-/// `ses_<ULID>` 会话 id → 创建时刻(Unix 毫秒)。
-///
-/// 生成规则在后端 qaqh-session/src/manager.rs `allocate_session` =
-/// `ses_` + Crockford base32(26 字符),载荷是 UUIDv7 的 16 字节
-/// (qaqh-ringing-contract/src/ulid.rs `generate_ulid`),前 48 bit 即 Unix
-/// 毫秒。这里只解码前 10 个字符(50 bit,时间戳占高 48);异形 id 一律 None。
-pub fn session_created_at_ms(session_id: &str) -> Option<u64> {
-    let ulid = session_id.strip_prefix("ses_")?;
-    let bytes = ulid.as_bytes();
-    if bytes.len() != 26 {
-        return None;
+fn collect_blob_hashes(
+    entries: &[BlockView],
+    tools: &[ToolCallView],
+    images: &[ImageRefView],
+    attachments: &[ContentRef],
+    exec_sessions: &[ExecSessionSnapshot],
+) -> Vec<qaqh_core_vocab::ContentHash> {
+    let mut wanted = Vec::new();
+    for block in entries {
+        if let ContentRef::Blob { hash, .. } = &block.content {
+            wanted.push(*hash);
+        }
+        for attachment in &block.attachments {
+            if let ContentRef::Blob { hash, .. } = attachment {
+                wanted.push(*hash);
+            }
+        }
+        wanted.extend(block.images.iter().map(|image| image.hash));
     }
-    let mut ts: u64 = 0;
-    for &ch in &bytes[..10] {
-        let up = ch.to_ascii_uppercase();
-        let v = match up {
-            b'0'..=b'9' => u64::from(up - b'0'),
-            b'A'..=b'H' => u64::from(up - b'A' + 10),
-            b'J' | b'K' => u64::from(up - b'J' + 18),
-            b'M' | b'N' => u64::from(up - b'M' + 20),
-            b'P'..=b'T' => u64::from(up - b'P' + 22),
-            b'V'..=b'Z' => u64::from(up - b'V' + 27),
-            // Crockford 易混容错:I/L→1、O→0;U 不在字母表。
-            b'I' | b'L' => 1,
-            b'O' => 0,
-            _ => return None,
-        };
-        ts = (ts << 5) | v;
+    for tool in tools {
+        for content in [&tool.args, &tool.output, &tool.diff].into_iter().flatten() {
+            if let ContentRef::Blob { hash, .. } = content {
+                wanted.push(*hash);
+            }
+        }
     }
-    // 首字符只带 3 个有效位(26×5=130 > 128,网格顶 2 位恒 0),前 10 字符
-    // 累出的 50 bit 里时间戳正好占低 48 位,无需再移位。
-    Some(ts)
+    wanted.extend(images.iter().map(|image| image.hash));
+    for attachment in attachments {
+        if let ContentRef::Blob { hash, .. } = attachment {
+            wanted.push(*hash);
+        }
+    }
+    for exec in exec_sessions {
+        if let Some(ContentRef::Blob { hash, .. }) = &exec.output {
+            wanted.push(*hash);
+        }
+    }
+    wanted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 复刻后端 ulid.rs 的 Crockford 编码,验证解码往返一致。
-    fn encode_ulid(bytes: [u8; 16]) -> String {
-        const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-        let value = u128::from_be_bytes(bytes);
-        let mut out = String::with_capacity(26);
-        for position in (0..26).rev() {
-            let index = ((value >> (position * 5)) & 0x1f) as usize;
-            out.push(ALPHABET[index] as char);
-        }
-        out
+    #[test]
+    fn collect_blob_hashes_includes_pending_images_attachments_and_exec_outputs() {
+        let img_hash = qaqh_core_vocab::ContentHash::from_bytes([1u8; 32]);
+        let att_hash = qaqh_core_vocab::ContentHash::from_bytes([2u8; 32]);
+        let exec_hash = qaqh_core_vocab::ContentHash::from_bytes([3u8; 32]);
+        let images = vec![ImageRefView {
+            hash: img_hash,
+            len: 4,
+            mime_type: "image/png".into(),
+        }];
+        let attachments = vec![ContentRef::Blob {
+            hash: att_hash,
+            len: 8,
+        }];
+        let exec_sessions = vec![ExecSessionSnapshot {
+            exec_session_id: qaqh_core_vocab::ExecSessionId::new("exec_1").expect("exec id"),
+            command: "echo hi".into(),
+            tty: false,
+            finished: true,
+            exit_code: Some(0),
+            next_offset: 3,
+            output: Some(ContentRef::Blob {
+                hash: exec_hash,
+                len: 3,
+            }),
+            state: qaqh_ringing_v3::ExecSessionStateView::Finished {
+                outcome: qaqh_ringing_v3::ExecOutcomeView::Exited { exit_code: 0 },
+            },
+            owner_session_id: SessionId::new("ses_1").expect("sid"),
+            origin_turn_id: None,
+            origin_call_id: None,
+            cwd: None,
+            started_at_ms: 0,
+            finished_at_ms: Some(1),
+            output_preview: String::new(),
+            preview_start_offset: 0,
+            output_complete: true,
+            capture_omitted_bytes: 0,
+            stream_dropped_bytes: 0,
+        }];
+        let hashes = collect_blob_hashes(&[], &[], &images, &attachments, &exec_sessions);
+        assert_eq!(hashes, vec![img_hash, att_hash, exec_hash]);
     }
 
     #[test]
-    fn decodes_creation_ms_from_ses_ulid() {
-        // UUIDv7 前 6 字节 = Unix 毫秒(48 bit),剩余 80 bit 随机位不影响。
-        let ms: u64 = 1_700_000_000_123;
-        let be = ms.to_be_bytes();
-        let mut bytes = [0u8; 16];
-        bytes[..6].copy_from_slice(&be[2..]);
-        bytes[6] = 0x70; // v7 版本位,形状保真即可。
-        let id = format!("ses_{}", encode_ulid(bytes));
-        assert_eq!(session_created_at_ms(&id), Some(ms));
-    }
-
-    #[test]
-    fn rejects_foreign_ids() {
-        assert_eq!(session_created_at_ms("ses_short"), None);
-        assert_eq!(session_created_at_ms("0123abcd-uuid-shape"), None);
-        assert_eq!(session_created_at_ms(""), None);
-    }
-
-    #[test]
-    fn groups_sort_prefers_created_ms_then_updated_fallback() {
-        let mk = |id: &str, updated_at: u64, created_at_ms: u64| SessionRow {
-            id: id.into(),
+    fn groups_sort_by_created_ms_then_id() {
+        let mk = |id: &str, created_at_ms: u64| SessionRow {
+            id: SessionId::new(id).expect("id"),
             title: String::new(),
-            updated_at,
             created_at_ms,
-            status: SessionRunStatus::NotRunning,
+            updated_at_ms: created_at_ms,
+            activity: ActivityState::Idle,
             workspace_id: None,
             cwd: None,
             archived: false,
-            handoff_from_session_id: None,
+            handoff_from: None,
         };
-        // ses_a 只有毫秒创建时刻,ses_b 是老数据(仅秒制 updated_at):
-        // 200_000ms > 100s×1000,新会话排前。
-        let old = mk("ses_b", 100, 0);
-        let new = mk("ses_a", 0, 200_000);
+        let old = mk("ses_b", 100_000);
+        let new = mk("ses_a", 200_000);
         let grouped = groups(&[old, new], &[]);
-        let ids: Vec<_> = grouped[0].rows.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<_> = grouped[0]
+            .rows
+            .iter()
+            .map(|row| row.id.as_str().to_owned())
+            .collect();
         assert_eq!(ids, ["ses_a", "ses_b"]);
     }
 
     #[test]
     fn telemetry_usage_input_and_cache_stats_contract() {
-        use qaqh_ringing_contract::fact::UsageInfo;
-
         let unreported = UsageInfo {
-            prompt_tokens: 1_200,
-            completion_tokens: 300,
-            total_tokens: 1_500,
-            ..Default::default()
+            input_tokens: 1_200,
+            output_tokens: 300,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
         };
         assert_eq!(usage_total_input(&unreported), 1_200);
         assert_eq!(usage_cache_stats(&unreported), None);
 
         let zero_hit = UsageInfo {
-            prompt_tokens: 1_000,
-            prompt_cache_hit_tokens: 0,
-            prompt_cache_miss_tokens: 1_000,
-            cache_usage_reported: Some(true),
-            ..Default::default()
+            input_tokens: 1_000,
+            output_tokens: 0,
+            cached_input_tokens: Some(0),
+            reasoning_tokens: None,
         };
         assert_eq!(usage_total_input(&zero_hit), 1_000);
         assert_eq!(
@@ -1674,11 +1885,10 @@ mod tests {
         );
 
         let high_hit = UsageInfo {
-            prompt_tokens: 100_000,
-            prompt_cache_hit_tokens: 85_000,
-            prompt_cache_miss_tokens: 15_000,
-            cache_usage_reported: Some(true),
-            ..Default::default()
+            input_tokens: 100_000,
+            output_tokens: 0,
+            cached_input_tokens: Some(85_000),
+            reasoning_tokens: None,
         };
         assert_eq!(usage_total_input(&high_hit), 100_000);
         assert_eq!(
@@ -1722,20 +1932,14 @@ pub struct AccountSignIn {
 
 impl AccountSignIn {
     pub fn poll_request(&self) -> BridgeRequest {
-        let (method, params) = match self.service {
-            AccountService::Siwc => (
-                "siwc.sign_in.status",
-                serde_json::json!({ "flow_id": self.flow_id }),
-            ),
-            AccountService::Dsaccount => (
-                "dsaccount.sign_in.status",
-                serde_json::Value::Object(Default::default()),
-            ),
-        };
-        BridgeRequest::Service {
-            method: method.into(),
-            params,
-        }
+        BridgeRequest::Account(match self.service {
+            AccountService::Siwc => AccountRequest::SiwcSignInPoll {
+                flow_id: self.flow_id.clone(),
+            },
+            AccountService::Dsaccount => AccountRequest::DsSignInPoll {
+                attempt_id: self.flow_id.clone(),
+            },
+        })
     }
 }
 
@@ -1748,16 +1952,16 @@ pub fn next_option<'a, T: PartialEq>(options: &'a [T], current: Option<&T>) -> O
 }
 
 pub fn next_model<'a>(
-    options: &'a [qaqh_types::ModelSelection],
-    current: Option<&qaqh_types::ModelSelection>,
-) -> Option<&'a qaqh_types::ModelSelection> {
+    options: &'a [ModelSelection],
+    current: Option<&ModelSelection>,
+) -> Option<&'a ModelSelection> {
     let current = current.and_then(|current| options.iter().find(|model| {
         model.provider_id == current.provider_id && model.model_id == current.model_id
     }));
     next_option(options, current)
 }
 
-pub fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaqh_types::ModelSelection) -> Vec<String> {
+pub fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &ModelSelection) -> Vec<String> {
     catalog.providers.get(&model.provider_id)
         .and_then(|provider| provider.models.get(&model.model_id))
         .filter(|model| model.capabilities.reasoning)
@@ -1766,7 +1970,7 @@ pub fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaq
 
 pub fn model_default_effort(
     catalog: &qaqh_profile::ProfilesDocument,
-    model: &qaqh_types::ModelSelection,
+    model: &ModelSelection,
 ) -> Option<String> {
     catalog
         .providers

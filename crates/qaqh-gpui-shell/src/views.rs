@@ -12,6 +12,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable, Size, WindowExt as _};
 use gpui_kit::assets::IconName;
 use qaqh_profile::ConfigPatch;
+use qaqh_ringing_v3::ConfigRequest;
 use qaqh_gpui_kit::kit::{
     BtnKind, RADIUS_CHIP, RADIUS_CONTROL, button, pill, segmented_item, segmented_strip,
     stage_surface,
@@ -24,7 +25,6 @@ use qaqh_gpui_kit::settings::{self, Density, MotionLevel, TerminalScheme};
 use qaqh_gpui_kit::theme::{ActiveTheme, Palette, ThemeMode, ThemePreset};
 use qaqh_gpui_session::store::{SessionRow, SettingsEditor};
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
-use qaqh_types::SessionRunStatus;
 
 use crate::daemon::DaemonStore;
 
@@ -41,14 +41,15 @@ pub(crate) fn sidebar_row(
     animate_motion: bool,
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement {
-    let dot = match row.status {
-        SessionRunStatus::Running => Some((t.accent, animate_motion)),
-        SessionRunStatus::WaitingUser => Some((t.warn, animate_motion)),
+    let dot = match row.activity {
+        qaqh_core_vocab::ActivityState::Running => Some((t.accent, animate_motion)),
+        qaqh_core_vocab::ActivityState::WaitingUser
+        | qaqh_core_vocab::ActivityState::Cancelling => Some((t.warn, animate_motion)),
         _ if tone == Some(false) => Some((t.bad, false)),
         _ => None,
     };
-    let anchor_id = row.id.clone();
-    let lineage_badge = row.handoff_from_session_id.as_ref().map(|_| {
+    let anchor_id = row.id.as_str().to_owned();
+    let lineage_badge = row.handoff_from.as_ref().map(|_| {
         let tip = match &parent_title {
             Some(title) if !title.is_empty() => format!("交接自「{title}」"),
             _ => "由上游会话交接而来".to_owned(),
@@ -103,7 +104,7 @@ pub(crate) fn sidebar_row(
                 .flex_shrink_0()
                 .text_xs()
                 .text_color(t.faint)
-                .child(qaqh_gpui_kit::kit::relative_time(row.updated_at)),
+                .child(qaqh_gpui_kit::kit::relative_time(row.updated_at_ms / 1000)),
         )
         .child(qaqh_gpui_session::handoff::anchor_probe(move |bounds| {
             anchors.record_sidebar_row(&anchor_id, bounds);
@@ -182,25 +183,17 @@ pub(crate) fn inspector_dock(
         .flex_col()
         .gap_1p5();
     for task in team_tasks {
-        use qaqh_ringing_contract::team::task_types::TaskState;
+        use qaqh_ringing_v3::TaskState;
         let (led, color) = match task.state {
             TaskState::Open => ("待认领", t.dim),
             TaskState::Claimed => ("进行中", t.accent),
-            TaskState::Completed | TaskState::Closed => ("已完结", t.ok),
+            TaskState::Completed => ("已完结", t.ok),
             TaskState::Cancelled => ("已取消", t.bad),
         };
         let owner = task
             .owner
-            .as_ref()
-            .map(|actor| {
-                actor
-                    .agent_path
-                    .as_str()
-                    .split('/')
-                    .next_back()
-                    .unwrap_or("root")
-                    .to_owned()
-            })
+            .as_deref()
+            .map(|actor| actor.split('/').next_back().unwrap_or("root").to_owned())
             .unwrap_or_else(|| "未认领".into());
         let mut meta = format!("{owner} · epoch {}", task.claim_epoch);
         if !task.depends_on.is_empty() {
@@ -637,31 +630,20 @@ pub(crate) fn settings_page(
             })
             .collect();
 
-        let reload_control: AnyElement = if daemon.current.is_some() {
-            button(
-                cx,
-                BtnKind::Soft,
-                "reload-agent-config",
-                "重载当前会话",
-                &t,
-                cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
-                    if let Some(current) = daemon.current.clone() {
-                        let session_id = current.read(cx).session_id.clone();
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
-                            target: qaqh_client::CommandTarget::Session { session_id },
-                            command: qaqh_client::RingingCommand::AgentReloadConfig,
-                        });
-                    }
-                    cx.notify();
-                }),
-            )
-        } else {
-            div()
-                .text_xs()
-                .text_color(t.faint)
-                .child("请先打开任意会话")
-                .into_any_element()
-        };
+        // V3 `config.reloadAgents` 是全局动作(全部会话代理配置 + MCP),不再按会话开。
+        let reload_control: AnyElement = button(
+            cx,
+            BtnKind::Soft,
+            "reload-agent-config",
+            "重载全部会话配置",
+            &t,
+            cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                let _ = daemon
+                    .requests
+                    .unbounded_send(BridgeRequest::Config(ConfigRequest::ReloadAgents));
+                cx.notify();
+            }),
+        );
 
         let reconnect_control = button(
             cx,
@@ -953,12 +935,12 @@ pub(crate) fn permission_row(
                     config.permission_level == level,
                     t,
                     cx.listener(move |daemon: &mut DaemonStore, _, _, _| {
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::SaveConfig(
-                            ConfigPatch {
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(crate::daemon::config_patch_request(&ConfigPatch {
                                 permission_level: Some(u64::from(level)),
                                 ..Default::default()
-                            },
-                        ));
+                            }));
                     }),
                 )
             });

@@ -3,6 +3,8 @@
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
 use qaqh_gpui_shell::daemon::DaemonStore;
 use qaqh_gpui_session::store::StreamState;
+use qaqh_core_vocab::{BlockId, SessionId};
+use qaqh_ringing_v3::{BlockKind, ConfigRequest};
 use gpui_kit::Context;
 use serde::Deserialize;
 use serde_json::json;
@@ -30,7 +32,6 @@ enum Action {
     Send,
     FailSend,
     Retry,
-    Receipt,
     Reconnect,
     Refill,
     LongSession {
@@ -74,7 +75,12 @@ pub fn poll(
             Ok(control) if control.sequence > SEQUENCE.load(Ordering::Relaxed) => {
                 SEQUENCE.store(control.sequence, Ordering::Relaxed);
                 match control.action {
-                    Action::Select { session_id } => daemon.select(session_id, window, cx),
+                    Action::Select { session_id } => {
+                        let Ok(session_id) = SessionId::new(session_id) else {
+                            return;
+                        };
+                        daemon.select(session_id, window, cx);
+                    }
                     Action::Reconnect => {
                         let _ = daemon.requests.unbounded_send(BridgeRequest::Reconnect);
                     }
@@ -87,8 +93,12 @@ pub fn poll(
                         daemon.new_session_open = false;
                         daemon.settings_editor = qaqh_gpui_session::store::SettingsEditor::Catalog;
                         daemon.settings_form = None;
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(BridgeRequest::Config(ConfigRequest::LoadFull));
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(BridgeRequest::Config(ConfigRequest::ListProviders));
                     }
                     Action::NewSession => {
                         daemon.open_startup(None, window, cx);
@@ -124,14 +134,13 @@ pub fn poll(
                                 Action::Send => { if let Some(reason) = store.composer_send(cx) { error = Some(reason.to_string()); } },
                                 Action::FailSend => store.simulate_closed_bridge(cx),
                                 Action::Retry => store.retry_message(),
-                                Action::Receipt => store.check_receipt(),
                                 Action::Refill => { store.snapshot_pending = true; let _ = store.requests().unbounded_send(BridgeRequest::Refill(store.session_id.clone())); },
-                                Action::Attach { path } => { store.attachment_pending = true; let _ = store.requests().unbounded_send(BridgeRequest::AttachFile { seed: store.session_id.clone(), path }); },
+                                Action::Attach { path } => { store.attachment_pending = true; let _ = store.requests().unbounded_send(BridgeRequest::AttachFile { session_id: store.session_id.clone(), path }); },
                                 Action::LongSession { entries } => {
-                                    let template = store.entries.iter().find(|entry| matches!(entry, qaqh_ringing_contract::state::TimelineEntry::Input { .. })).cloned().expect("real input fixture");
+                                    let template = store.entries.iter().find(|entry| entry.kind == BlockKind::User).cloned().expect("real input fixture");
                                     for index in 0..entries {
                                         let mut entry = template.clone();
-                                        if let qaqh_ringing_contract::state::TimelineEntry::Input { block_id, .. } = &mut entry { *block_id = qaqh_ringing_contract::fact::BlockId::new(format!("load-{index}")); }
+                                        entry.block_id = BlockId::new(format!("load-{index}")).expect("验收块 id 合法");
                                         store.entries.push(entry);
                                     }
                                     store.timeline_list.reset(store.entries.len() + 1);
@@ -154,7 +163,7 @@ pub fn poll(
         let store = store.read(cx);
         json!({"id": store.session_id, "draft":store.composer.read(cx).value().to_string(),"entries":store.entries.len(),
             "snapshot_pending":store.snapshot_pending,"stream_open":matches!(store.stream, StreamState::Open),
-            "outbox":store.outbox,"client_session_id":store.client_session_id,
+            "outbox":store.outbox,
             "images":store.images.len(),"attachments":store.attachments.len(),"attachment_pending":store.attachment_pending,
             "error":store.operation_error})
     });

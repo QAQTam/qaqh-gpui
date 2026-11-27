@@ -1,14 +1,17 @@
 //! Local workbench persistence, deliberately separate from daemon business state.
 use qaqh_gpui_wire::delivery::{DeliveryState, Outbox};
-use qaqh_client::{ContentRef, ImageBlock};
+use qaqh_core_vocab::ContentRef;
+use qaqh_ringing_v3::ImageRefView;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Draft {
     pub text: String,
-    pub images: Vec<ImageBlock>,
+    pub images: Vec<ImageRefView>,
     pub attachments: Vec<ContentRef>,
+    #[serde(default)]
+    pub pending_send: Option<crate::store::PendingSend>,
     pub outbox: Option<Outbox>,
     pub local_root: Option<PathBuf>,
 }
@@ -25,7 +28,7 @@ pub struct Workbench {
     pub collapsed: Vec<String>,
 }
 
-fn new_client_instance_id() -> String { qaqh_ringing_contract::ulid::generate_ulid() }
+fn new_client_instance_id() -> String { qaqh_gpui_wire::ids::new_id("wb") }
 
 impl Default for Workbench {
     fn default() -> Self {

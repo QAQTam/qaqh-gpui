@@ -19,14 +19,14 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
-use qaqh_ringing_contract::fact::{
-    ActorKind, AssistantBlockKind, BlockId, ContentValue, InputPurpose, InteractionKind,
-    PermissionGrantScope, ToolCallId, TurnId,
+use qaqh_core_vocab::{
+    ActivityState, BlockId, ContentRef, PermissionGrantScope, ToolCallId, TurnId,
 };
-use qaqh_ringing_contract::state::{
-    ExecSessionState, TimelineEntry, ToolCallState, ToolCallView,
+use qaqh_ringing_v3::{
+    BlockActor, BlockKind, BlockView, ChoiceTone, CommandInteractionResolution,
+    ExecSessionStateView, InputPurpose, InteractionDecisionKind, InteractionKind, ToolCallStatus,
+    ToolCallView,
 };
-use qaqh_types::{SessionRunStatus, ToolCallOutcome};
 
 use qaqh_gpui_kit::icons::{AppIcon, command_icon, render_app_icon};
 use qaqh_gpui_kit::kit::{
@@ -455,12 +455,12 @@ fn todo_floating_card(
     )
 }
 
-pub(crate) fn content_text(value: &ContentValue) -> &str {
-    match value {
-        ContentValue::Inline { text } => text,
-        ContentValue::Ref { .. } => "引用内容（未加载）",
-        ContentValue::Unavailable(_) => "内容不可用",
-    }
+/// 大内容未到货时的占位(blob 帧到达后重渲染)。
+pub(crate) const CONTENT_LOADING: &str = "内容加载中…";
+
+/// 内容引用 → 可渲染文本(blob 走 store 的字节缓存)。
+pub(crate) fn content_text(store: &SessionStore, content: &ContentRef) -> String {
+    store.content_text(content)
 }
 
 /// 视图投影条目:单条、连续成功工具归组(展开模式)、或限高过程轨迹视窗(折叠模式)。
@@ -486,41 +486,50 @@ pub(crate) struct TimelineProjection {
 }
 
 fn find_tool<'a>(store: &'a SessionStore, call_id: &ToolCallId) -> Option<&'a ToolCallView> {
-    store.tools.iter().find(|tool| &tool.call_id == call_id)
+    store.tools.iter().find(|tool| &tool.tool_call_id == call_id)
 }
 
-fn is_trace_foldable_tool_view(tool: &ToolCallView) -> bool {
-    if crate::store::handoff_facts(tool).is_some() || todo_card_data(tool).is_some() {
+/// 工具参数 → JSON 对象(V3 参数是 `ContentRef`;大参数走 blob 时要等字节到货)。
+fn tool_args(store: &SessionStore, tool: &ToolCallView) -> Option<serde_json::Value> {
+    serde_json::from_str(&store.content_text(tool.args.as_ref()?)).ok()
+}
+
+fn is_trace_foldable_tool_view(store: &SessionStore, tool: &ToolCallView) -> bool {
+    if crate::store::handoff_facts(tool, |content| store.content_text(content)).is_some()
+        || todo_card_data(store, tool).is_some()
+    {
         return false;
     }
-    !matches!(tool.state, ToolCallState::AwaitingInteraction { .. })
+    tool.status != ToolCallStatus::AwaitingInteraction
 }
 
-fn is_groupable_tool(store: &SessionStore, entry: &TimelineEntry) -> bool {
-    let TimelineEntry::ToolCall { call_id, .. } = entry else {
+fn is_groupable_tool(store: &SessionStore, block: &BlockView) -> bool {
+    if block.kind != BlockKind::ToolCall {
+        return false;
+    }
+    let Some(call_id) = block.tool_call_id.as_ref() else {
         return false;
     };
     let Some(tool) = find_tool(store, call_id) else {
         return false;
     };
-    if crate::store::handoff_facts(tool).is_some() || todo_card_data(tool).is_some() {
+    if crate::store::handoff_facts(tool, |content| store.content_text(content)).is_some()
+        || todo_card_data(store, tool).is_some()
+    {
         return false;
     }
-    matches!(
-        &tool.state,
-        ToolCallState::Finished { outcome } if outcome.is_success()
-    )
+    tool.status == ToolCallStatus::Succeeded
 }
 
 fn has_live_answer_stream(store: &SessionStore) -> bool {
     store.streaming.iter().any(|(_, kind, text)| {
-        *kind == AssistantBlockKind::Answer && has_assistant_text(*kind, text)
+        *kind == BlockKind::Answer && has_assistant_text(*kind, text)
     })
 }
 
 fn has_live_foldable_tail(store: &SessionStore) -> bool {
     let has_live_reasoning = store.streaming.iter().any(|(_, kind, text)| {
-        *kind != AssistantBlockKind::Answer && has_assistant_text(*kind, text)
+        *kind != BlockKind::Answer && has_assistant_text(*kind, text)
     });
     if has_live_reasoning || !store.arg_stream.is_empty() {
         return true;
@@ -528,33 +537,24 @@ fn has_live_foldable_tail(store: &SessionStore) -> bool {
     let referenced: HashSet<&ToolCallId> = store
         .entries
         .iter()
-        .filter_map(|entry| match entry {
-            TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
-            _ => None,
-        })
+        .filter_map(|block| block.tool_call_id.as_ref())
         .collect();
     store
         .tools
         .iter()
-        .any(|tool| !referenced.contains(&tool.call_id) && is_trace_foldable_tool_view(tool))
+        .any(|tool| {
+            !referenced.contains(&tool.tool_call_id) && is_trace_foldable_tool_view(store, tool)
+        })
 }
 
-fn entry_turn_id(entry: &TimelineEntry) -> Option<TurnId> {
-    match entry {
-        TimelineEntry::Input { turn_id, .. }
-        | TimelineEntry::ToolCall { turn_id, .. }
-        | TimelineEntry::ToolResult { turn_id, .. } => turn_id.clone(),
-        TimelineEntry::AssistantBlock { turn_id, .. } => Some(turn_id.clone()),
-        TimelineEntry::Compaction { .. } => None,
-    }
+fn entry_turn_id(block: &BlockView) -> Option<TurnId> {
+    block.turn_id.clone()
 }
 
-fn is_user_turn_trigger(entry: &TimelineEntry) -> bool {
-    matches!(
-        entry,
-        TimelineEntry::Input { actor, purpose, .. }
-            if actor.kind == ActorKind::User && *purpose == InputPurpose::TriggerTurn
-    )
+fn is_user_turn_trigger(block: &BlockView) -> bool {
+    block.kind == BlockKind::User
+        && block.actor == Some(BlockActor::User)
+        && block.purpose == Some(InputPurpose::TriggerTurn)
 }
 
 pub(crate) fn build_timeline_items(
@@ -578,7 +578,7 @@ pub(crate) fn build_timeline_items(
         };
 
         for (index, entry) in store.entries.iter().enumerate() {
-            if hidden_timeline_entry(entry) {
+            if hidden_timeline_entry(store, entry) {
                 continue;
             }
             if is_groupable_tool(store, entry) {
@@ -629,11 +629,11 @@ pub(crate) fn build_timeline_items(
             (turn_start..turn_end).rev().find(|&idx| {
                 matches!(
                     store.entries.get(idx),
-                    Some(TimelineEntry::AssistantBlock {
-                        block_kind: AssistantBlockKind::Answer,
+                    Some(BlockView {
+                        kind: BlockKind::Answer,
                         content,
                         ..
-                    }) if has_assistant_text(AssistantBlockKind::Answer, content_text(content))
+                    }) if has_assistant_text(BlockKind::Answer, &content_text(store, content))
                 )
             })
         };
@@ -659,20 +659,18 @@ pub(crate) fn build_timeline_items(
             let Some(entry) = store.entries.get(index) else {
                 continue;
             };
-            if hidden_timeline_entry(entry) {
+            if hidden_timeline_entry(store, entry) {
                 continue;
             }
-            let foldable = match entry {
-                TimelineEntry::AssistantBlock { block_kind, .. } => match block_kind {
-                    AssistantBlockKind::Reasoning | AssistantBlockKind::ToolCall => true,
-                    AssistantBlockKind::Answer => Some(index) != promoted_answer_idx,
-                },
-                TimelineEntry::ToolCall { call_id, .. } => {
-                    find_tool(store, call_id).is_some_and(is_trace_foldable_tool_view)
-                }
-                TimelineEntry::Input { .. }
-                | TimelineEntry::Compaction { .. }
-                | TimelineEntry::ToolResult { .. } => false,
+            let foldable = match entry.kind {
+                BlockKind::ToolCall => entry
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|call_id| find_tool(store, call_id))
+                    .is_some_and(|tool| is_trace_foldable_tool_view(store, tool)),
+                BlockKind::Reasoning => true,
+                BlockKind::Answer => Some(index) != promoted_answer_idx,
+                BlockKind::User | BlockKind::ToolResult | BlockKind::System => false,
             };
 
             if foldable {
@@ -760,67 +758,56 @@ fn copy_conversation_chip(entity: &Entity<SessionStore>, t: &Palette) -> AnyElem
         .into_any_element()
 }
 
-fn state_label(state: &ToolCallState) -> &'static str {
-    match state {
-        ToolCallState::Declared => "已就绪",
-        ToolCallState::AwaitingInteraction { .. } => "等待确认",
-        ToolCallState::Running => "执行中",
-        ToolCallState::Cancelling => "取消中",
-        ToolCallState::Finished { outcome } => match outcome {
-            ToolCallOutcome::Completed => "已完成",
-            ToolCallOutcome::Yielded { .. } => "后台运行",
-            ToolCallOutcome::Failed { .. } => "失败",
-            ToolCallOutcome::Cancelled { .. } => "已取消",
-            ToolCallOutcome::Interrupted { .. } => "已中断",
-        },
-    }
-}
-
-fn state_color(state: &ToolCallState, t: &Palette) -> Hsla {
-    match state {
-        ToolCallState::Declared => t.dim,
-        ToolCallState::AwaitingInteraction { .. } => t.warn,
-        ToolCallState::Running => t.accent,
-        ToolCallState::Cancelling => t.warn,
-        ToolCallState::Finished { outcome } => match outcome {
-            ToolCallOutcome::Completed => t.ok,
-            ToolCallOutcome::Yielded { .. } => t.accent,
-            ToolCallOutcome::Failed { .. } => t.bad,
-            ToolCallOutcome::Cancelled { .. } | ToolCallOutcome::Interrupted { .. } => t.dim,
-        },
-    }
-}
-
-fn exec_state_label(state: &ExecSessionState, t: &Palette) -> (&'static str, Hsla) {
-    match state {
-        ExecSessionState::Running => ("运行中", t.accent),
-        ExecSessionState::Stopping { .. } => ("停止中", t.warn),
-        ExecSessionState::Finished { .. } => ("已结束", t.dim),
-    }
-}
-
-/// 会话运行状态的语义色:运行 accent,等待/取消 warn,空闲/未运行 dim。
-pub fn status_color(status: SessionRunStatus, t: &Palette) -> Hsla {
+fn state_label(status: ToolCallStatus) -> &'static str {
     match status {
-        SessionRunStatus::Running => t.accent,
-        SessionRunStatus::WaitingUser | SessionRunStatus::Cancelling => t.warn,
-        SessionRunStatus::Idle | SessionRunStatus::NotRunning => t.dim,
+        ToolCallStatus::Pending => "已就绪",
+        ToolCallStatus::AwaitingInteraction => "等待确认",
+        ToolCallStatus::Running => "执行中",
+        ToolCallStatus::Cancelling => "取消中",
+        ToolCallStatus::Succeeded => "已完成",
+        ToolCallStatus::Failed => "失败",
+        ToolCallStatus::Cancelled => "已取消",
+        ToolCallStatus::Indeterminate => "结果未知",
     }
 }
 
-/// 侧栏状态点:运行/待响应/取消中高亮,空闲置灰,未加载不显示。
-pub fn status_dot(status: SessionRunStatus, t: &Palette) -> Div {
+fn state_color(status: ToolCallStatus, t: &Palette) -> Hsla {
+    match status {
+        ToolCallStatus::Pending => t.dim,
+        ToolCallStatus::AwaitingInteraction | ToolCallStatus::Cancelling => t.warn,
+        ToolCallStatus::Running => t.accent,
+        ToolCallStatus::Succeeded => t.ok,
+        ToolCallStatus::Failed => t.bad,
+        ToolCallStatus::Cancelled | ToolCallStatus::Indeterminate => t.dim,
+    }
+}
+
+fn exec_state_label(state: &ExecSessionStateView, t: &Palette) -> (&'static str, Hsla) {
+    match state {
+        ExecSessionStateView::Running => ("运行中", t.accent),
+        ExecSessionStateView::Stopping { .. } => ("停止中", t.warn),
+        ExecSessionStateView::Finished { .. } => ("已结束", t.dim),
+    }
+}
+
+/// 会话活动状态的语义色:运行 accent,等待/取消 warn,空闲 dim。
+pub fn status_color(status: ActivityState, t: &Palette) -> Hsla {
+    match status {
+        ActivityState::Running => t.accent,
+        ActivityState::WaitingUser | ActivityState::Cancelling => t.warn,
+        ActivityState::Idle => t.dim,
+    }
+}
+
+/// 侧栏状态点:运行/待响应/取消中高亮,空闲置灰。
+pub fn status_dot(status: ActivityState, t: &Palette) -> Div {
     let color = status_color(status, t);
     let label = match status {
-        SessionRunStatus::Running => "运行中",
-        SessionRunStatus::WaitingUser => "待响应",
-        SessionRunStatus::Cancelling => "取消中",
-        SessionRunStatus::Idle => "空闲",
-        SessionRunStatus::NotRunning => "",
+        ActivityState::Running => "运行中",
+        ActivityState::WaitingUser => "待响应",
+        ActivityState::Cancelling => "取消中",
+        ActivityState::Idle => "空闲",
     };
-    if label.is_empty() {
-        return div();
-    }
     div()
         .flex()
         .items_center()
@@ -920,7 +907,7 @@ fn utf8_tail(text: &str, max_bytes: usize) -> (&str, bool) {
     (text.split_at(start).1, true)
 }
 
-fn tool_summary(name: &str, state: &ToolCallState) -> Option<&'static str> {
+fn tool_summary(name: &str, status: ToolCallStatus) -> Option<&'static str> {
     let (active, done) = match name {
         "todo_write" => ("正在创建待办", "已创建待办"),
         "todo_update" => ("正在更新待办", "已更新待办"),
@@ -955,10 +942,10 @@ fn tool_summary(name: &str, state: &ToolCallState) -> Option<&'static str> {
         "get_goal" => ("正在读取目标", "已读取目标"),
         _ => return None,
     };
-    match state {
-        ToolCallState::Finished { outcome } => outcome.is_success().then_some(done),
-        ToolCallState::Declared | ToolCallState::Running => Some(active),
-        ToolCallState::AwaitingInteraction { .. } if name == "ask" => Some(active),
+    match status {
+        ToolCallStatus::Succeeded => Some(done),
+        ToolCallStatus::Pending | ToolCallStatus::Running => Some(active),
+        ToolCallStatus::AwaitingInteraction if name == "ask" => Some(active),
         _ => None,
     }
 }
@@ -983,16 +970,21 @@ fn summarize_burst(store: &SessionStore, indices: &[usize]) -> String {
     let (mut cmds, mut files, mut searches, mut todos, mut agents, mut others) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for &idx in indices {
-        let Some(TimelineEntry::ToolCall { call_id, .. }) = store.entries.get(idx) else {
+        let Some(call_id) = store
+            .entries
+            .get(idx)
+            .filter(|block| block.kind == BlockKind::ToolCall)
+            .and_then(|block| block.tool_call_id.as_ref())
+        else {
             continue;
         };
-        let Some(tool) = store.tools.iter().find(|t| &t.call_id == call_id) else {
+        let Some(tool) = store.tools.iter().find(|t| &t.tool_call_id == call_id) else {
             others += 1;
             continue;
         };
-        let name = tool.tool_name.as_deref().unwrap_or("");
+        let name = tool.tool_name.as_str();
         let is_exec = name == "exec_command"
-            || store.exec_sessions.iter().any(|e| e.origin_call_id == tool.call_id);
+            || store.exec_sessions.iter().any(|e| e.origin_call_id.as_ref() == Some(&tool.tool_call_id));
         if is_exec {
             cmds += 1;
         } else if matches!(name, "edit" | "apply_patch" | "write" | "delete") {
@@ -1051,9 +1043,9 @@ fn tool_status_only(name: &str) -> bool {
     )
 }
 
-fn tool_status_line(name: &str, title: String, state: &ToolCallState, t: &Palette) -> Div {
+fn tool_status_line(name: &str, title: String, status: ToolCallStatus, t: &Palette) -> Div {
     let icon = tool_category_icon(name, false);
-    let color = state_color(state, t);
+    let color = state_color(status, t);
     div()
         .px_2p5()
         .py_1()
@@ -1068,21 +1060,19 @@ fn tool_status_line(name: &str, title: String, state: &ToolCallState, t: &Palett
 }
 
 /// 折叠行状态 icon:loader(运行时旋转)/圈对/圈叹号。
-fn tool_status_icon(call_id: &ToolCallId, state: &ToolCallState, t: &Palette) -> AnyElement {
-    let (name, spin) = match state {
-        ToolCallState::Finished { outcome } if outcome.is_success() => {
-            (IconName::CircleCheck, false)
-        }
-        ToolCallState::Finished { .. } => (IconName::CircleAlert, false),
-        ToolCallState::Declared => (IconName::LoaderCircle, false),
+fn tool_status_icon(call_id: &ToolCallId, status: ToolCallStatus, t: &Palette) -> AnyElement {
+    let (name, spin) = match status {
+        ToolCallStatus::Succeeded => (IconName::CircleCheck, false),
+        ToolCallStatus::Failed | ToolCallStatus::Cancelled => (IconName::CircleAlert, false),
+        ToolCallStatus::Pending => (IconName::LoaderCircle, false),
         _ => (IconName::LoaderCircle, true),
     };
     let icon = Icon::new(name)
         .with_size(Size::XSmall)
-        .text_color(state_color(state, t));
+        .text_color(state_color(status, t));
     if spin {
         icon.with_animation(
-            SharedString::from(format!("tool-spin-{}", call_id.0)),
+            SharedString::from(format!("tool-spin-{}", call_id.as_str())),
             Animation::new(std::time::Duration::from_millis(900)).repeat(),
             |icon, value| icon.rotate(gpui_kit::Radians(value * std::f32::consts::TAU)),
         )
@@ -1120,7 +1110,7 @@ fn tool_toggle(
     let entity = entity.downgrade();
     let call_id = call_id.clone();
     div()
-        .id(SharedString::from(format!("tool-toggle-{}", call_id.0)))
+        .id(SharedString::from(format!("tool-toggle-{}", call_id.as_str())))
         .flex()
         .items_center()
         .gap_2()
@@ -1149,7 +1139,7 @@ fn tool_toggle(
                 .child(div().text_color(t.bad).child(format!("−{removed}")))
         }))
         .child(spring_chevron(
-            SharedString::from(format!("tool-chev-{}", call_id.0)),
+            SharedString::from(format!("tool-chev-{}", call_id.as_str())),
             expanded,
             t.faint,
             animate_motion,
@@ -1315,18 +1305,16 @@ fn parse_todo_card_item(raw: &serde_json::Value) -> Option<TodoCardItem> {
 
 /// 仅当 todo 写操作处于成功终态且入参可解析时返回时间线原位快照卡片数据;
 /// 只读 `todo_list` / 非成功终态 / 解析失败一律返回 `None` 回退普通状态行。
-fn todo_card_data(tool: &ToolCallView) -> Option<TodoCardData> {
-    let name = tool.tool_name.as_deref()?;
+fn todo_card_data(store: &SessionStore, tool: &ToolCallView) -> Option<TodoCardData> {
+    let name = tool.tool_name.as_str();
     if !matches!(name, "todo" | "todo_write" | "todo_create" | "todo_update") {
         return None;
     }
-    if !matches!(
-        &tool.state,
-        ToolCallState::Finished { outcome } if outcome.is_success()
-    ) {
+    if tool.status != ToolCallStatus::Succeeded {
         return None;
     }
-    let args = tool.args.as_ref()?.as_object()?;
+    let args = tool_args(store, tool)?;
+    let args = args.as_object()?;
     if let Some(list_text) = args.get("list").and_then(|v| v.as_str()) {
         let parsed = parse_todo_list_text(list_text)?;
         if parsed.is_empty() {
@@ -1386,7 +1374,7 @@ fn render_inline_todo_card(
         } => {
             let (status_label, status_color) = todo_status_label(status, t);
             let icon_el = todo_status_icon(
-                SharedString::from(format!("todo-inline-spin-{}", tool.call_id.0)),
+                SharedString::from(format!("todo-inline-spin-{}", tool.tool_call_id.as_str())),
                 status,
                 animate_motion,
                 t,
@@ -1476,12 +1464,12 @@ fn render_inline_todo_card(
             } else {
                 done as f32 / total as f32
             };
-            let is_open = (total <= 12) ^ store.toggled_todo_cards.contains(&tool.call_id);
-            let call_id = tool.call_id.clone();
+            let is_open = (total <= 12) ^ store.toggled_todo_cards.contains(&tool.tool_call_id);
+            let call_id = tool.tool_call_id.clone();
             let toggle_entity = entity.clone();
 
             let header = div()
-                .id(SharedString::from(format!("todo-inline-toggle-{}", tool.call_id.0)))
+                .id(SharedString::from(format!("todo-inline-toggle-{}", tool.tool_call_id.as_str())))
                 .px_3()
                 .py_1p5()
                 .bg(t.surface_subtle)
@@ -1555,7 +1543,7 @@ fn render_inline_todo_card(
 
             if is_open {
                 let mut list = div()
-                    .id(SharedString::from(format!("todo-inline-list-{}", tool.call_id.0)))
+                    .id(SharedString::from(format!("todo-inline-list-{}", tool.tool_call_id.as_str())))
                     .max_h(px(264.))
                     .overflow_y_scroll()
                     .px_2()
@@ -1567,7 +1555,7 @@ fn render_inline_todo_card(
                 for (idx, item) in items.into_iter().enumerate() {
                     let settled = item.status == "completed" || item.status == "cancelled";
                     let icon_el = todo_status_icon(
-                        SharedString::from(format!("todo-inline-spin-{}-{idx}", tool.call_id.0)),
+                        SharedString::from(format!("todo-inline-spin-{}-{idx}", tool.tool_call_id.as_str())),
                         item.status,
                         animate_motion,
                         t,
@@ -1580,7 +1568,7 @@ fn render_inline_todo_card(
                         div()
                             .id(SharedString::from(format!(
                                 "todo-inline-row-{}-{idx}",
-                                tool.call_id.0
+                                tool.tool_call_id.as_str()
                             )))
                             .px_1p5()
                             .py_1()
@@ -1667,56 +1655,54 @@ fn tool_card(
     t: &Palette,
     tail_max: usize,
 ) -> Div {
-    let name = tool.tool_name.as_deref().unwrap_or("(未知工具)");
+    let name = tool.tool_name.as_str();
+    let args = tool_args(store, tool);
     let exec = store
         .exec_sessions
         .iter()
-        .find(|exec| exec.origin_call_id == tool.call_id);
+        .find(|exec| exec.origin_call_id.as_ref() == Some(&tool.tool_call_id));
     let is_exec = exec.is_some() || name == "exec_command";
     let command = if let Some(exec) = exec {
         Some(exec.command.as_str())
     } else if is_exec {
-        tool.args.as_ref().and_then(|args| args.get("cmd")?.as_str())
+        args.as_ref().and_then(|args| args.get("cmd")?.as_str())
     } else {
         None
     };
     let (status, status_color) = if let Some(exec) = exec {
         exec_state_label(&exec.state, t)
     } else {
-        (state_label(&tool.state), state_color(&tool.state, t))
+        (state_label(tool.status), state_color(tool.status, t))
     };
-    let fork_suffix = fork_suffix(name, tool.args.as_ref());
+    let fork_suffix = fork_suffix(name, args.as_ref());
     let title = if let Some(command) = command {
         let command = command.replace(['\r', '\n'], " ");
         format!("$ {command}  ·  {status}")
-    } else if let Some(summary) = tool_summary(name, &tool.state) {
+    } else if let Some(summary) = tool_summary(name, tool.status) {
         format!("{summary}{fork_suffix}")
     } else {
         format!("{name}  ·  {status}{fork_suffix}")
     };
-    if let Some(data) = todo_card_data(tool) {
+    if let Some(data) = todo_card_data(store, tool) {
         let animate_motion = effective_motion(cx) != MotionLevel::Off;
         return render_inline_todo_card(store, entity, tool, name, data, animate_motion, t);
     }
     if tool_status_only(name) {
-        return tool_status_line(name, title, &tool.state, t);
+        return tool_status_line(name, title, tool.status, t);
     }
-    let expanded = store.expanded_tools.contains(&tool.call_id);
+    let expanded = store.expanded_tools.contains(&tool.tool_call_id);
     let delta = tool
         .code_delta
         .as_ref()
-        .map(|d| (d.lines_added, d.lines_removed));
+        .map(|d| (d.lines_added as usize, d.lines_removed as usize));
     let animate_motion = effective_motion(cx) != MotionLevel::Off;
-    let shell = tool
-        .args
-        .as_ref()
-        .and_then(|args| args.get("shell")?.as_str());
+    let shell = args.as_ref().and_then(|args| args.get("shell")?.as_str());
     let category = tool_exec_icon(name, is_exec, command, shell);
     let header = tool_toggle(
         entity,
-        &tool.call_id,
+        &tool.tool_call_id,
         expanded,
-        tool_status_icon(&tool.call_id, &tool.state, t),
+        tool_status_icon(&tool.tool_call_id, tool.status, t),
         category,
         title,
         delta,
@@ -1754,7 +1740,7 @@ fn tool_card(
         );
 
     let mut body = div().flex().flex_col().gap_2().p_3().min_w_0();
-    if !is_exec && let Some(args) = &tool.args {
+    if !is_exec && let Some(args) = &args {
         body = body.children(args_summary(args).map(|summary| {
             div()
                 .px_2p5()
@@ -1768,35 +1754,45 @@ fn tool_card(
                 .child(SharedString::from(summary))
         }));
     }
-    let raw_output = if let Some(exec) = exec {
+    let raw_output: String = if let Some(exec) = exec {
         store
             .exec_output_tail
             .iter()
-            .find(|(id, end, text)| id == &exec.id && *end > exec.next_offset && !text.is_empty())
-            .map_or(exec.output_preview.as_str(), |(_, _, text)| text.as_str())
-    } else if matches!(tool.state, ToolCallState::Finished { .. }) {
-        tool.output.as_ref().map_or("", content_text)
+            .find(|(id, end, text)| {
+                id == &exec.exec_session_id && *end > exec.next_offset && !text.is_empty()
+            })
+            .map_or_else(
+                || exec.output_preview.clone(),
+                |(_, _, text)| text.clone(),
+            )
+    } else if is_terminal_status(tool.status) {
+        tool.output
+            .as_ref()
+            .map(|content| store.content_text(content))
+            .unwrap_or_default()
     } else {
         store
             .output_tail
             .iter()
-            .find(|(call_id, _)| call_id == &tool.call_id)
-            .map_or("", |(_, tail)| tail.as_str())
+            .find(|(call_id, _)| call_id == &tool.tool_call_id)
+            .map(|(_, tail)| tail.clone())
+            .unwrap_or_default()
     };
     let result = if is_exec && exec.is_none() {
-        serde_json::from_str::<serde_json::Value>(raw_output).ok()
+        serde_json::from_str::<serde_json::Value>(&raw_output).ok()
     } else {
         None
     };
     let output = result
         .as_ref()
         .and_then(|result| result.get("output")?.as_str())
+        .map(str::to_owned)
         .unwrap_or(raw_output);
-    let (output, truncated) = utf8_tail(output, tail_max);
+    let (output, truncated) = utf8_tail(&output, tail_max);
     if !output.is_empty() {
         body = body.child(
             div()
-                .id(SharedString::from(format!("tool-output-{}", tool.call_id.0)))
+                .id(SharedString::from(format!("tool-output-{}", tool.tool_call_id.as_str())))
                 .max_h(px(240.))
                 .overflow_y_scroll()
                 .font_family(qaqh_gpui_kit::fonts::mono_font_family())
@@ -1823,12 +1819,12 @@ fn tool_card(
         }
     }
     if let Some(exec) = exec
-        && !exec.state.is_terminal()
+        && !exec.finished
     {
-        let id = exec.id.0.clone();
+        let id = exec.exec_session_id.as_str().to_owned();
         let control = |terminate| {
             let entity = entity.downgrade();
-            let exec_id = id.clone();
+            let exec_id = exec.exec_session_id.clone();
             move |_: &ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 let _ = entity.update(cx, |store, _| store.exec_control(exec_id.clone(), terminate));
             }
@@ -1856,8 +1852,8 @@ fn tool_card(
         );
     }
     if let Some(exec) = exec {
-        let exec_id = exec.id.0.clone();
-        let exec_handle = exec.id.clone();
+        let exec_id = exec.exec_session_id.as_str().to_owned();
+        let exec_handle = exec.exec_session_id.clone();
         let entity = entity.downgrade();
         body = body.child(
             div()
@@ -1973,8 +1969,12 @@ fn tool_burst_card(
                 .flex_col()
                 .gap_1();
             for &idx in &indices_owned {
-                if let Some(TimelineEntry::ToolCall { call_id, .. }) = store.entries.get(idx)
-                    && let Some(tool) = store.tools.iter().find(|tool| &tool.call_id == call_id)
+                if let Some(call_id) = store
+                    .entries
+                    .get(idx)
+                    .filter(|block| block.kind == BlockKind::ToolCall)
+                    .and_then(|block| block.tool_call_id.as_ref())
+                    && let Some(tool) = store.tools.iter().find(|tool| &tool.tool_call_id == call_id)
                 {
                     spine = spine.child(tool_card(
                         cx,
@@ -2038,19 +2038,22 @@ fn work_trace_elapsed_ms(
     let mut gen_ms: u64 = 0;
     for &idx in indices {
         match store.entries.get(idx) {
-            Some(TimelineEntry::ToolCall { call_id, .. }) => {
-                if let Some(tool) = find_tool(store, call_id)
+            Some(block) if block.kind == BlockKind::ToolCall => {
+                if let Some(tool) = block.tool_call_id.as_ref().and_then(|id| find_tool(store, id))
                     && let Some(metrics) = &tool.metrics
                 {
-                    min_start = Some(min_start.map_or(metrics.started_at_ms, |v| v.min(metrics.started_at_ms)));
-                    max_end = Some(max_end.map_or(metrics.finished_at_ms, |v| v.max(metrics.finished_at_ms)));
+                    let started = metrics.started_at_ms as i64;
+                    let finished = if metrics.finished_at_ms == 0 {
+                        started
+                    } else {
+                        metrics.finished_at_ms as i64
+                    };
+                    min_start = Some(min_start.map_or(started, |v| v.min(started)));
+                    max_end = Some(max_end.map_or(finished, |v| v.max(finished)));
                 }
             }
-            Some(TimelineEntry::AssistantBlock {
-                generated_ms: Some(ms),
-                ..
-            }) => {
-                gen_ms = gen_ms.saturating_add(*ms);
+            Some(block) if block.generated_ms.is_some() => {
+                gen_ms = gen_ms.saturating_add(block.generated_ms.unwrap_or_default());
             }
             _ => {}
         }
@@ -2058,18 +2061,18 @@ fn work_trace_elapsed_ms(
     if let (Some(s), Some(e)) = (min_start, max_end)
         && e >= s
     {
-        return Some((e - s) as u64);
+        return Some((e - s).max(0) as u64);
     }
     (gen_ms > 0).then_some(gen_ms)
 }
 
 fn classify_tool_bucket(store: &SessionStore, tool: &ToolCallView) -> &'static str {
-    let name = tool.tool_name.as_deref().unwrap_or("");
+    let name = tool.tool_name.as_str();
     let is_exec = name == "exec_command"
         || store
             .exec_sessions
             .iter()
-            .any(|e| e.origin_call_id == tool.call_id);
+            .any(|e| e.origin_call_id.as_ref() == Some(&tool.tool_call_id));
     if is_exec {
         "cmd"
     } else if matches!(name, "edit" | "apply_patch" | "write" | "delete") {
@@ -2104,42 +2107,34 @@ fn summarize_work_trace(store: &SessionStore, indices: &[usize], attach_live: bo
     };
 
     for &idx in indices {
-        match store.entries.get(idx) {
-            Some(TimelineEntry::ToolCall { call_id, .. }) => {
-                if let Some(tool) = find_tool(store, call_id) {
-                    bump_tool(classify_tool_bucket(store, tool));
-                } else {
-                    bump_tool("other");
+        match store.entries.get(idx).map(|block| block.kind) {
+            Some(BlockKind::ToolCall) => {
+                let tool = store
+                    .entries
+                    .get(idx)
+                    .and_then(|block| block.tool_call_id.as_ref())
+                    .and_then(|call_id| find_tool(store, call_id));
+                match tool {
+                    Some(tool) => bump_tool(classify_tool_bucket(store, tool)),
+                    None => bump_tool("other"),
                 }
             }
-            Some(TimelineEntry::AssistantBlock {
-                block_kind: AssistantBlockKind::Reasoning,
-                ..
-            }) => reasonings += 1,
-            Some(TimelineEntry::AssistantBlock {
-                block_kind: AssistantBlockKind::Answer,
-                ..
-            }) => retracted_answers += 1,
+            Some(BlockKind::Reasoning) => reasonings += 1,
+            Some(BlockKind::Answer) => retracted_answers += 1,
             _ => {}
         }
     }
 
     if attach_live {
-        let referenced: HashSet<&ToolCallId> = store
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
-                _ => None,
-            })
-            .collect();
+        let referenced: HashSet<&ToolCallId> =
+            store.entries.iter().filter_map(|block| block.tool_call_id.as_ref()).collect();
         for (_, kind, text) in &store.streaming {
-            if *kind == AssistantBlockKind::Reasoning && has_assistant_text(*kind, text) {
+            if *kind == BlockKind::Reasoning && has_assistant_text(*kind, text) {
                 reasonings += 1;
             }
         }
         for tool in &store.tools {
-            if !referenced.contains(&tool.call_id) && is_trace_foldable_tool_view(tool) {
+            if !referenced.contains(&tool.tool_call_id) && is_trace_foldable_tool_view(store, tool) {
                 bump_tool(classify_tool_bucket(store, tool));
             }
         }
@@ -2202,9 +2197,9 @@ fn render_arg_stream_item(
         args_complete,
     } = stream;
     if tool_status_only(tool_name) {
-        let title = tool_summary(tool_name, &ToolCallState::Declared)
+        let title = tool_summary(tool_name, ToolCallStatus::Pending)
             .map_or_else(|| format!("正在准备 {tool_name}"), str::to_owned);
-        return tool_status_line(tool_name, title, &ToolCallState::Declared, t).into_any_element();
+        return tool_status_line(tool_name, title, ToolCallStatus::Pending, t).into_any_element();
     }
     let mut title = format!("正在准备 {tool_name}");
     if let Some((added, removed)) = lines {
@@ -2231,7 +2226,7 @@ fn render_arg_stream_item(
             entity,
             call_id,
             expanded,
-            tool_status_icon(call_id, &ToolCallState::Running, t),
+            tool_status_icon(call_id, ToolCallStatus::Running, t),
             tool_exec_icon(
                 tool_name,
                 tool_name == "exec_command",
@@ -2253,7 +2248,7 @@ fn render_arg_stream_item(
                 .text_xs()
                 .text_color(t.dim)
                 .max_h(px(240.))
-                .id(SharedString::from(format!("arg-stream-{}", call_id.0)))
+                .id(SharedString::from(format!("arg-stream-{}", call_id.as_str())))
                 .overflow_y_scroll()
                 .child(SharedString::from(text.clone()))
         }))
@@ -2294,13 +2289,13 @@ fn retracted_answer_row(
         (
             store.expanded_thinking.contains(block_id),
             preview,
-            SharedString::from(format!("md-retracted-{}-{}-{section}", store.session_id, block_id.0)),
+            SharedString::from(format!("md-retracted-{}-{}-{section}", store.session_id, block_id.as_str())),
             store.md_extensions.clone(),
         )
     };
     let toggle_block = block_id.clone();
     let header = div()
-        .id(SharedString::from(format!("retracted-toggle-{}", block_id.0)))
+        .id(SharedString::from(format!("retracted-toggle-{}", block_id.as_str())))
         .flex()
         .items_center()
         .gap_2()
@@ -2318,7 +2313,7 @@ fn retracted_answer_row(
         )
         .child(div().flex_1().min_w_0().truncate().child(SharedString::from(preview)))
         .child(spring_chevron(
-            SharedString::from(format!("retracted-chev-{}", block_id.0)),
+            SharedString::from(format!("retracted-chev-{}", block_id.as_str())),
             expanded,
             t.faint,
             animate_motion,
@@ -2336,7 +2331,7 @@ fn retracted_answer_row(
     let t_copy = *t;
     let ty_copy = *ty;
     let revealed = accordion_reveal(
-        SharedString::from(format!("retracted-reveal-{}", block_id.0)),
+        SharedString::from(format!("retracted-reveal-{}", block_id.as_str())),
         expanded,
         window,
         cx,
@@ -2345,7 +2340,7 @@ fn retracted_answer_row(
             let text = assistant_source_text(store, source);
             let body = crate::markdown::render_document(
                 md_key,
-                text,
+                &text,
                 &md_extensions,
                 entity_for_body.downgrade(),
                 &t_copy,
@@ -2529,7 +2524,7 @@ fn work_trace_card(
         enum TraceSlot {
             EntryTool(ToolCallId),
             Assistant {
-                kind: AssistantBlockKind,
+                kind: BlockKind,
                 source: AssistantSource,
                 live: bool,
                 section: usize,
@@ -2544,20 +2539,18 @@ fn work_trace_card(
             let mut slots = Vec::new();
             for &idx in &indices_owned {
                 match store.entries.get(idx) {
-                    Some(TimelineEntry::ToolCall { call_id, .. }) => {
-                        slots.push(TraceSlot::EntryTool(call_id.clone()));
+                    Some(block) if block.kind == BlockKind::ToolCall => {
+                        if let Some(call_id) = block.tool_call_id.as_ref() {
+                            slots.push(TraceSlot::EntryTool(call_id.clone()));
+                        }
                     }
-                    Some(TimelineEntry::AssistantBlock {
-                        block_id,
-                        block_kind,
-                        ..
-                    }) => {
+                    Some(block) if matches!(block.kind, BlockKind::Answer | BlockKind::Reasoning) => {
                         slots.push(TraceSlot::Assistant {
-                            kind: *block_kind,
+                            kind: block.kind,
                             source: AssistantSource::Entry(idx),
                             live: false,
                             section: idx * 2,
-                            block_id: block_id.clone(),
+                            block_id: block.block_id.clone(),
                         });
                     }
                     _ => {}
@@ -2565,7 +2558,7 @@ fn work_trace_card(
             }
             if attach_live_tail {
                 for (i, (block_id, kind, text)) in store.streaming.iter().enumerate() {
-                    if *kind != AssistantBlockKind::Answer && has_assistant_text(*kind, text) {
+                    if *kind != BlockKind::Answer && has_assistant_text(*kind, text) {
                         slots.push(TraceSlot::Assistant {
                             kind: *kind,
                             source: AssistantSource::Streaming(i),
@@ -2578,17 +2571,11 @@ fn work_trace_card(
                 for i in 0..store.arg_stream.len() {
                     slots.push(TraceSlot::ArgStream(i));
                 }
-                let referenced: HashSet<&ToolCallId> = store
-                    .entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
-                        _ => None,
-                    })
-                    .collect();
+                let referenced: HashSet<&ToolCallId> =
+                    store.entries.iter().filter_map(|block| block.tool_call_id.as_ref()).collect();
                 for tool in &store.tools {
-                    if !referenced.contains(&tool.call_id) && is_trace_foldable_tool_view(tool) {
-                        slots.push(TraceSlot::UnrefTool(tool.call_id.clone()));
+                    if !referenced.contains(&tool.tool_call_id) && is_trace_foldable_tool_view(store, tool) {
+                        slots.push(TraceSlot::UnrefTool(tool.tool_call_id.clone()));
                     }
                 }
             }
@@ -2607,7 +2594,7 @@ fn work_trace_card(
                     }
                 }
                 TraceSlot::Assistant {
-                    kind: AssistantBlockKind::Answer,
+                    kind: BlockKind::Answer,
                     source,
                     section,
                     block_id,
@@ -2742,19 +2729,28 @@ pub(crate) fn provider_retry_banner(store: &SessionStore, t: &Palette) -> Option
     )
 }
 
-fn has_assistant_text(kind: AssistantBlockKind, text: &str) -> bool {
-    kind != AssistantBlockKind::ToolCall && !text.trim().is_empty()
+fn is_terminal_status(status: ToolCallStatus) -> bool {
+    matches!(
+        status,
+        ToolCallStatus::Succeeded
+            | ToolCallStatus::Failed
+            | ToolCallStatus::Cancelled
+            | ToolCallStatus::Indeterminate
+    )
 }
 
-fn hidden_timeline_entry(entry: &TimelineEntry) -> bool {
-    match entry {
-        TimelineEntry::ToolResult { .. } => true,
-        TimelineEntry::AssistantBlock {
-            block_kind,
-            content,
-            ..
-        } => !has_assistant_text(*block_kind, content_text(content)),
-        _ => false,
+fn has_assistant_text(kind: BlockKind, text: &str) -> bool {
+    matches!(kind, BlockKind::Answer | BlockKind::Reasoning) && !text.trim().is_empty()
+}
+
+fn hidden_timeline_entry(store: &SessionStore, block: &BlockView) -> bool {
+    match block.kind {
+        BlockKind::ToolResult => true,
+        BlockKind::Answer | BlockKind::Reasoning => {
+            !has_assistant_text(block.kind, &content_text(store, &block.content))
+        }
+        BlockKind::System => content_text(store, &block.content).trim().is_empty(),
+        BlockKind::User | BlockKind::ToolCall => false,
     }
 }
 
@@ -2772,7 +2768,7 @@ fn thinking_toggle(
     let block_id = block_id.clone();
     let label_el: AnyElement = if live && !expanded {
         shimmer_label(
-            format!("thinking-shimmer-{}", block_id.0),
+            format!("thinking-shimmer-{}", block_id.as_str()),
             "正在深度思考…",
             t,
         )
@@ -2787,7 +2783,7 @@ fn thinking_toggle(
     };
 
     div()
-        .id(SharedString::from(format!("thinking-toggle-{}", block_id.0)))
+        .id(SharedString::from(format!("thinking-toggle-{}", block_id.as_str())))
         .self_start()
         .max_w_full()
         .flex()
@@ -2805,7 +2801,7 @@ fn thinking_toggle(
         )
         .child(div().min_w_0().flex_1().child(label_el))
         .child(spring_chevron(
-            SharedString::from(format!("think-chev-{}", block_id.0)),
+            SharedString::from(format!("think-chev-{}", block_id.as_str())),
             expanded,
             t.faint,
             animate_motion,
@@ -2826,21 +2822,170 @@ enum AssistantSource {
     Streaming(usize),
 }
 
-fn assistant_source_text<'a>(store: &'a SessionStore, source: AssistantSource) -> &'a str {
+fn assistant_source_text(store: &SessionStore, source: AssistantSource) -> String {
     match source {
         AssistantSource::Entry(idx) => match store.entries.get(idx) {
-            Some(TimelineEntry::AssistantBlock { content, .. }) => content_text(content),
-            _ => "",
+            Some(block) => content_text(store, &block.content),
+            None => String::new(),
         },
         AssistantSource::Streaming(idx) => store
             .streaming
             .get(idx)
-            .map(|(_, _, text)| text.as_str())
-            .unwrap_or(""),
+            .map(|(_, _, text)| text.clone())
+            .unwrap_or_default(),
     }
 }
 
 /// 标准正文阅读轨(最宽 880px,窄屏或分栏压缩时自动收缩),表格破栏块以外的所有元素统一走此轨道居中。
+fn timeline_top_banners(
+    store: &SessionStore,
+    entity: &Entity<SessionStore>,
+    t: &Palette,
+    ty: &settings::Typography,
+) -> Option<AnyElement> {
+    let show_older = store.transcript_before_ord.is_some_and(|ord| ord > 1);
+    let compaction = store.pinned_compaction.as_ref();
+    if !show_older && compaction.is_none() {
+        return None;
+    }
+
+    let mut children: Vec<AnyElement> = Vec::new();
+    if show_older {
+        let loading = store.transcript_loading;
+        let label = if loading {
+            "正在加载更早历史…"
+        } else {
+            "加载更早历史"
+        };
+        let entity_for_click = entity.clone();
+        let pill = div()
+            .id("timeline-load-older")
+            .px_3()
+            .py_1()
+            .rounded_full()
+            .border_1()
+            .border_color(t.border_subtle)
+            .bg(t.surface_subtle)
+            .text_xs()
+            .text_color(if loading { t.faint } else { t.dim })
+            .when(!loading, |el| {
+                el.cursor_pointer()
+                    .hover(|style| style.bg(t.hover).text_color(t.text))
+                    .on_click(move |_, _, cx| {
+                        entity_for_click.update(cx, |store, cx| {
+                            store.request_older();
+                            cx.notify();
+                        });
+                    })
+            })
+            .child(label);
+        children.push(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(pill)
+                .into_any_element(),
+        );
+    }
+
+    if let Some(compaction) = compaction {
+        let expanded = store.compaction_expanded;
+        let entity_for_toggle = entity.clone();
+        let header_meta = if compaction.blocks_compacted > 0 {
+            format!("已压缩 {} 块", compaction.blocks_compacted)
+        } else {
+            "已固定".to_owned()
+        };
+        let header = div()
+            .id("timeline-pinned-compaction-toggle")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                entity_for_toggle.update(cx, |store, cx| {
+                    store.compaction_expanded = !store.compaction_expanded;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Layers)
+                            .with_size(Size::XSmall)
+                            .text_color(t.accent),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.text)
+                            .child("上下文压缩摘要"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.faint)
+                            .child(SharedString::from(header_meta)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child(if expanded { "收起" } else { "展开" }),
+            );
+
+        let body = if expanded {
+            div()
+                .text_xs()
+                .text_color(t.dim)
+                .child(SharedString::from(compaction.summary.clone()))
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(t.dim)
+                .line_clamp(2)
+                .text_ellipsis()
+                .child(SharedString::from(compaction.summary.clone()))
+                .into_any_element()
+        };
+
+        children.push(
+            div()
+                .id("timeline-pinned-compaction")
+                .w_full()
+                .rounded(px(RADIUS_CARD))
+                .border_1()
+                .border_color(t.border_subtle)
+                .bg(t.surface_subtle)
+                .px_3p5()
+                .py_2p5()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(header)
+                .child(body)
+                .into_any_element(),
+        );
+    }
+
+    Some(
+        prose_rail(ty)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(children)
+            .into_any_element(),
+    )
+}
+
 fn prose_rail(_ty: &settings::Typography) -> Div {
     div()
         .w_full()
@@ -2924,7 +3069,7 @@ fn scroll_to_latest_button(
 fn assistant_section(
     window: &mut Window,
     cx: &mut gpui_kit::App,
-    kind: &AssistantBlockKind,
+    kind: &BlockKind,
     source: AssistantSource,
     live: bool,
     section: usize,
@@ -2934,14 +3079,14 @@ fn assistant_section(
     ty: &settings::Typography,
 ) -> AnyElement {
     let animate_motion = effective_motion(cx) != MotionLevel::Off;
-    let reasoning = matches!(kind, AssistantBlockKind::Reasoning);
+    let reasoning = matches!(kind, BlockKind::Reasoning);
     let weak_entity = entity.downgrade();
     let (expanded, header, body, full_text, md_extensions, md_key) = {
         let store = entity.read(cx);
         let text = assistant_source_text(store, source);
         let md_key = SharedString::from(format!(
             "md-{}-{}-{section}",
-            store.session_id, block_id.0
+            store.session_id, block_id.as_str()
         ));
         let md_extensions = store.md_extensions.clone();
         let expanded = reasoning && store.expanded_thinking.contains(block_id);
@@ -2966,7 +3111,7 @@ fn assistant_section(
                 thinking_toggle(entity, block_id, expanded, live, title, animate_motion, t)
                     .into_any_element(),
             )
-        } else if matches!(kind, AssistantBlockKind::ToolCall) {
+        } else if matches!(kind, BlockKind::ToolCall) {
             Some(
                 prose_rail(ty)
                     .child(
@@ -2986,7 +3131,7 @@ fn assistant_section(
         } else {
             Some(crate::markdown::render_document_breakout(
                 md_key.clone(),
-                text,
+                &text,
                 &md_extensions,
                 weak_entity.clone(),
                 t,
@@ -3012,7 +3157,7 @@ fn assistant_section(
         let md_ext_for_body = md_extensions.clone();
         let md_key_for_body = md_key.clone();
         let revealed = accordion_reveal(
-            SharedString::from(format!("think-reveal-{}", block_id.0)),
+            SharedString::from(format!("think-reveal-{}", block_id.as_str())),
             expanded,
             window,
             cx,
@@ -3021,7 +3166,7 @@ fn assistant_section(
                 let text = assistant_source_text(store, source);
                 let body = crate::markdown::render_document(
                     md_key_for_body.clone(),
-                    text,
+                    &text,
                     &md_ext_for_body,
                     entity_for_body.downgrade(),
                     &t_copy,
@@ -3052,9 +3197,9 @@ fn assistant_section(
                     .items_center()
                     .gap_1p5()
                     .pt_0p5()
-                    .child(live_dot(format!("live-gen-{}", block_id.0), t.accent, true))
+                    .child(live_dot(format!("live-gen-{}", block_id.as_str()), t.accent, true))
                     .child(shimmer_label(
-                        format!("live-shimmer-{}", block_id.0),
+                        format!("live-shimmer-{}", block_id.as_str()),
                         "正在生成…",
                         t,
                     )),
@@ -3103,21 +3248,22 @@ fn notice_line(label: &str, text: &str, color: Hsla, t: &Palette) -> Div {
 }
 
 fn terminal_notice(
-    terminal: &qaqh_ringing_contract::commands::SubagentTerminalNotification,
+    terminal: &qaqh_ringing_v3::SubagentTerminalView,
     text: &str,
     t: &Palette,
 ) -> Div {
-    use qaqh_ringing_contract::commands::SubagentTerminalKind;
+    use qaqh_ringing_v3::SubagentTerminalKind;
     let (label, color) = match terminal.terminal {
         SubagentTerminalKind::Completed => ("子代理已完成", t.ok),
         SubagentTerminalKind::Failed => ("子代理失败", t.bad),
         SubagentTerminalKind::Cancelled => ("子代理已取消", t.dim),
         SubagentTerminalKind::TimedOut => ("子代理超时", t.warn),
     };
-    let mut title = format!("{label} · {}", terminal.child_session_id);
-    if !terminal.parent_call_id.is_empty() {
-        title.push_str(&format!(" (调用 {})", terminal.parent_call_id));
-    }
+    let title = format!(
+        "{label} · {} (调用 {})",
+        terminal.child_session_id.as_str(),
+        terminal.parent_call_id.as_str()
+    );
     notice_line(&title, text, color, t)
 }
 
@@ -3134,9 +3280,9 @@ fn timeline_entry(
     let assistant_meta = {
         let store = entity.read(cx);
         match store.entries.get(index)? {
-            TimelineEntry::AssistantBlock {
+            BlockView {
                 block_id,
-                block_kind,
+                kind: block_kind @ (BlockKind::Answer | BlockKind::Reasoning),
                 ..
             } => Some((block_id.clone(), *block_kind)),
             _ => None,
@@ -3162,10 +3308,14 @@ fn timeline_entry(
 
     let open_info = {
         let store = entity.read(cx);
-        if matches!(store.entries.get(index), Some(TimelineEntry::Input { .. })) {
+        if store
+            .entries
+            .get(index)
+            .is_some_and(|block| block.kind == BlockKind::User)
+        {
             crate::handoff::detect_open_source(store, index).map(|src| {
                 let text = match store.entries.get(index) {
-                    Some(TimelineEntry::Input { content, .. }) => content_text(content).to_owned(),
+                    Some(block) => content_text(store, &block.content),
                     _ => String::new(),
                 };
                 (src, text)
@@ -3191,12 +3341,19 @@ fn timeline_entry(
 
     let seal_facts = {
         let store = entity.read(cx);
-        if let Some(TimelineEntry::ToolCall { call_id, .. }) = store.entries.get(index) {
+        if let Some(call_id) = store
+            .entries
+            .get(index)
+            .filter(|block| block.kind == BlockKind::ToolCall)
+            .and_then(|block| block.tool_call_id.as_ref())
+        {
             store
                 .tools
                 .iter()
-                .find(|tool| &tool.call_id == call_id)
-                .and_then(crate::store::handoff_facts)
+                .find(|tool| &tool.tool_call_id == call_id)
+                .and_then(|tool| {
+                    crate::store::handoff_facts(tool, |content| store.content_text(content))
+                })
         } else {
             None
         }
@@ -3210,40 +3367,37 @@ fn timeline_entry(
 
     let store = entity.read(cx);
     let entry = store.entries.get(index)?;
-    Some(match entry {
-        TimelineEntry::Input {
-            turn_id,
-            content,
-            images,
-            attachments,
-            inter_agent,
-            subagent_terminal,
-            actor,
-            purpose,
-            ..
-        } => {
-            let text = content_text(content);
+    Some(match entry.kind {
+        BlockKind::User => {
+            let text = content_text(store, &entry.content);
+            let actor = entry.actor.unwrap_or(BlockActor::User);
+            let purpose = entry.purpose.unwrap_or(InputPurpose::TriggerTurn);
+            let turn_id = entry.turn_id.as_ref();
+            let images = &entry.images;
+            let attachments = &entry.attachments;
+            let inter_agent = entry.inter_agent.as_ref();
+            let subagent_terminal = entry.subagent_terminal.as_ref();
             if let Some(terminal) = subagent_terminal {
-                terminal_notice(terminal, text, t).into_any_element()
-            } else if actor.kind == ActorKind::System && text.starts_with("<qaqh_goal_continuation") {
-                notice_line("目标续跑", text, t.warn, t).into_any_element()
+                terminal_notice(terminal, &text, t).into_any_element()
+            } else if actor == BlockActor::System && text.starts_with("<qaqh_goal_continuation") {
+                notice_line("目标续跑", &text, t.warn, t).into_any_element()
             } else if let Some(envelope) = inter_agent {
                 notice_line(
                     &format!("跨代理消息 · 来自 {}", envelope.author),
-                    text,
+                    &text,
                     t.accent,
                     t,
                 )
                 .into_any_element()
-            } else if actor.kind != ActorKind::User {
-                let label = match actor.kind {
-                    ActorKind::System => "系统插话",
-                    ActorKind::Api => "API 插话",
-                    ActorKind::Agent => "代理消息",
-                    ActorKind::Subagent => "子代理消息",
-                    ActorKind::User => unreachable!("handled above"),
+            } else if actor != BlockActor::User {
+                let label = match actor {
+                    BlockActor::System => "系统插话",
+                    BlockActor::Api => "API 插话",
+                    BlockActor::Agent => "代理消息",
+                    BlockActor::Subagent => "子代理消息",
+                    BlockActor::User => unreachable!("handled above"),
                 };
-                notice_line(label, text, t.dim, t).into_any_element()
+                notice_line(label, &text, t.dim, t).into_any_element()
             } else {
                 let mut row = match purpose {
                     InputPurpose::TriggerTurn => div()
@@ -3253,13 +3407,13 @@ fn timeline_entry(
                         .gap_1p5()
                         .child(user_bubble(
                             SharedString::from(format!("user-msg-{index}")),
-                            text,
+                            &text,
                             entity,
                             t,
                         )),
-                    InputPurpose::QueueOnly => notice_line("排队消息", text, t.dim, t),
-                    InputPurpose::Steer => notice_line("运行中转向", text, t.warn, t),
-                    InputPurpose::Interject => notice_line("运行中插话", text, t.warn, t),
+                    InputPurpose::QueueOnly => notice_line("排队消息", &text, t.dim, t),
+                    InputPurpose::Steer => notice_line("运行中转向", &text, t.warn, t),
+                    InputPurpose::Interject => notice_line("运行中插话", &text, t.warn, t),
                 };
                 if !images.is_empty() {
                     row = row.child(
@@ -3267,7 +3421,12 @@ fn timeline_entry(
                             .flex()
                             .flex_wrap()
                             .gap_2()
-                            .children(images.iter().map(qaqh_gpui_render::media::preview)),
+                            .children(images.iter().map(|image| {
+                                qaqh_gpui_render::media::preview(
+                                    image,
+                                    store.blobs.get(&image.hash),
+                                )
+                            })),
                     );
                 }
                 if !attachments.is_empty() {
@@ -3282,12 +3441,12 @@ fn timeline_entry(
                     && !store.is_running()
                     && let Some(tid) = turn_id
                 {
-                    let tid_str = tid.0.clone();
+                    let tid_str = tid.as_str().to_owned();
                     let confirming =
                         store.confirm_truncate_turn.as_deref() == Some(tid_str.as_str());
                     let group_id = SharedString::from(format!("user-turn-{tid_str}"));
                     let weak_undo = entity.downgrade();
-                    let text_owned = text.to_owned();
+                    let text_owned = text.clone();
                     let bar = if confirming {
                         let tid_confirm = tid_str.clone();
                         let weak_confirm = weak_undo.clone();
@@ -3312,7 +3471,14 @@ fn timeline_entry(
                                         let tid = tid_confirm.clone();
                                         let prefill = text_owned.clone();
                                         let _ = weak_confirm.update(cx, |store, cx| {
-                                            store.truncate_turn(tid, Some(prefill), window, cx);
+                                            if let Ok(turn_id) = TurnId::new(tid) {
+                                                store.truncate_turn(
+                                                    turn_id,
+                                                    Some(prefill),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                         });
                                     })
                                     .child("确认从此处截断？"),
@@ -3367,7 +3533,7 @@ fn timeline_entry(
                             )
                     };
                     div()
-                        .id(SharedString::from(format!("user-turn-wrap-{}", tid.0)))
+                        .id(SharedString::from(format!("user-turn-wrap-{}", tid.as_str())))
                         .group(group_id)
                         .flex()
                         .flex_col()
@@ -3381,21 +3547,24 @@ fn timeline_entry(
                 }
             }
         }
-        TimelineEntry::AssistantBlock { .. } => unreachable!("handled above"),
-        TimelineEntry::ToolCall { call_id, .. } => {
-            let tool = store.tools.iter().find(|tool| &tool.call_id == call_id)?;
+        BlockKind::Answer | BlockKind::Reasoning => unreachable!("handled above"),
+        BlockKind::ToolCall => {
+            let call_id = entry.tool_call_id.as_ref()?;
+            let tool = store.tools.iter().find(|tool| &tool.tool_call_id == call_id)?;
             tool_card(cx, store, entity, tool, t, tail_max).into_any_element()
         }
-        TimelineEntry::Compaction { .. } => div()
+        BlockKind::System => div()
             .flex()
             .items_center()
             .gap_3()
             .py_1()
             .child(div().flex_1().h(px(1.)).bg(t.border_subtle))
-            .child(div().text_xs().text_color(t.faint).child("上下文已自动整理压缩"))
+            .child(div().text_xs().text_color(t.faint).child(SharedString::from(
+                content_text(store, &entry.content),
+            )))
             .child(div().flex_1().h(px(1.)).bg(t.border_subtle))
             .into_any_element(),
-        TimelineEntry::ToolResult { .. } => return None,
+        BlockKind::ToolResult => return None,
     })
 }
 
@@ -3550,22 +3719,29 @@ impl Render for SessionStore {
         let timeline_list_el = list(list_state, move |index, window, cx| {
             let row = div().w_full().when(index == 0, |row| row.pt_4());
             let gap = px((10.0 + ty.density_shift).max(4.));
+            let top_banner = (index == 0)
+                .then(|| timeline_top_banners(entity.read(cx), &entity, &t, &ty))
+                .flatten();
 
             if let Some(item) = items_for_list.get(index) {
-                return match item {
+                let item_el = match item {
                     TimelineItem::Single(entry_idx) => {
                         let (is_assistant, last_assistant) = {
                             let store = entity.read(cx);
-                            let is_assistant = matches!(
-                                store.entries.get(*entry_idx),
-                                Some(TimelineEntry::AssistantBlock { .. })
-                            );
+                            let is_assistant = store
+                                .entries
+                                .get(*entry_idx)
+                                .is_some_and(|block| {
+                                    matches!(block.kind, BlockKind::Answer | BlockKind::Reasoning)
+                                });
                             let last_assistant = items_for_list.iter().rev().find_map(|item| {
                                 if let TimelineItem::Single(idx) = item
-                                    && matches!(
-                                        store.entries.get(*idx),
-                                        Some(TimelineEntry::AssistantBlock { .. })
-                                    )
+                                    && store.entries.get(*idx).is_some_and(|block| {
+                                        matches!(
+                                            block.kind,
+                                            BlockKind::Answer | BlockKind::Reasoning
+                                        )
+                                    })
                                 {
                                     Some(*idx)
                                 } else {
@@ -3618,17 +3794,29 @@ impl Render for SessionStore {
                         )))
                         .into_any_element(),
                 };
+                return match top_banner {
+                    Some(banner) => div()
+                        .w_full()
+                        .pt_4()
+                        .flex()
+                        .flex_col()
+                        .gap(gap)
+                        .child(banner)
+                        .child(item_el)
+                        .into_any_element(),
+                    None => item_el,
+                };
             }
 
             let (streaming_meta, show_unattached_live_trace) = {
                 let store = entity.read(cx);
-                let streaming_meta: Vec<(usize, BlockId, AssistantBlockKind)> = store
+                let streaming_meta: Vec<(usize, BlockId, BlockKind)> = store
                     .streaming
                     .iter()
                     .enumerate()
                     .filter(|(_, (_, kind, text))| {
                         has_assistant_text(*kind, text)
-                            && (!collapse_work_trace || *kind == AssistantBlockKind::Answer)
+                            && (!collapse_work_trace || *kind == BlockKind::Answer)
                     })
                     .map(|(i, (block_id, kind, _))| (i, block_id.clone(), *kind))
                     .collect();
@@ -3678,10 +3866,7 @@ impl Render for SessionStore {
             let referenced_tools: HashSet<_> = store
                 .entries
                 .iter()
-                .filter_map(|entry| match entry {
-                    TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
-                    _ => None,
-                })
+                .filter_map(|block| block.tool_call_id.as_ref())
                 .collect();
 
             let arg_stream_els: Vec<AnyElement> = if collapse_work_trace {
@@ -3708,10 +3893,10 @@ impl Render for SessionStore {
                 .tools
                 .iter()
                 .filter_map(|tool| {
-                    if referenced_tools.contains(&tool.call_id) {
+                    if referenced_tools.contains(&tool.tool_call_id) {
                         return None;
                     }
-                    if collapse_work_trace && is_trace_foldable_tool_view(tool) {
+                    if collapse_work_trace && is_trace_foldable_tool_view(store, tool) {
                         return None;
                     }
                     Some(
@@ -3729,17 +3914,14 @@ impl Render for SessionStore {
                 .flex()
                 .flex_col()
                 .gap(gap)
+                .children(top_banner)
                 .children(live_trace_el)
                 .children(streaming_els)
                 .children(arg_stream_els)
                 .children(unref_tool_els)
                 .children(store.subagents.iter().map(|subagent| {
-                    let status = subagent
-                        .status
-                        .as_ref()
-                        .map(|status| format!("{status:?}"))
-                        .unwrap_or_else(|| "进行中".into());
-                    let mut row = div()
+                    let status = format!("{:?}", subagent.status);
+                    let row = div()
                         .px_3()
                         .py_2()
                         .rounded(px(RADIUS_CONTROL))
@@ -3753,13 +3935,13 @@ impl Render for SessionStore {
                         .text_color(t.dim)
                         .child(Icon::new(IconName::Bot).with_size(Size::XSmall).text_color(t.accent))
                         .child(SharedString::from(format!(
-                            "子代理 {} · {status}",
-                            subagent.child_session_id.0,
+                            "子代理 {} · {status} · {}",
+                            subagent.session_id.as_str(),
+                            subagent
+                                .nickname
+                                .as_deref()
+                                .unwrap_or("未命名"),
                         )));
-                    if let Some(result) = &subagent.result {
-                        let head: String = content_text(result).chars().take(160).collect();
-                        row = row.child(div().text_xs().text_color(t.dim).truncate().child(head));
-                    }
                     prose_rail(&ty).child(row).into_any_element()
                 }))
                 .into_any_element()
@@ -3820,107 +4002,87 @@ impl Render for SessionStore {
 
         let mut pending_interactions = Vec::new();
         for interaction in self.interactions.clone().iter() {
-            if interaction.resolution.is_some() {
-                continue;
-            }
             match interaction.kind {
                 InteractionKind::Permission => {
-                    let Some(call_id) = &interaction.call_id else {
-                        continue;
-                    };
-                    let call = call_id.0.clone();
-                    let allow = {
-                        let call = call.clone();
-                        cx.listener(
+                    // V3 按钮组由后端直供(`choices`),前端不许自己猜。
+                    let interaction_id = interaction.interaction_id.clone();
+                    let uid = interaction.interaction_id.as_str().to_owned();
+                    let mut buttons: Vec<AnyElement> = Vec::new();
+                    for (choice_index, choice) in interaction.choices.iter().enumerate() {
+                        let resolution = match choice.decision {
+                            InteractionDecisionKind::Approved => {
+                                Some(CommandInteractionResolution::Approve {
+                                    scope: PermissionGrantScope::Once,
+                                })
+                            }
+                            InteractionDecisionKind::ApprovedForSession => {
+                                Some(CommandInteractionResolution::Approve {
+                                    scope: PermissionGrantScope::Session,
+                                })
+                            }
+                            InteractionDecisionKind::Rejected => {
+                                Some(CommandInteractionResolution::Reject {
+                                    text: String::new(),
+                                })
+                            }
+                            InteractionDecisionKind::Answered
+                            | InteractionDecisionKind::Dismissed => None,
+                        };
+                        let Some(resolution) = resolution else { continue };
+                        let color = match choice.tone {
+                            ChoiceTone::Primary => t.accent,
+                            ChoiceTone::Secondary => t.ok,
+                            ChoiceTone::Destructive => t.bad,
+                        };
+                        let target = interaction_id.clone();
+                        let listener = cx.listener(
                             move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(
-                                    call.clone(),
-                                    true,
-                                    Some(PermissionGrantScope::Once),
-                                );
+                                store.respond_interaction(&target, resolution.clone());
                                 cx.notify();
                             },
-                        )
-                    };
-                    let allow_session = {
-                        let call = call.clone();
-                        cx.listener(
-                            move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(
-                                    call.clone(),
-                                    true,
-                                    Some(PermissionGrantScope::Session),
-                                );
-                                cx.notify();
-                            },
-                        )
-                    };
-                    let trust = {
-                        let call = call.clone();
-                        cx.listener(
-                            move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(
-                                    call.clone(),
-                                    true,
-                                    Some(PermissionGrantScope::Persistent),
-                                );
-                                cx.notify();
-                            },
-                        )
-                    };
-                    let deny = {
-                        let call = call.clone();
-                        cx.listener(
-                            move |store: &mut SessionStore, _, _, cx: &mut Context<SessionStore>| {
-                                store.respond_permission(call.clone(), false, None);
-                                cx.notify();
-                            },
-                        )
-                    };
-                    let uid = interaction.interaction_id.0.clone();
+                        );
+                        buttons.push(
+                            action_button(
+                                cx,
+                                format!("{uid}-choice-{choice_index}"),
+                                choice.label.clone(),
+                                color,
+                                listener,
+                                &t,
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                    let mut body: Vec<AnyElement> = Vec::new();
+                    if let Some(permission) = &interaction.permission {
+                        let mut meta = vec![permission.category.clone(), permission.risk.clone()];
+                        if let Some(summary) = &permission.action_summary {
+                            meta.push(summary.clone());
+                        }
+                        body.push(
+                            div()
+                                .text_xs()
+                                .text_color(t.dim)
+                                .child(SharedString::from(meta.join(" · ")))
+                                .into_any_element(),
+                        );
+                        if !permission.paths.is_empty() {
+                            body.push(
+                                div()
+                                    .text_xs()
+                                    .text_color(t.faint)
+                                    .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                                    .child(SharedString::from(permission.paths.join("\n")))
+                                    .into_any_element(),
+                            );
+                        }
+                    }
                     pending_interactions.push(
                         interaction_card(
-                            "工具权限",
-                            content_text(&interaction.request),
-                            vec![
-                                action_button(
-                                    cx,
-                                    format!("{uid}-allow"),
-                                    "允许一次",
-                                    t.ok,
-                                    allow,
-                                    &t,
-                                )
-                                .into_any_element(),
-                                action_button(
-                                    cx,
-                                    format!("{uid}-session"),
-                                    "本会话允许",
-                                    t.accent,
-                                    allow_session,
-                                    &t,
-                                )
-                                .into_any_element(),
-                                action_button(
-                                    cx,
-                                    format!("{uid}-trust"),
-                                    "始终允许",
-                                    t.ok,
-                                    trust,
-                                    &t,
-                                )
-                                .into_any_element(),
-                                action_button(
-                                    cx,
-                                    format!("{uid}-deny"),
-                                    "拒绝",
-                                    t.bad,
-                                    deny,
-                                    &t,
-                                )
-                                .into_any_element(),
-                            ],
-                            Vec::new(),
+                            &interaction.title,
+                            &interaction.body,
+                            buttons,
+                            body,
                             &t,
                         )
                         .into_any_element(),

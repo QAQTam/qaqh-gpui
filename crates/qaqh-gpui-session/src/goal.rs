@@ -9,8 +9,8 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::component::WindowExt;
 use gpui_kit::assets::IconName;
-use qaqh_ringing_contract::state::GoalStatus;
-use qaqh_ringing_contract::state::GoalView;
+use qaqh_core_vocab::GoalStatus;
+use qaqh_ringing_v3::GoalView;
 
 use crate::store::SessionStore;
 use qaqh_gpui_kit::theme::ActiveTheme as _;
@@ -188,7 +188,7 @@ pub fn goal_dialog(
                 "暂停",
                 &t,
                 cx.listener(|store, _, window: &mut Window, cx| {
-                    store.goal_set(None, Some(GoalStatus::Paused), None);
+                    store.goal_transition(GoalStatus::Paused);
                     window.close_dialog(cx);
                     cx.notify();
                 }),
@@ -204,7 +204,7 @@ pub fn goal_dialog(
                 "恢复",
                 &t,
                 cx.listener(|store, _, window: &mut Window, cx| {
-                    store.goal_set(None, Some(GoalStatus::Active), None);
+                    store.goal_transition(GoalStatus::Active);
                     window.close_dialog(cx);
                     cx.notify();
                 }),
@@ -233,21 +233,17 @@ pub fn goal_dialog(
             let objective = store
                 .goal_draft
                 .as_ref()
-                .and_then(|(field, _)| {
-                    Some(field.read(cx).value().trim().to_string()).filter(|text| !text.is_empty())
-                });
-            let budget = store.goal_draft.as_ref().and_then(|(_, field)| {
-                field
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .map(Some)
-            });
-            match (objective, budget) {
-                (None, None) => {}
-                (objective, budget) => store.goal_set(objective, None, budget),
+                .map(|(field, _)| field.read(cx).value().trim().to_string())
+                .filter(|text| !text.is_empty())
+                .or_else(|| store.goal.as_ref().map(|goal| goal.objective.clone()));
+            let budget = store
+                .goal_draft
+                .as_ref()
+                .and_then(|(_, field)| field.read(cx).value().trim().parse::<u64>().ok());
+            // V3 `SetGoal` 是全量写:正文必填,状态沿用当前(新目标默认 Active)。
+            if let Some(objective) = objective {
+                let status = store.goal.as_ref().map_or(GoalStatus::Active, |goal| goal.status);
+                store.goal_set(objective, status, budget);
             }
             window.close_dialog(cx);
             cx.notify();

@@ -1245,12 +1245,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "data-encoding"
-version = "2.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
-
-[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5335,9 +5329,8 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qaqh-client"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
- "base64 0.23.1",
  "bytes",
  "futures-util",
  "hex",
@@ -5355,13 +5348,12 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
- "tokio-tungstenite",
  "uuid",
 ]
 
 [[package]]
 name = "qaqh-core-vocab"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "hex",
  "serde",
@@ -5375,11 +5367,12 @@ dependencies = [
  "embed-resource",
  "futures",
  "gpui-kit",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
  "qaqh-gpui-session",
  "qaqh-gpui-shell",
  "qaqh-gpui-wire",
- "qaqh-ringing-contract",
+ "qaqh-ringing-v3",
  "serde",
  "serde_json",
 ]
@@ -5397,10 +5390,10 @@ dependencies = [
 name = "qaqh-gpui-render"
 version = "5.0.0"
 dependencies = [
- "base64 0.22.1",
  "gpui-kit",
- "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
+ "qaqh-ringing-v3",
  "tree-sitter-bash",
  "tree-sitter-go",
  "tree-sitter-highlight",
@@ -5419,13 +5412,12 @@ dependencies = [
  "futures",
  "gpui-kit",
  "percent-encoding",
- "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
  "qaqh-gpui-render",
  "qaqh-gpui-wire",
  "qaqh-profile",
- "qaqh-ringing-contract",
- "qaqh-types",
+ "qaqh-ringing-v3",
  "serde",
  "serde_json",
 ]
@@ -5434,15 +5426,15 @@ dependencies = [
 name = "qaqh-gpui-shell"
 version = "5.0.0"
 dependencies = [
+ "bytes",
  "futures",
  "gpui-kit",
- "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
  "qaqh-gpui-session",
  "qaqh-gpui-wire",
  "qaqh-profile",
- "qaqh-ringing-contract",
- "qaqh-types",
+ "qaqh-ringing-v3",
  "serde",
  "serde_json",
 ]
@@ -5451,13 +5443,12 @@ dependencies = [
 name = "qaqh-gpui-wire"
 version = "5.0.0"
 dependencies = [
- "base64 0.22.1",
  "futures",
  "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-profile",
- "qaqh-ringing-contract",
  "qaqh-ringing-v3",
- "qaqh-types",
+ "qaqh-v3-transport",
  "serde",
  "serde_json",
  "tokio",
@@ -5465,7 +5456,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-hooks"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "chrono",
  "hex",
@@ -5481,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-profile"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "log",
  "qaqh-types",
@@ -5494,7 +5485,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "qaqh-profile",
  "qaqh-ringing-contract",
@@ -5505,7 +5496,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing-contract"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "qaqh-types",
  "serde",
@@ -5517,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing-v3"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "bytes",
  "postcard",
@@ -5529,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-types"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "chrono",
  "dunce",
@@ -5546,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-v3-transport"
-version = "4.2.0"
+version = "4.7.100"
 dependencies = [
  "log",
  "qaqh-ringing-v3",
@@ -6589,17 +6580,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7272,22 +7252,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
-dependencies = [
- "futures-util",
- "log",
- "rustls",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tungstenite",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7597,24 +7561,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
-]
-
-[[package]]
-name = "tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "rustls",
- "rustls-pki-types",
- "sha1",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8130,24 +8076,6 @@ name = "webpki-root-certs"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.12",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]

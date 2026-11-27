@@ -27,7 +27,7 @@ use qaqh_gpui_kit::theme::{ActiveTheme, Palette};
 use qaqh_gpui_session::store::SettingsEditor;
 use qaqh_gpui_session::store::WorkspaceGroup;
 use qaqh_gpui_wire::bridge::BridgeRequest;
-use qaqh_client::{CommandTarget, RingingCommand};
+use qaqh_ringing_v3::{SessionRequest, WorkspaceRequest};
 
 use crate::daemon::{DaemonStore, PrimarySection, clean_session_title};
 use crate::pages;
@@ -47,7 +47,7 @@ impl Render for DaemonStore {
                 row.archived == self.show_archived
                     && (query.is_empty()
                         || row.title.to_lowercase().contains(&query)
-                        || row.id.contains(&query))
+                        || row.id.as_str().contains(&query))
             })
             .cloned()
             .collect();
@@ -64,7 +64,11 @@ impl Render for DaemonStore {
         let animate_motion = effective_motion(cx) != MotionLevel::Off;
         let mut rows: Vec<AnyElement> = Vec::new();
         for group in &groups {
-            let key = group.id.clone().unwrap_or_else(|| "ungrouped".into());
+            let key = group
+                .id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())
+                .unwrap_or_else(|| "ungrouped".to_owned());
             let collapsed = self.collapsed.contains(&key);
             let title = key.clone();
             let was_collapsed = collapsed;
@@ -160,7 +164,7 @@ impl Render for DaemonStore {
             } else {
                 let group_id_for_ctx = group_id.clone();
                 let group_title_for_ctx = group.title.clone();
-                let group_session_ids: Vec<String> =
+                let group_session_ids: Vec<qaqh_core_vocab::SessionId> =
                     group.rows.iter().map(|row| row.id.clone()).collect();
                 rows.push(
                     div()
@@ -251,7 +255,7 @@ impl Render for DaemonStore {
             let group_parents: Vec<Option<SharedString>> = group_rows
                 .iter()
                 .map(|row| {
-                    row.handoff_from_session_id.as_ref().and_then(|parent_id| {
+                    row.handoff_from.as_ref().and_then(|parent_id| {
                         self.sessions
                             .iter()
                             .find(|item| &item.id == parent_id)
@@ -284,7 +288,7 @@ impl Render for DaemonStore {
                                 &group_titles[primary_len..],
                                 &group_parents[primary_len..],
                                 &rename_draft,
-                                active_id_for_grp.as_deref(),
+                                active_id_for_grp.as_ref(),
                                 active_tone,
                                 &daemon_for_grp,
                                 &anchors_for_grp,
@@ -303,7 +307,7 @@ impl Render for DaemonStore {
                     &group_titles[..primary_len],
                     &group_parents[..primary_len],
                     &rename_draft,
-                    active_id_for_grp.as_deref(),
+                    active_id_for_grp.as_ref(),
                     active_tone,
                     &daemon_for_grp,
                     &anchors_for_grp,
@@ -404,7 +408,7 @@ impl Render for DaemonStore {
             );
 
         let skills_badge = self.skills_report.as_ref().and_then(|report| {
-            let count = report.project.len() + report.user.len();
+            let count = report.skills.len();
             (count > 0).then(|| SharedString::from(count.to_string()))
         });
         let primary_nav = div()
@@ -822,7 +826,7 @@ impl Render for DaemonStore {
             .children(self.fly_box.as_ref().map(|fly| {
                 qaqh_gpui_session::handoff::fly_box_overlay(
                     fly.from,
-                    fly.target_session_id.clone(),
+                    fly.target_session_id.as_str().to_owned(),
                     fly.started_at,
                     self.handoff_anchors.clone(),
                     t,
@@ -876,10 +880,10 @@ fn ctx_menu_element(
                                     let title = emitter.read(cx).value().trim().to_string();
                                     if !title.is_empty() {
                                         let _ = daemon.requests.unbounded_send(
-                                            BridgeRequest::RenameSession {
-                                                seed: sid.clone(),
+                                            BridgeRequest::Session(SessionRequest::Rename {
+                                                session_id: sid.clone(),
                                                 title,
-                                            },
+                                            }),
                                         );
                                     }
                                     daemon.rename_draft = None;
@@ -912,16 +916,18 @@ fn ctx_menu_element(
                 cx.listener({
                     let session_id = session_id.clone();
                     move |daemon: &mut DaemonStore, _, _, cx| {
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
-                            target: CommandTarget::Session {
+                        let request = if archived {
+                            SessionRequest::Unarchive {
                                 session_id: session_id.clone(),
-                            },
-                            command: if archived {
-                                RingingCommand::SessionUnarchive {}
-                            } else {
-                                RingingCommand::SessionArchive {}
-                            },
-                        });
+                            }
+                        } else {
+                            SessionRequest::Archive {
+                                session_id: session_id.clone(),
+                            }
+                        };
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(BridgeRequest::Session(request));
                         daemon.ctx_menu = None;
                         cx.notify();
                     }
@@ -956,9 +962,11 @@ fn ctx_menu_element(
                             cx.notify();
                             return;
                         }
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::DeleteSession {
-                            seed: session_id.clone(),
-                        });
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(BridgeRequest::Session(SessionRequest::Delete {
+                                session_id: session_id.clone(),
+                            }));
                         if daemon.rename_draft.as_ref().is_some_and(|(target, _)| {
                             *target == crate::daemon::RenameTarget::Session(session_id.clone())
                         }) {
@@ -1008,14 +1016,10 @@ fn ctx_menu_element(
                                     let new_title = emitter.read(cx).value().trim().to_string();
                                     if !new_title.is_empty() {
                                         let _ = daemon.requests.unbounded_send(
-                                            BridgeRequest::Command {
-                                                target: CommandTarget::Workspace {
-                                                    workspace_id: wid.clone(),
-                                                },
-                                                command: RingingCommand::WorkspaceRename {
-                                                    title: new_title,
-                                                },
-                                            },
+                                            BridgeRequest::Workspace(WorkspaceRequest::Rename {
+                                                workspace_id: wid.clone(),
+                                                title: new_title,
+                                            }),
                                         );
                                     }
                                     daemon.rename_draft = None;
@@ -1056,16 +1060,18 @@ fn ctx_menu_element(
                             return;
                         }
                         for sid in &session_ids {
-                            let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
-                                target: CommandTarget::Session {
+                            let request = if archived_view {
+                                SessionRequest::Unarchive {
                                     session_id: sid.clone(),
-                                },
-                                command: if archived_view {
-                                    RingingCommand::SessionUnarchive {}
-                                } else {
-                                    RingingCommand::SessionArchive {}
-                                },
-                            });
+                                }
+                            } else {
+                                SessionRequest::Archive {
+                                    session_id: sid.clone(),
+                                }
+                            };
+                            let _ = daemon
+                                .requests
+                                .unbounded_send(BridgeRequest::Session(request));
                         }
                         daemon.ctx_menu = None;
                         cx.notify();
@@ -1102,19 +1108,18 @@ fn ctx_menu_element(
                             cx.notify();
                             return;
                         }
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::Command {
-                            target: CommandTarget::Workspace {
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(BridgeRequest::Workspace(WorkspaceRequest::Delete {
                                 workspace_id: workspace_id.clone(),
-                            },
-                            command: RingingCommand::WorkspaceDelete {},
-                        });
+                            }));
                         if daemon.rename_draft.as_ref().is_some_and(|(target, _)| {
                             *target == crate::daemon::RenameTarget::Workspace(workspace_id.clone())
                         }) {
                             daemon.rename_draft = None;
                         }
-                        daemon.collapsed.remove(&workspace_id);
-                        daemon.expanded_more.remove(&workspace_id);
+                        daemon.collapsed.remove(workspace_id.as_str());
+                        daemon.expanded_more.remove(workspace_id.as_str());
                         daemon.ctx_menu = None;
                         cx.notify();
                     }
@@ -1209,7 +1214,7 @@ fn render_session_rows(
     titles: &[SharedString],
     parents: &[Option<SharedString>],
     rename_draft: &Option<(crate::daemon::RenameTarget, gpui_kit::Entity<InputState>)>,
-    active_id: Option<&str>,
+    active_id: Option<&qaqh_core_vocab::SessionId>,
     active_tone: Option<bool>,
     daemon_entity: &gpui_kit::Entity<DaemonStore>,
     anchors: &qaqh_gpui_session::handoff::HandoffAnchors,
@@ -1247,7 +1252,7 @@ fn render_session_rows(
             );
             continue;
         }
-        let selected = active_id == Some(row.id.as_str());
+        let selected = active_id == Some(&row.id);
         let id = row.id.clone();
         let archived = row.archived;
         let daemon_click = daemon_entity.clone();

@@ -3,9 +3,9 @@
 // CLI 口径经 attach_parent_console 挂回调用方终端。
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
-//! qaqh-gpui — QAQ-Harness 的 GPUI 桌面前端(RingingV2 客户端)。
+//! qaqh-gpui — QAQ-Harness 的 GPUI 桌面前端(RingingV3 客户端)。
 //!
-//! `--probe` 以无 GUI 方式跑连接序列(discovery → open_v2 → session.list),
+//! `--probe` 以无 GUI 方式跑连接序列(discovery → V3 握手 → session.list),
 //! 用于环境验证;默认启动窗口。
 
 mod app;
