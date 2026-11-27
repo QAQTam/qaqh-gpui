@@ -9,10 +9,10 @@ use qaqh_client::v3::BlobInbox;
 pub(super) async fn attach_events(
     client: &V3Client<YamuxTransport>,
     to_ui: &UnboundedSender<BridgeMsg>,
+    generation: u64,
     session_id: &SessionId,
     since_seq: u64,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    let generation = next_generation();
     let mut stream = client
         .attach_session(session_id, since_seq)
         .await
@@ -68,10 +68,10 @@ pub(super) async fn attach_events(
 pub(super) async fn attach_shell(
     client: &V3Client<YamuxTransport>,
     to_ui: &UnboundedSender<BridgeMsg>,
+    generation: u64,
     shell_id: &str,
     from_offset: u64,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    let generation = next_generation();
     let mut stream = client
         .attach_shell(shell_id, from_offset)
         .await
@@ -118,9 +118,9 @@ pub(super) async fn attach_shell(
 /// 消费服务端主动推来的 blob（收件箱由 client 一次性交给本任务）。
 pub(super) fn spawn_blob_inbox(
     to_ui: &UnboundedSender<BridgeMsg>,
+    generation: u64,
     mut inbox: BlobInbox,
 ) -> tokio::task::JoinHandle<()> {
-    let generation = CONNECTION_GENERATION.load(Ordering::Acquire);
     let to_ui = to_ui.clone();
     tokio::spawn(async move {
         while let Some(blob) = inbox.next().await {

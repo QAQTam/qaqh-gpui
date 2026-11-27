@@ -7,6 +7,7 @@ use crate::bridge::streams::attach_shell;
 pub(super) async fn handle_request(
     client: &mut V3Client<YamuxTransport>,
     to_ui: &UnboundedSender<BridgeMsg>,
+    generation: u64,
     shell_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     request: BridgeRequest,
 ) {
@@ -26,7 +27,7 @@ pub(super) async fn handle_request(
             limit,
             timeline_epoch,
         } => {
-            let result = call(
+            match call(
                 client,
                 ControlRequest::Session(SessionRequest::TranscriptPage {
                     session_id: session_id.clone(),
@@ -35,11 +36,22 @@ pub(super) async fn handle_request(
                     timeline_epoch: *timeline_epoch,
                 }),
             )
-            .await;
-            if let Ok(ControlResponse::Session(SessionResponse::Page(page))) = &result {
-                let _ = to_ui.unbounded_send(BridgeMsg::Transcript(page.clone()));
+            .await
+            {
+                Ok(ControlResponse::Session(SessionResponse::Page(page))) => {
+                    let _ = to_ui.unbounded_send(BridgeMsg::Transcript(page));
+                }
+                Ok(other) => {
+                    let message = format!("翻页回执形状异常：{other:?}");
+                    send_line(to_ui, message.clone());
+                    let _ = to_ui.unbounded_send(BridgeMsg::Session(Err(message)));
+                }
+                Err(error) => {
+                    send_line(to_ui, format!("翻页失败：{error}"));
+                    let _ = to_ui.unbounded_send(BridgeMsg::Session(Err(error)));
+                }
             }
-            result
+            return;
         }
         BridgeRequest::Session(request) => {
             call(client, ControlRequest::Session(request.clone())).await
@@ -64,17 +76,21 @@ pub(super) async fn handle_request(
             call(client, ControlRequest::ToolCatalog(request.clone())).await
         }
         BridgeRequest::Shell(request) => {
-            shell_request(client, to_ui, shell_tasks, request.clone()).await;
+            shell_request(client, to_ui, generation, shell_tasks, request.clone()).await;
             return;
         }
         BridgeRequest::ShellAttach {
             shell_id,
             from_offset,
         } => {
-            shell_tasks.remove(shell_id);
-            match attach_shell(client, to_ui, shell_id, *from_offset).await {
+            if let Some(old) = shell_tasks.remove(shell_id) {
+                old.abort();
+            }
+            match attach_shell(client, to_ui, generation, shell_id, *from_offset).await {
                 Ok(task) => {
-                    shell_tasks.insert(shell_id.clone(), task);
+                    if let Some(old) = shell_tasks.insert(shell_id.clone(), task) {
+                        old.abort();
+                    }
                 }
                 Err(error) => {
                     send_shell_error(to_ui, format!("shell 流订阅失败（{shell_id}）：{error}"))
@@ -138,6 +154,7 @@ pub(super) async fn handle_request(
 async fn shell_request(
     client: &V3Client<YamuxTransport>,
     to_ui: &UnboundedSender<BridgeMsg>,
+    generation: u64,
     shell_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     request: ShellRequest,
 ) {
@@ -164,9 +181,11 @@ async fn shell_request(
                 Ok(ControlResponse::Shell(ShellResponse::Opened(view))) => {
                     // 先把页签交给 UI，再建流，避免首帧字节早于页签到达。
                     let _ = to_ui.unbounded_send(BridgeMsg::ShellOpened(view.clone()));
-                    match attach_shell(client, to_ui, &view.shell_id, 0).await {
+                    match attach_shell(client, to_ui, generation, &view.shell_id, 0).await {
                         Ok(task) => {
-                            shell_tasks.insert(view.shell_id.clone(), task);
+                            if let Some(old) = shell_tasks.insert(view.shell_id.clone(), task) {
+                                old.abort();
+                            }
                         }
                         Err(error) => send_shell_error(to_ui, format!("shell 流订阅失败：{error}")),
                     }
@@ -176,7 +195,9 @@ async fn shell_request(
             }
         }
         ShellRequest::Close { shell_id } => {
-            shell_tasks.remove(&shell_id);
+            if let Some(old) = shell_tasks.remove(&shell_id) {
+                old.abort();
+            }
             let _ = to_ui.unbounded_send(BridgeMsg::ShellStatus {
                 shell_id: shell_id.clone(),
                 status: ShellUiStatus::Unsubscribed {
@@ -206,7 +227,13 @@ async fn shell_request(
             .await;
             match listed {
                 Ok(ControlResponse::Shell(ShellResponse::Shells(views))) => {
-                    shell_tasks.retain(|id, _| views.iter().any(|view| &view.shell_id == id));
+                    shell_tasks.retain(|id, handle| {
+                        let keep = views.iter().any(|view| &view.shell_id == id);
+                        if !keep {
+                            handle.abort();
+                        }
+                        keep
+                    });
                     let missing: Vec<ShellView> = views
                         .iter()
                         .filter(|view| !view.exited && !shell_tasks.contains_key(&view.shell_id))
@@ -214,10 +241,19 @@ async fn shell_request(
                         .collect();
                     let _ = to_ui.unbounded_send(BridgeMsg::Shells(views));
                     for view in missing {
-                        match attach_shell(client, to_ui, &view.shell_id, view.output_offset).await
+                        match attach_shell(
+                            client,
+                            to_ui,
+                            generation,
+                            &view.shell_id,
+                            view.output_offset,
+                        )
+                        .await
                         {
                             Ok(task) => {
-                                shell_tasks.insert(view.shell_id.clone(), task);
+                                if let Some(old) = shell_tasks.insert(view.shell_id.clone(), task) {
+                                    old.abort();
+                                }
                             }
                             Err(error) => send_shell_error(
                                 to_ui,
@@ -256,7 +292,12 @@ fn deliver(
                 BridgeRequest::Config(_) => BridgeMsg::Config(Err(error)),
                 BridgeRequest::Account(_) => BridgeMsg::Account(Err(error)),
                 BridgeRequest::Workspace(_) => BridgeMsg::Workspace(Err(error)),
-                BridgeRequest::ToolCatalog(_) => BridgeMsg::ToolCatalog(Err(error)),
+                BridgeRequest::ToolCatalog(ToolCatalogRequest::Get { session_id }) => {
+                    BridgeMsg::ToolCatalog {
+                        session_id: session_id.clone(),
+                        result: Err(error),
+                    }
+                }
                 BridgeRequest::Shell(_) => BridgeMsg::Shell(Err(error)),
                 BridgeRequest::Command { command_id, .. } => BridgeMsg::Command {
                     session_id: None,
@@ -278,9 +319,13 @@ fn deliver(
         (BridgeRequest::Workspace(_), Ok(ControlResponse::Workspace(response))) => {
             BridgeMsg::Workspace(Ok(response))
         }
-        (BridgeRequest::ToolCatalog(_), Ok(ControlResponse::ToolCatalog(response))) => {
-            BridgeMsg::ToolCatalog(Ok(response))
-        }
+        (
+            BridgeRequest::ToolCatalog(ToolCatalogRequest::Get { session_id }),
+            Ok(ControlResponse::ToolCatalog(response)),
+        ) => BridgeMsg::ToolCatalog {
+            session_id: session_id.clone(),
+            result: Ok(response),
+        },
         (BridgeRequest::Shell(_), Ok(ControlResponse::Shell(response))) => {
             BridgeMsg::Shell(Ok(response))
         }
@@ -389,5 +434,22 @@ pub(super) async fn refill(
             Ok(other) => trace(&format!("会话快照请求回执异常：{other:?}")),
             Err(error) => trace(&format!("会话快照请求失败：{error}")),
         }
+    }
+    match call(
+        client,
+        ControlRequest::ToolCatalog(ToolCatalogRequest::Get {
+            session_id: session_id.clone(),
+        }),
+    )
+    .await
+    {
+        Ok(ControlResponse::ToolCatalog(response)) => {
+            let _ = to_ui.unbounded_send(BridgeMsg::ToolCatalog {
+                session_id: session_id.clone(),
+                result: Ok(response),
+            });
+        }
+        Ok(other) => trace(&format!("工具目录请求回执异常：{other:?}")),
+        Err(error) => trace(&format!("工具目录请求失败：{error}")),
     }
 }

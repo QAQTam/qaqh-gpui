@@ -32,7 +32,7 @@ use qaqh_ringing_v3::{
     SessionSettingsPatch, SubagentSummary, ToolCallView, TurnSummary, WorkspaceEntry,
 };
 
-/// 单会话 SSE 流状态(由 `V2StreamStatus` 映射,避免 store 依赖 SDK 内部枚举形状)。
+/// 单会话事件流状态(由 V3 `StreamProgress` 映射,避免 store 依赖传输细节)。
 pub enum StreamState {
     Connecting,
     Open,
@@ -447,6 +447,10 @@ pub struct SessionStore {
     pub settings_pending: bool,
     /// 会话当前工具模式(composer 模式切换的权威值)。
     pub tool_mode: ToolMode,
+    /// 当前会话工具目录单一真相源(`ToolCatalogRequest::Get`)。
+    pub tool_catalog: Option<Arc<qaqh_core_vocab::ToolCatalog>>,
+    /// 置顶压缩摘要卡片是否展开全文。
+    pub compaction_expanded: bool,
     pub catalog: Option<Arc<ProfilesDocument>>,
     pub siwc_ready: bool,
     pub dsaccount_signed_in: bool,
@@ -601,6 +605,8 @@ provider_retry: None,
             settings: None,
             settings_pending: false,
             tool_mode: ToolMode::Standard,
+            tool_catalog: None,
+            compaction_expanded: false,
             catalog: None,
             siwc_ready: false,
             dsaccount_signed_in: false,
@@ -1417,28 +1423,16 @@ provider_retry: None,
         }
     }
 
-    /// 扫描块/工具里的大内容引用,对首次见到的哈希发一次 `FetchBlob`。
+    /// 扫描块/工具/待发图片/执行会话里的大内容引用,对首次见到的哈希发一次 `FetchBlob`。
     /// 快照、增量块、工具视图更新后调用;重复调用无副作用(幂等)。
     pub fn prefetch_blobs(&mut self) {
-        let mut wanted: Vec<qaqh_core_vocab::ContentHash> = Vec::new();
-        for block in &self.entries {
-            if let ContentRef::Blob { hash, .. } = &block.content {
-                wanted.push(*hash);
-            }
-            for attachment in &block.attachments {
-                if let ContentRef::Blob { hash, .. } = attachment {
-                    wanted.push(*hash);
-                }
-            }
-            wanted.extend(block.images.iter().map(|image| image.hash));
-        }
-        for tool in &self.tools {
-            for content in [&tool.args, &tool.output, &tool.diff].into_iter().flatten() {
-                if let ContentRef::Blob { hash, .. } = content {
-                    wanted.push(*hash);
-                }
-            }
-        }
+        let wanted = collect_blob_hashes(
+            &self.entries,
+            &self.tools,
+            &self.images,
+            &self.attachments,
+            &self.exec_sessions,
+        );
         for hash in wanted {
             if self.blobs.want(&hash) {
                 let _ = self.requests.unbounded_send(BridgeRequest::FetchBlob(hash));
@@ -1751,9 +1745,93 @@ pub fn groups(sessions: &[SessionRow], workspaces: &[WorkspaceEntry]) -> Vec<Wor
         .collect()
 }
 
+fn collect_blob_hashes(
+    entries: &[BlockView],
+    tools: &[ToolCallView],
+    images: &[ImageRefView],
+    attachments: &[ContentRef],
+    exec_sessions: &[ExecSessionSnapshot],
+) -> Vec<qaqh_core_vocab::ContentHash> {
+    let mut wanted = Vec::new();
+    for block in entries {
+        if let ContentRef::Blob { hash, .. } = &block.content {
+            wanted.push(*hash);
+        }
+        for attachment in &block.attachments {
+            if let ContentRef::Blob { hash, .. } = attachment {
+                wanted.push(*hash);
+            }
+        }
+        wanted.extend(block.images.iter().map(|image| image.hash));
+    }
+    for tool in tools {
+        for content in [&tool.args, &tool.output, &tool.diff].into_iter().flatten() {
+            if let ContentRef::Blob { hash, .. } = content {
+                wanted.push(*hash);
+            }
+        }
+    }
+    wanted.extend(images.iter().map(|image| image.hash));
+    for attachment in attachments {
+        if let ContentRef::Blob { hash, .. } = attachment {
+            wanted.push(*hash);
+        }
+    }
+    for exec in exec_sessions {
+        if let Some(ContentRef::Blob { hash, .. }) = &exec.output {
+            wanted.push(*hash);
+        }
+    }
+    wanted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_blob_hashes_includes_pending_images_attachments_and_exec_outputs() {
+        let img_hash = qaqh_core_vocab::ContentHash::from_bytes([1u8; 32]);
+        let att_hash = qaqh_core_vocab::ContentHash::from_bytes([2u8; 32]);
+        let exec_hash = qaqh_core_vocab::ContentHash::from_bytes([3u8; 32]);
+        let images = vec![ImageRefView {
+            hash: img_hash,
+            len: 4,
+            mime_type: "image/png".into(),
+        }];
+        let attachments = vec![ContentRef::Blob {
+            hash: att_hash,
+            len: 8,
+        }];
+        let exec_sessions = vec![ExecSessionSnapshot {
+            exec_session_id: qaqh_core_vocab::ExecSessionId::new("exec_1").expect("exec id"),
+            command: "echo hi".into(),
+            tty: false,
+            finished: true,
+            exit_code: Some(0),
+            next_offset: 3,
+            output: Some(ContentRef::Blob {
+                hash: exec_hash,
+                len: 3,
+            }),
+            state: qaqh_ringing_v3::ExecSessionStateView::Finished {
+                outcome: qaqh_ringing_v3::ExecOutcomeView::Exited { exit_code: 0 },
+            },
+            owner_session_id: SessionId::new("ses_1").expect("sid"),
+            origin_turn_id: None,
+            origin_call_id: None,
+            cwd: None,
+            started_at_ms: 0,
+            finished_at_ms: Some(1),
+            output_preview: String::new(),
+            preview_start_offset: 0,
+            output_complete: true,
+            capture_omitted_bytes: 0,
+            stream_dropped_bytes: 0,
+        }];
+        let hashes = collect_blob_hashes(&[], &[], &images, &attachments, &exec_sessions);
+        assert_eq!(hashes, vec![img_hash, att_hash, exec_hash]);
+    }
 
     #[test]
     fn groups_sort_by_created_ms_then_id() {

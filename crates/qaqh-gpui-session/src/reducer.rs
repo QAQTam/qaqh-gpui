@@ -140,9 +140,7 @@ pub fn apply_transcript(store: &mut SessionStore, page: qaqh_ringing_v3::Transcr
     for call in page.tool_calls {
         upsert_tool_view(store, call);
     }
-    store.transcript_before_ord = page
-        .next_before_ord
-        .or_else(|| store.entries.first().map(|block| block.ord));
+    store.transcript_before_ord = page.next_before_ord;
     store.timeline_list.reset(store.entries.len() + 1);
     store.prefetch_blobs();
 }
@@ -462,10 +460,12 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             store.driver_client_instance_id = Some(driver_client_instance_id);
             store.driver_ordinal = ordinal;
         }
-        SessionEvent::CatalogChanged { .. } => {
-            let _ = store.requests.unbounded_send(qaqh_gpui_wire::bridge::BridgeRequest::Config(
-                qaqh_ringing_v3::ConfigRequest::ListProviders,
-            ));
+        SessionEvent::CatalogChanged { session_id } => {
+            let _ = store.requests.unbounded_send(
+                qaqh_gpui_wire::bridge::BridgeRequest::ToolCatalog(
+                    qaqh_ringing_v3::ToolCatalogRequest::Get { session_id },
+                ),
+            );
         }
         SessionEvent::HandoffSealed {
             sealed_session_id,

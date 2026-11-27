@@ -270,14 +270,14 @@ cargo run -j2 -p qaqh-gpui -- --probe
 #   切会话/切回（尾窗+增量续接）→ 图片附件预览 → 设置页改模型 → 账号页登录态
 ```
 
-### 验收记录（2026-11-28，P3-5e 落地当轮）
+### 验收记录（2026-11-28，P3-5e 联动收口）
 
 | 门禁 | 结果 |
 |---|---|
-| 1 旧契约零命中 | ✅ `rg` 无输出（含 docs；`docs/m1-draft` 死草稿已删） |
-| 2 bridge 行数 | ✅ 435 行（≤ 650） |
-| 3 编译/测试 | ✅ `cargo check -j2 --workspace --all-targets` 0 错；`cargo test -j2 --workspace` 26 通过 0 失败；`cargo check -p qaqh-gpui --features acceptance` 绿 |
-| 4 连通性 | ✅ 隔离数据根跑 V3 daemon：`protocol_rev=1 build_id=4.2.0` / `daemon 已连接` / `session.list：0 个会话` |
+| 1 旧契约零命中 | ✅ `rg` 无输出（含 `crates/`、`Cargo.toml`、`scripts/ringing-probe.sh`、`scripts/check-capabilities.py`） |
+| 2 bridge 行数 | ✅ ≤ 650 行（满足腰斩硬标尺） |
+| 3 编译/测试 | ✅ `cargo check -j2 --workspace --all-targets` 0 错；`cargo test -j2 --workspace` 全绿；`cargo check -j2 -p qaqh-gpui --features acceptance` 绿；`python3 scripts/check-capabilities.py` 绿 |
+| 4 连通性 | ✅ 隔离数据根跑 `v4.7.100` V3 daemon：`protocol_rev=1 build_id=4.7.100` / `daemon 已连接` / `session.list：0 个会话` |
 | 5 真窗口 | ⏳ 待人工（见下方清单） |
 
 ---

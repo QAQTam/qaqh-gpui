@@ -48,12 +48,13 @@ pub enum PrimarySection {
     Access,
 }
 
-/// 「工具」页子分栏(Skills / MCP)。
+/// 「工具」页子分栏(Skills / MCP / 工具目录)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolsTab {
     #[default]
     Skills,
     Mcp,
+    Catalog,
 }
 
 /// 全局策略页行内输入框实体集合:改完回车或点应用即写 daemon,告别整页切表单。
@@ -500,6 +501,16 @@ impl DaemonStore {
             .unbounded_send(BridgeRequest::Session(SessionRequest::GetSkillsCatalog { cwd }));
     }
 
+    /// 刷新当前选中会话的后端工具目录（`ToolCatalogRequest::Get`）。
+    pub fn refresh_tool_catalog(&self, cx: &gpui_kit::App) {
+        if let Some(current) = &self.current {
+            let session_id = current.read(cx).session_id.clone();
+            let _ = self.requests.unbounded_send(BridgeRequest::ToolCatalog(
+                qaqh_ringing_v3::ToolCatalogRequest::Get { session_id },
+            ));
+        }
+    }
+
     /// 刷新「团队」页当前选定会话的 team 快照。
     pub fn refresh_team_page(&mut self) {
         if let Some(seed) = self.team_page_seed.clone() {
@@ -686,9 +697,24 @@ impl DaemonStore {
                 }
                 cx.notify();
             }
-            BridgeMsg::ToolCatalog(result) => {
-                if let Err(error) = result {
-                    self.last_operation = Some(format!("工具目录读取失败：{error}"));
+            BridgeMsg::ToolCatalog { session_id, result } => {
+                match result {
+                    Ok(qaqh_ringing_v3::ToolCatalogResponse::Catalog(catalog)) => {
+                        let catalog = Arc::new(*catalog);
+                        if let Some(store) = self
+                            .stores
+                            .iter()
+                            .find(|store| store.read(cx).session_id == session_id)
+                        {
+                            store.update(cx, |store, cx| {
+                                store.tool_catalog = Some(catalog);
+                                cx.notify();
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        self.last_operation = Some(format!("工具目录读取失败：{error}"));
+                    }
                 }
                 cx.notify();
             }

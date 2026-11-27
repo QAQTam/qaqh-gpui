@@ -2837,6 +2837,155 @@ fn assistant_source_text(store: &SessionStore, source: AssistantSource) -> Strin
 }
 
 /// 标准正文阅读轨(最宽 880px,窄屏或分栏压缩时自动收缩),表格破栏块以外的所有元素统一走此轨道居中。
+fn timeline_top_banners(
+    store: &SessionStore,
+    entity: &Entity<SessionStore>,
+    t: &Palette,
+    ty: &settings::Typography,
+) -> Option<AnyElement> {
+    let show_older = store.transcript_before_ord.is_some_and(|ord| ord > 1);
+    let compaction = store.pinned_compaction.as_ref();
+    if !show_older && compaction.is_none() {
+        return None;
+    }
+
+    let mut children: Vec<AnyElement> = Vec::new();
+    if show_older {
+        let loading = store.transcript_loading;
+        let label = if loading {
+            "正在加载更早历史…"
+        } else {
+            "加载更早历史"
+        };
+        let entity_for_click = entity.clone();
+        let pill = div()
+            .id("timeline-load-older")
+            .px_3()
+            .py_1()
+            .rounded_full()
+            .border_1()
+            .border_color(t.border_subtle)
+            .bg(t.surface_subtle)
+            .text_xs()
+            .text_color(if loading { t.faint } else { t.dim })
+            .when(!loading, |el| {
+                el.cursor_pointer()
+                    .hover(|style| style.bg(t.hover).text_color(t.text))
+                    .on_click(move |_, _, cx| {
+                        entity_for_click.update(cx, |store, cx| {
+                            store.request_older();
+                            cx.notify();
+                        });
+                    })
+            })
+            .child(label);
+        children.push(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(pill)
+                .into_any_element(),
+        );
+    }
+
+    if let Some(compaction) = compaction {
+        let expanded = store.compaction_expanded;
+        let entity_for_toggle = entity.clone();
+        let header_meta = if compaction.blocks_compacted > 0 {
+            format!("已压缩 {} 块", compaction.blocks_compacted)
+        } else {
+            "已固定".to_owned()
+        };
+        let header = div()
+            .id("timeline-pinned-compaction-toggle")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                entity_for_toggle.update(cx, |store, cx| {
+                    store.compaction_expanded = !store.compaction_expanded;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Layers)
+                            .with_size(Size::XSmall)
+                            .text_color(t.accent),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.text)
+                            .child("上下文压缩摘要"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.faint)
+                            .child(SharedString::from(header_meta)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child(if expanded { "收起" } else { "展开" }),
+            );
+
+        let body = if expanded {
+            div()
+                .text_xs()
+                .text_color(t.dim)
+                .child(SharedString::from(compaction.summary.clone()))
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(t.dim)
+                .line_clamp(2)
+                .text_ellipsis()
+                .child(SharedString::from(compaction.summary.clone()))
+                .into_any_element()
+        };
+
+        children.push(
+            div()
+                .id("timeline-pinned-compaction")
+                .w_full()
+                .rounded(px(RADIUS_CARD))
+                .border_1()
+                .border_color(t.border_subtle)
+                .bg(t.surface_subtle)
+                .px_3p5()
+                .py_2p5()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(header)
+                .child(body)
+                .into_any_element(),
+        );
+    }
+
+    Some(
+        prose_rail(ty)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(children)
+            .into_any_element(),
+    )
+}
+
 fn prose_rail(_ty: &settings::Typography) -> Div {
     div()
         .w_full()
@@ -3570,9 +3719,12 @@ impl Render for SessionStore {
         let timeline_list_el = list(list_state, move |index, window, cx| {
             let row = div().w_full().when(index == 0, |row| row.pt_4());
             let gap = px((10.0 + ty.density_shift).max(4.));
+            let top_banner = (index == 0)
+                .then(|| timeline_top_banners(entity.read(cx), &entity, &t, &ty))
+                .flatten();
 
             if let Some(item) = items_for_list.get(index) {
-                return match item {
+                let item_el = match item {
                     TimelineItem::Single(entry_idx) => {
                         let (is_assistant, last_assistant) = {
                             let store = entity.read(cx);
@@ -3641,6 +3793,18 @@ impl Render for SessionStore {
                             tail_max,
                         )))
                         .into_any_element(),
+                };
+                return match top_banner {
+                    Some(banner) => div()
+                        .w_full()
+                        .pt_4()
+                        .flex()
+                        .flex_col()
+                        .gap(gap)
+                        .child(banner)
+                        .child(item_el)
+                        .into_any_element(),
+                    None => item_el,
                 };
             }
 
@@ -3750,6 +3914,7 @@ impl Render for SessionStore {
                 .flex()
                 .flex_col()
                 .gap(gap)
+                .children(top_banner)
                 .children(live_trace_el)
                 .children(streaming_els)
                 .children(arg_stream_els)

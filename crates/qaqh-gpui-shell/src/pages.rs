@@ -1041,6 +1041,20 @@ pub(crate) fn tools_page(
                     }
                 }),
             ),
+            segmented_item(
+                "tools-tab-catalog",
+                "工具目录",
+                daemon.tools_tab == ToolsTab::Catalog,
+                t,
+                cx.listener(|daemon, _, _, cx| {
+                    if daemon.tools_tab != ToolsTab::Catalog {
+                        daemon.tools_tab = ToolsTab::Catalog;
+                        daemon.page_epoch = daemon.page_epoch.wrapping_add(1);
+                        daemon.refresh_tool_catalog(cx);
+                        cx.notify();
+                    }
+                }),
+            ),
         ],
         t,
     )
@@ -1058,6 +1072,7 @@ pub(crate) fn tools_page(
         t,
         cx.listener(|daemon, _, _, cx| {
             daemon.refresh_skills();
+            daemon.refresh_tool_catalog(cx);
             let _ = daemon
                 .requests
                 .unbounded_send(BridgeRequest::Config(qaqh_ringing_v3::ConfigRequest::LoadFull));
@@ -1070,6 +1085,7 @@ pub(crate) fn tools_page(
     let body = match daemon.tools_tab {
         ToolsTab::Skills => tools_skills_body(daemon, window, cx, t),
         ToolsTab::Mcp => tools_mcp_body(daemon, window, cx, t),
+        ToolsTab::Catalog => tools_catalog_body(daemon, cx, t),
     };
 
     page_shell(
@@ -1081,6 +1097,147 @@ pub(crate) fn tools_page(
         t,
     )
     .into_any_element()
+}
+
+fn tools_catalog_body(
+    daemon: &DaemonStore,
+    cx: &Context<DaemonStore>,
+    t: &Palette,
+) -> Vec<AnyElement> {
+    let Some(catalog) = daemon
+        .current
+        .as_ref()
+        .and_then(|store| store.read(cx).tool_catalog.clone())
+    else {
+        return vec![
+            card(t)
+                .p_4()
+                .text_xs()
+                .text_color(t.dim)
+                .child("选择会话后将从后端加载工具目录（ToolCatalog）。")
+                .into_any_element(),
+        ];
+    };
+
+    let available_count = catalog.available().count();
+    let total_count = catalog.entries.len();
+    let mode_label = tools_mode_label(Some(catalog.mode));
+
+    let mut out = Vec::new();
+    out.push(
+        card(t)
+            .px_3p5()
+            .py_2p5()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.text)
+                    .child(SharedString::from(format!("当前模式：{mode_label}"))),
+            )
+            .child(pill(
+                &format!("可用 {available_count} / {total_count}"),
+                t.accent,
+                t,
+            ))
+            .into_any_element(),
+    );
+
+    let cards = catalog.entries.iter().map(|entry| {
+        let group = match entry.group {
+            qaqh_core_vocab::ToolGroup::Read => "只读",
+            qaqh_core_vocab::ToolGroup::Write => "写入",
+            qaqh_core_vocab::ToolGroup::Exec => "执行",
+            qaqh_core_vocab::ToolGroup::Net => "网络",
+        };
+        let (risk_label, risk_color) = match entry.risk {
+            qaqh_core_vocab::ToolRiskLevel::ReadOnly => ("低风险", t.ok),
+            qaqh_core_vocab::ToolRiskLevel::Write => ("写操作", t.warn),
+            qaqh_core_vocab::ToolRiskLevel::Destructive => ("高风险", t.bad),
+            qaqh_core_vocab::ToolRiskLevel::Administrative => ("管理", t.accent),
+        };
+        let (avail_label, avail_color) = match &entry.availability {
+            qaqh_core_vocab::ToolAvailability::Available => ("可用", t.ok),
+            qaqh_core_vocab::ToolAvailability::Unavailable { reason } => (
+                match reason {
+                    qaqh_core_vocab::ToolUnavailableReason::ModelLacksToolCalls => "模型无工具能力",
+                    qaqh_core_vocab::ToolUnavailableReason::ModelLacksImageInput => "模型不支持图像",
+                    qaqh_core_vocab::ToolUnavailableReason::ExcludedByToolMode => "模式已排除",
+                    qaqh_core_vocab::ToolUnavailableReason::ExcludedByGlobalCeiling => "全局策略禁用",
+                },
+                t.faint,
+            ),
+        };
+        let origin = match &entry.origin {
+            qaqh_core_vocab::ToolOrigin::Builtin => "内置".to_owned(),
+            qaqh_core_vocab::ToolOrigin::DynamicMcp { server } => format!("MCP:{server}"),
+            qaqh_core_vocab::ToolOrigin::DynamicExtension { id } => format!("扩展:{id}"),
+        };
+
+        card(t)
+            .px_3p5()
+            .py_2p5()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.text)
+                                    .truncate()
+                                    .child(SharedString::from(entry.name.clone())),
+                            )
+                            .child(pill(group, t.dim, t))
+                            .child(pill(risk_label, risk_color, t)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .flex_shrink_0()
+                            .child(div().text_xs().text_color(t.faint).child(origin))
+                            .child(pill(avail_label, avail_color, t)),
+                    ),
+            )
+            .when(!entry.summary.is_empty(), |c| {
+                c.child(
+                    div()
+                        .text_xs()
+                        .text_color(t.dim)
+                        .child(SharedString::from(entry.summary.clone())),
+                )
+            })
+            .into_any_element()
+    });
+
+    out.push(
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(cards)
+            .into_any_element(),
+    );
+    out
 }
 
 fn tools_skills_body(

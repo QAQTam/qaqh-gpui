@@ -132,7 +132,10 @@ pub enum BridgeMsg {
     Config(Result<ConfigResponse, String>),
     Account(Result<AccountResponse, String>),
     Workspace(Result<WorkspaceResponse, String>),
-    ToolCatalog(Result<ToolCatalogResponse, String>),
+    ToolCatalog {
+        session_id: SessionId,
+        result: Result<ToolCatalogResponse, String>,
+    },
     /// Shell 域回执（write/resize 等）。
     Shell(Result<ShellResponse, String>),
     /// `shell.list` 全量。
@@ -241,6 +244,18 @@ fn channel() -> String {
     })
 }
 
+fn abort_task(slot: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = slot.take() {
+        handle.abort();
+    }
+}
+
+fn abort_all(map: &mut HashMap<String, tokio::task::JoinHandle<()>>) {
+    for (_, handle) in map.drain() {
+        handle.abort();
+    }
+}
+
 /// 桥线程主循环：复用 qaqh-client 的全局 tokio 运行时。
 pub fn run(
     to_ui: UnboundedSender<BridgeMsg>,
@@ -250,13 +265,15 @@ pub fn run(
     qaqh_client::runtime_handle().block_on(serve(to_ui, requests, client_instance_id));
 }
 
-async fn connect(build_id: &str) -> Result<V3Client<YamuxTransport>, String> {
+async fn connect(launch_if_missing: bool) -> Result<(u64, V3Client<YamuxTransport>), String> {
     let root = data_root();
     let channel = channel();
-    let instance = format!("qaqh-gpui-{}-{}", std::process::id(), next_generation());
-    V3Client::connect_local(&root, build_id, &channel, &instance, true)
+    let generation = next_generation();
+    let instance = format!("qaqh-gpui-{}-{generation}", std::process::id());
+    let client = V3Client::connect_local(&root, None, &channel, &instance, launch_if_missing)
         .await
-        .map_err(|error| format!("V3 连接失败：{error}"))
+        .map_err(|error| format!("V3 连接失败：{error}"))?;
+    Ok((generation, client))
 }
 
 async fn call(
@@ -269,10 +286,8 @@ async fn call(
 async fn establish(
     to_ui: &UnboundedSender<BridgeMsg>,
     blob_task: &mut Option<tokio::task::JoinHandle<()>>,
-) -> Result<V3Client<YamuxTransport>, String> {
-    let endpoint = qaqh_ringing_v3::read_daemon_endpoint(&data_root(), &channel())
-        .map_err(|error| format!("daemon.endpoint 不可读：{error}"))?;
-    let mut client = connect(&endpoint.build_id).await?;
+) -> Result<(u64, V3Client<YamuxTransport>), String> {
+    let (generation, mut client) = connect(true).await?;
     let (server_instance_id, build_id, protocol_rev) = match client.server_hello() {
         qaqh_ringing_v3::ServerHello::Accepted {
             server_instance_id,
@@ -294,10 +309,11 @@ async fn establish(
         to_ui,
         format!("V3 已连接：server={server_instance_id} build={build_id} protocol_rev={protocol_rev}"),
     );
+    abort_task(blob_task);
     if let Some(inbox) = client.take_blob_inbox() {
-        *blob_task = Some(spawn_blob_inbox(to_ui, inbox));
+        *blob_task = Some(spawn_blob_inbox(to_ui, generation, inbox));
     }
-    Ok(client)
+    Ok((generation, client))
 }
 
 /// 桥主循环：连接 → 名册 → 请求/事件流。
@@ -307,6 +323,7 @@ async fn serve(
     _client_instance_id: String,
 ) {
     let mut client: Option<V3Client<YamuxTransport>> = None;
+    let mut conn_gen = 0u64;
     let mut selected: Option<(SessionId, u64)> = None;
     let mut event_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut shell_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -319,19 +336,20 @@ async fn serve(
                 let Some(request) = message else { break };
                 match request {
                     BridgeRequest::Reconnect => {
-                        event_task = None;
-                        shell_tasks.clear();
-                        blob_task = None;
+                        abort_task(&mut event_task);
+                        abort_all(&mut shell_tasks);
+                        abort_task(&mut blob_task);
                         client = None;
+                        conn_gen = 0;
                         failures = 0;
                         let _ = to_ui.unbounded_send(BridgeMsg::Connection(ConnectionState::Connecting));
                         roster.reset_immediately();
                     }
                     BridgeRequest::Select { session_id, since_seq } => {
                         selected = Some((session_id.clone(), since_seq));
-                        event_task = None;
+                        abort_task(&mut event_task);
                         let Some(active) = &client else { continue };
-                        match attach_events(active, &to_ui, &session_id, since_seq).await {
+                        match attach_events(active, &to_ui, conn_gen, &session_id, since_seq).await {
                             Ok(task) => event_task = Some(task),
                             Err(error) => send_line(&to_ui, format!("附着会话事件流失败：{error}")),
                         }
@@ -342,7 +360,7 @@ async fn serve(
                             send_line(&to_ui, "连接尚未恢复，请稍后重试");
                             continue;
                         };
-                        handle_request(active, &to_ui, &mut shell_tasks, other).await;
+                        handle_request(active, &to_ui, conn_gen, &mut shell_tasks, other).await;
                     }
                 }
             }
@@ -352,8 +370,10 @@ async fn serve(
                         if requests::poll_roster(active, &to_ui).await { failures = 0; } else { failures += 1; }
                         if failures >= 3 {
                             client = None;
-                            event_task = None;
-                            shell_tasks.clear();
+                            conn_gen = 0;
+                            abort_task(&mut event_task);
+                            abort_all(&mut shell_tasks);
+                            abort_task(&mut blob_task);
                             let _ = to_ui.unbounded_send(BridgeMsg::Connection(ConnectionState::Failed {
                                 detail: "daemon 查询连续失败，正在重新发现服务".into(),
                             }));
@@ -362,11 +382,12 @@ async fn serve(
                     None => {
                         let _ = to_ui.unbounded_send(BridgeMsg::Connection(ConnectionState::Connecting));
                         match establish(&to_ui, &mut blob_task).await {
-                            Ok(active) => {
+                            Ok((generation, active)) => {
+                                conn_gen = generation;
                                 failures = 0;
                                 requests::poll_roster(&active, &to_ui).await;
                                 if let Some((seed, since_seq)) = selected.clone() {
-                                    match attach_events(&active, &to_ui, &seed, since_seq).await {
+                                    match attach_events(&active, &to_ui, conn_gen, &seed, since_seq).await {
                                         Ok(task) => event_task = Some(task),
                                         Err(error) => send_line(&to_ui, format!("重新附着失败：{error}")),
                                     }
@@ -384,34 +405,34 @@ async fn serve(
             }
         }
     }
-    drop(event_task);
-    drop(shell_tasks);
-    drop(blob_task);
+    abort_task(&mut event_task);
+    abort_all(&mut shell_tasks);
+    abort_task(&mut blob_task);
 }
 
 /// `--probe`：无 GUI 连通性验证。
 pub fn probe() {
     qaqh_client::runtime_handle().block_on(async {
-        let endpoint = match qaqh_ringing_v3::read_daemon_endpoint(&data_root(), &channel()) {
-            Ok(endpoint) => endpoint,
+        let (_, client) = match connect(false).await {
+            Ok(connected) => connected,
             Err(error) => {
-                println!("qaqh-gpui: daemon.endpoint 不可读（{error}）");
+                println!("qaqh-gpui: {error}");
                 return;
             }
         };
-        println!(
-            "qaqh-gpui: protocol_rev={} build_id={}",
-            qaqh_ringing_v3::PROTOCOL_REV,
-            endpoint.build_id
-        );
-        let client = match connect(&endpoint.build_id).await {
-            Ok(client) => client,
-            Err(error) => {
-                println!("连接失败：{error}");
+        let (build_id, protocol_rev) = match client.server_hello() {
+            qaqh_ringing_v3::ServerHello::Accepted {
+                build_id,
+                protocol_rev,
+                ..
+            } => (build_id.as_str(), *protocol_rev),
+            qaqh_ringing_v3::ServerHello::Rejected(reject) => {
+                println!("qaqh-gpui: 握手被拒（{reject:?}）");
                 return;
             }
         };
-        println!("daemon 已连接（build_id={}）", endpoint.build_id);
+        println!("qaqh-gpui: protocol_rev={protocol_rev} build_id={build_id}");
+        println!("daemon 已连接（build_id={build_id}）");
         let listed = call(
             &client,
             ControlRequest::Session(SessionRequest::List { include_archived: true }),
