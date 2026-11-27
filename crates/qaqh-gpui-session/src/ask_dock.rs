@@ -19,12 +19,10 @@ use qaqh_gpui_kit::kit::{
 };
 use qaqh_gpui_kit::motion::accordion_reveal;
 use qaqh_gpui_kit::theme::Palette;
-use qaqh_gpui_wire::ask;
-use qaqh_ringing_contract::fact::InteractionId;
-use qaqh_ringing_contract::state::InteractionView;
+use qaqh_core_vocab::InteractionId;
+use qaqh_ringing_v3::{AskQuestionView, InteractionView};
 
 use crate::store::SessionStore;
-use crate::timeline::content_text;
 
 fn keycap(label: impl Into<SharedString>, selected: bool, t: &Palette) -> Div {
     div()
@@ -238,18 +236,17 @@ pub fn render(
     t: &Palette,
 ) -> AnyElement {
     let iid = interaction.interaction_id.clone();
-    match ask::parse_request(&interaction.request) {
-        Ok(questions) if !questions.is_empty() => {
-            render_structured(store, &iid, &questions, window, cx, t)
-        }
-        _ => render_fallback(store, &iid, content_text(&interaction.request), window, cx, t),
+    if interaction.questions.is_empty() {
+        render_fallback(store, &iid, &interaction.body, window, cx, t)
+    } else {
+        render_structured(store, &iid, &interaction.questions, window, cx, t)
     }
 }
 
 fn render_structured(
     store: &mut SessionStore,
     iid: &InteractionId,
-    questions: &[ask::AskQuestion],
+    questions: &[AskQuestionView],
     window: &mut Window,
     cx: &mut Context<SessionStore>,
     t: &Palette,
@@ -312,7 +309,7 @@ fn render_structured(
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(t.text)
                 .truncate()
-                .child(SharedString::from(question.question.clone())),
+                .child(SharedString::from(question.prompt.clone())),
         );
         if total > 1 {
             collapsed_meta = collapsed_meta.child(
@@ -337,7 +334,7 @@ fn render_structured(
                 .line_height(relative(1.45))
                 .child(crate::markdown::render_inline(
                     md_id,
-                    &question.question,
+                    &question.prompt,
                     &md_extensions,
                     entity.downgrade(),
                     t,
@@ -532,7 +529,7 @@ fn render_structured(
     };
     body_col = body_col.child(action_footer(
         iid,
-        question.allow_custom,
+        question.allow_free_text,
         &custom_field,
         question.options.len(),
         custom_active,
@@ -554,7 +551,7 @@ fn render_structured(
     let body_el = body_col.into_any_element();
     let iid_keys = iid.clone();
     let options_for_keys = question.options.clone();
-    let allow_custom_keys = question.allow_custom;
+    let allow_custom_keys = question.allow_free_text;
     let card_focus = focus_handle.clone();
 
     let shell = card_shell(SharedString::from(format!("ask-dock-{iid}")), t)

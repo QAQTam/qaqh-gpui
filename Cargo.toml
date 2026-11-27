@@ -38,23 +38,18 @@ qaqh-gpui-shell = { path = "crates/qaqh-gpui-shell" }
 gpui-kit = "=0.11.0"
 
 # ---- 后端 path 依赖(相对 workspace 根,与 qaqh-tui 同路;后端仓必须与该相对路径共存) ----
-# RingingV2 传输权威实现。协议类型经它转出,前端零自建、零转换层。
-# 【复线 2026-11-13】后端 main f1b5fc78 已含 ADR-0014 A–G,工作区叠加 ADR-0015 goal
-# 面与 widget_context;协议重新对齐,退役 ../qaqh-backend-snap 快照(目录已不存在)。
+# 传输实现(本地发现 + V3 客户端 + 全局 tokio 运行时)。协议类型一律来自
+# `qaqh-ringing-v3`;前端零自建、零转换层。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
-# RingingV3 契约域(P3-5e):前端直接持有其强类型,零前端 DTO、零转换层。
+# RingingV3 契约域:前端直接持有其强类型,零前端 DTO、零转换层。
 qaqh-ringing-v3 = { path = "../qaqh-backend/crates/qaqh-ringing-v3" }
 qaqh-core-vocab = { path = "../qaqh-backend/crates/qaqh-core-vocab" }
 qaqh-v3-transport = { path = "../qaqh-backend/crates/qaqh-v3-transport" }
-# 契约类型直用(store 字段直接持有 TimelineEntry/ToolCallView 等),非转换层。
-qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
-# ModelSelection/SettingValue wire 类型(session.settings.patch 组装用,零转换层)。
-qaqh-types = { path = "../qaqh-backend/crates/qaqh-types" }
+# 配置文档(providers.toml / config.toml 的落地模型);协议面一律走 V3。
 qaqh-profile = { path = "../qaqh-backend/crates/qaqh-profile" }
 
 # ---- 第三方 ----
 futures = "0.3"
-base64 = "0.22"
 # AST 代码高亮(M5):官方 highlighter + 各语言 grammar(MIT 系)。
 tree-sitter-highlight = "0.25"
 tree-sitter-rust = "0.24"
@@ -72,6 +67,8 @@ percent-encoding = "2"
 tokio = { version = "1", default-features = false, features = ["time"] }
 # 完整 VT100/xterm/ConPTY 虚拟终端内核(Apache-2.0,仅用无头 Term + vte::ansi::Processor,不启本地 PTY)。
 alacritty_terminal = "0.26"
+# V3 `ShellRequest::Write` 的载荷类型(裸 PTY 字节);与后端同版本线。
+bytes = "1"
 
 # 内存受限环境:dev profile 压低编译峰值——
 # 16 个 codegen 单元压低单 crate 编译峰值,limited 调试信息压低产物与链接期峰值。

@@ -24,10 +24,9 @@ use qaqh_gpui_kit::motion::{
 use qaqh_gpui_kit::settings::MotionLevel;
 use qaqh_gpui_kit::theme::Palette;
 use qaqh_gpui_session::store::{SettingsEditor, model_default_effort, model_effort_levels};
-use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState, ScannedSkill};
-use qaqh_ringing_contract::team::snapshot::TeamAgentStatus;
-use qaqh_ringing_contract::team::task_types::TaskState;
-use qaqh_types::ModelSelection;
+use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState};
+use qaqh_core_vocab::{ModelSelection, ToolMode};
+use qaqh_ringing_v3::{SkillCatalogEntry, TaskState, TeamAgentStatus};
 
 use crate::daemon::{DaemonStore, ToolsTab, clean_session_title};
 
@@ -39,13 +38,11 @@ fn token_badge(tokens: u32) -> String {
     }
 }
 
-fn tools_mode_label(mode: Option<&str>) -> &'static str {
+fn tools_mode_label(mode: Option<ToolMode>) -> &'static str {
     match mode {
-        Some(m) if m == qaqh_types::MINIMAL => "精简",
-        Some(m) if m == qaqh_types::MINIMAL_B => "精简 B",
-        Some(m) if m == qaqh_types::MINIMAL_C => "精简 C",
-        Some(m) if m == qaqh_types::CUSTOM => "自定义",
-        _ => "标准",
+        Some(ToolMode::Core) => "精简",
+        Some(ToolMode::Custom) => "自定义",
+        Some(ToolMode::Standard) | None => "标准",
     }
 }
 
@@ -586,7 +583,12 @@ fn startup_composer_island(
                             model_id: mid.clone(),
                             options: Default::default(),
                         };
-                        if qaqh_profile::resolve_model_selection(catalog, &selection).is_ok() {
+                        if qaqh_profile::resolve_model_selection(
+                            catalog,
+                            &qaqh_gpui_session::store::profile_selection(&selection),
+                        )
+                        .is_ok()
+                        {
                             let display = model
                                 .display_name
                                 .as_deref()
@@ -597,10 +599,10 @@ fn startup_composer_island(
                             items.push((selection, display, ctx));
                         }
                     }
-                    let unauthenticated = match provider.credential {
-                        qaqh_types::CredentialSource::ApiKey => false,
-                        qaqh_types::CredentialSource::ChatgptPlan => !daemon.siwc_ready(),
-                        qaqh_types::CredentialSource::DeepseekAccount => {
+                    let unauthenticated = match qaqh_gpui_wire::profile_vocab::credential_kind(provider) {
+                        qaqh_core_vocab::CredentialSource::ApiKey => false,
+                        qaqh_core_vocab::CredentialSource::ChatgptPlan => !daemon.siwc_ready(),
+                        qaqh_core_vocab::CredentialSource::DeepseekAccount => {
                             !daemon.dsaccount_signed_in()
                         }
                     };
@@ -745,16 +747,16 @@ fn startup_composer_island(
         .into_any_element();
 
     // 3) 推理强度 Popover(仅当前所选模型或继承的全局默认模型支持推理档位时显示)
-    let effective_model = daemon
+    let effective_model: Option<ModelSelection> = daemon
         .new_model
-        .as_ref()
+        .clone()
         .or_else(|| {
             daemon
                 .providers
                 .as_deref()
                 .and_then(|catalog| catalog.default_model_selection.as_ref())
-        })
-        .cloned();
+                .map(qaqh_gpui_session::store::selection_from_profile)
+        });
     let levels = daemon
         .providers
         .as_deref()
@@ -842,7 +844,7 @@ fn startup_composer_island(
     });
 
     // 4) 工具档位 Popover
-    let cur_mode = daemon.startup_tool_mode.clone();
+    let cur_mode = daemon.startup_tool_mode;
     let mode_weak = weak;
     let tools_popover = Popover::new("startup-tools-popover")
         .anchor(Anchor::BottomLeft)
@@ -851,17 +853,16 @@ fn startup_composer_island(
             cx,
             "startup-tools-btn",
             IconName::Wrench,
-            tools_mode_label(cur_mode.as_deref()),
+            tools_mode_label(cur_mode),
             "选择新会话工具预设",
             t,
         ))
         .content(move |_state, _window, cx| {
             let popover: WeakEntity<PopoverState> = cx.entity().downgrade();
-            let presets: [(Option<&'static str>, &'static str, &'static str); 4] = [
+            let presets: [(Option<ToolMode>, &'static str, &'static str); 3] = [
                 (None, "标准工具", "完整工程读写、搜索与终端"),
-                (Some(qaqh_types::MINIMAL), "精简", "基础文件读写与命令执行"),
-                (Some(qaqh_types::MINIMAL_B), "精简 B", "轻量只读检查与检索"),
-                (Some(qaqh_types::MINIMAL_C), "精简 C", "最小对话工具集"),
+                (Some(ToolMode::Core), "精简", "基础文件读写与命令执行"),
+                (Some(ToolMode::Custom), "自定义", "只保留工具白名单内的工具"),
             ];
             let mut card_box = popover_card(&t_copy, 224.);
             card_box = card_box.child(
@@ -874,7 +875,7 @@ fn startup_composer_island(
                     .child("工具权限预设"),
             );
             for (val, label, desc) in presets {
-                let selected = cur_mode.as_deref() == val;
+                let selected = cur_mode == val;
                 let w = mode_weak.clone();
                 let pop = popover.clone();
                 card_box = card_box.child(popover_option_row(
@@ -884,9 +885,8 @@ fn startup_composer_island(
                     selected,
                     &t_copy,
                     move |window, cx| {
-                        let next = val.map(ToOwned::to_owned);
                         let _ = w.update(cx, |daemon, cx| {
-                            daemon.startup_tool_mode = next;
+                            daemon.startup_tool_mode = val;
                             cx.notify();
                         });
                         let _ = pop.update(cx, |state, cx| state.dismiss(window, cx));
@@ -1034,7 +1034,9 @@ pub(crate) fn tools_page(
                     if daemon.tools_tab != ToolsTab::Mcp {
                         daemon.tools_tab = ToolsTab::Mcp;
                         daemon.page_epoch = daemon.page_epoch.wrapping_add(1);
-                        let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
+                        let _ = daemon
+                            .requests
+                            .unbounded_send(BridgeRequest::Config(qaqh_ringing_v3::ConfigRequest::LoadFull));
                         cx.notify();
                     }
                 }),
@@ -1056,7 +1058,9 @@ pub(crate) fn tools_page(
         t,
         cx.listener(|daemon, _, _, cx| {
             daemon.refresh_skills();
-            let _ = daemon.requests.unbounded_send(BridgeRequest::QueryConfig);
+            let _ = daemon
+                .requests
+                .unbounded_send(BridgeRequest::Config(qaqh_ringing_v3::ConfigRequest::LoadFull));
             cx.notify();
         }),
     );
@@ -1118,53 +1122,9 @@ fn tools_skills_body(
         return blocks;
     };
 
-    if report.daemon_unreachable {
-        blocks.push(
-            div()
-                .p_3p5()
-                .rounded(px(RADIUS_CARD))
-                .bg(soft(t.warn, 0.10))
-                .border_1()
-                .border_color(soft(t.warn, 0.25))
-                .flex()
-                .items_center()
-                .gap_2p5()
-                .child(
-                    Icon::new(IconName::TriangleAlert)
-                        .with_size(Size::Small)
-                        .text_color(t.warn),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(t.text)
-                                .child("daemon 不可达，无法读取 skills catalog"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(t.dim)
-                                .child("请确认本地 daemon 连接就绪后点击「重新扫描」。"),
-                        ),
-                )
-                .into_any_element(),
-        );
-    }
-
-    if !report.issues.is_empty() {
-        let issue_rows = report.issues.iter().map(|issue| {
-            let color = if issue.forbidden { t.bad } else { t.warn };
-            let detail = if issue.forbidden {
-                "目录不在 daemon 可读根内——把它注册为工作区即可读。".to_owned()
-            } else {
-                issue.message.clone()
-            };
+    if !report.diagnostics.is_empty() {
+        let issue_rows = report.diagnostics.iter().map(|issue| {
+            let color = if issue.severity == "error" { t.bad } else { t.warn };
             div()
                 .px_3()
                 .py_2()
@@ -1186,7 +1146,10 @@ fn tools_skills_body(
                         .min_w_0()
                         .text_xs()
                         .text_color(t.text)
-                        .child(SharedString::from(format!("{} · {detail}", issue.root))),
+                        .child(SharedString::from(format!(
+                            "{} · {}",
+                            issue.path, issue.message
+                        ))),
                 )
         });
         blocks.push(
@@ -1199,8 +1162,18 @@ fn tools_skills_body(
         );
     }
 
-    let project_skills = report.project.clone();
-    let user_skills = report.user.clone();
+    let project_skills: Vec<SkillCatalogEntry> = report
+        .skills
+        .iter()
+        .filter(|skill| skill.scope == "project")
+        .cloned()
+        .collect();
+    let user_skills: Vec<SkillCatalogEntry> = report
+        .skills
+        .iter()
+        .filter(|skill| skill.scope != "project")
+        .cloned()
+        .collect();
     blocks.push(skill_group_section(
         daemon,
         "project",
@@ -1237,7 +1210,7 @@ fn skill_group_section(
     title: &'static str,
     hint: &'static str,
     icon: IconName,
-    skills: &[ScannedSkill],
+    skills: &[SkillCatalogEntry],
     empty_text: &'static str,
     animate_motion: bool,
     window: &mut Window,
@@ -1277,13 +1250,12 @@ fn skill_group_section(
         let count = skills.len();
         let mut cards = Vec::with_capacity(count);
         for (idx, item) in skills.iter().enumerate() {
-            let path = item.entry.path.clone();
+            let path = item.path.clone();
             let expanded = daemon.expanded_skills.contains(&path);
-            let name = item.entry.name.clone();
-            let desc = item.entry.description.clone();
-            let ws = item.workspace.clone();
-            let origin = item.entry.origin.clone();
-            let scope = item.entry.scope.clone();
+            let name = item.name.clone();
+            let desc = item.description.clone();
+            let origin = item.origin.clone();
+            let scope = item.scope.clone();
             let toggle_path = path.clone();
             let t_copy = *t;
 
@@ -1346,7 +1318,7 @@ fn skill_group_section(
                         .items_center()
                         .gap_2()
                         .flex_shrink_0()
-                        .child(div().text_xs().text_color(t.faint).child(ws.clone()))
+                        .child(div().text_xs().text_color(t.faint).child(origin.clone()))
                         .child(spring_chevron(
                             SharedString::from(format!("skill-chev-{group_key}-{idx}")),
                             expanded,
@@ -1356,7 +1328,7 @@ fn skill_group_section(
                 );
 
             let detail_path = path.clone();
-            let detail_desc = item.entry.description.clone();
+            let detail_desc = item.description.clone();
             let reveal_body = accordion_reveal(
                 SharedString::from(format!("skill-reveal-{group_key}-{idx}")),
                 expanded,
@@ -1389,8 +1361,9 @@ fn skill_group_section(
                                 .gap_2()
                                 .text_xs()
                                 .text_color(t_copy.faint)
-                                .child(SharedString::from(format!("作用域：{scope} · 来源：{origin}")))
-                                .child(SharedString::from(format!("工作区：{ws}"))),
+                                .child(SharedString::from(format!(
+                                    "作用域：{scope} · 来源：{origin}"
+                                ))),
                         )
                         .child(
                             div()
@@ -1613,7 +1586,7 @@ fn task_state_meta(state: TaskState, t: &Palette) -> (&'static str, Hsla) {
     match state {
         TaskState::Open => ("待认领", t.dim),
         TaskState::Claimed => ("进行中", t.accent),
-        TaskState::Completed | TaskState::Closed => ("已完结", t.ok),
+        TaskState::Completed => ("已完结", t.ok),
         TaskState::Cancelled => ("已取消", t.bad),
     }
 }
@@ -1643,13 +1616,13 @@ pub(crate) fn team_page(
 
     let selected_seed = daemon.team_page_seed.clone();
     let active_label = selected_seed
-        .as_deref()
-        .and_then(|seed| daemon.sessions.iter().find(|s| s.id == seed))
+        .as_ref()
+        .and_then(|seed| daemon.sessions.iter().find(|s| &s.id == seed))
         .map(|row| clean_session_title(row, &daemon.workspaces).to_string())
         .unwrap_or_else(|| "选择会话".to_owned());
     let active_short: String = active_label.chars().take(26).collect();
 
-    let session_opts: Vec<(String, String, Option<String>)> = daemon
+    let session_opts: Vec<(qaqh_core_vocab::SessionId, String, Option<String>)> = daemon
         .sessions
         .iter()
         .filter(|s| !s.archived)
@@ -1705,7 +1678,7 @@ pub(crate) fn team_page(
                 );
             } else {
                 for (sid, title, ws) in &session_opts {
-                    let is_sel = selected_seed.as_deref() == Some(sid.as_str());
+                    let is_sel = selected_seed.as_ref() == Some(sid);
                     let sid_owned = sid.clone();
                     let w = weak.clone();
                     let pop = popover.clone();
@@ -1827,7 +1800,7 @@ fn team_page_body(
         .count();
     let completed = tasks
         .iter()
-        .filter(|task| matches!(task.state, TaskState::Completed | TaskState::Closed))
+        .filter(|task| matches!(task.state, TaskState::Completed))
         .count();
     let total_agents = resp.team.agents.len();
 
@@ -1860,14 +1833,14 @@ fn team_page_body(
                     tasks
                         .iter()
                         .find(|other| &other.task_id == dep_id)
-                        .is_some_and(|dep| matches!(dep.state, TaskState::Completed | TaskState::Closed))
+                        .is_some_and(|dep| matches!(dep.state, TaskState::Completed))
                 });
                 let blocked = !deps_satisfied
                     && matches!(task.state, TaskState::Open | TaskState::Claimed);
                 let owner_name = task
                     .owner
-                    .as_ref()
-                    .and_then(|o| o.agent_path.as_str().rsplit('/').next())
+                    .as_deref()
+                    .and_then(|o| o.rsplit('/').next())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("未认领")
                     .to_owned();
@@ -1880,7 +1853,7 @@ fn team_page_body(
                             .iter()
                             .find(|other| &other.task_id == dep_id)
                             .map(|other| other.title.clone())
-                            .unwrap_or_else(|| dep_id.as_str().to_owned())
+                            .unwrap_or_else(|| dep_id.clone())
                     })
                     .collect();
 
@@ -2015,10 +1988,10 @@ fn team_page_body(
                     .to_owned();
                 let (status_label, status_color, active) = agent_status_meta(agent.status, t);
                 let residency_label = match agent.residency {
-                    qaqh_ringing_contract::team::snapshot::TeamAgentResidency::Loaded => "常驻",
-                    qaqh_ringing_contract::team::snapshot::TeamAgentResidency::Unloaded => "已休眠",
+                    qaqh_ringing_v3::TeamAgentResidency::Loaded => "常驻",
+                    qaqh_ringing_v3::TeamAgentResidency::Unloaded => "已休眠",
                 };
-                let agent_session_id = agent.agent_id.0.clone();
+                let agent_session_id = agent.agent_id.clone();
                 let clickable = daemon.sessions.iter().any(|s| s.id == agent_session_id);
                 let tip_path = raw_path.clone();
 
@@ -2160,7 +2133,9 @@ pub(crate) fn access_page(
         t,
         cx.listener(|daemon, _, _, cx| {
             daemon.refresh_accounts();
-            let _ = daemon.requests.unbounded_send(BridgeRequest::ListProviders);
+            let _ = daemon
+                .requests
+                .unbounded_send(BridgeRequest::Config(qaqh_ringing_v3::ConfigRequest::ListProviders));
             cx.notify();
         }),
     );
@@ -2187,12 +2162,16 @@ pub(crate) fn access_page(
             for (pid, provider) in &catalog.providers {
                 let mut has_any = false;
                 for mid in provider.models.keys() {
-                    let sel = ModelSelection {
-                        provider_id: pid.clone(),
-                        model_id: mid.clone(),
-                        options: Default::default(),
-                    };
-                    if qaqh_profile::resolve_model_selection(catalog, &sel).is_ok() {
+                    if qaqh_profile::resolve_model_selection(
+                        catalog,
+                        &qaqh_profile::ModelSelection {
+                            provider_id: pid.clone(),
+                            model_id: mid.clone(),
+                            options: Default::default(),
+                        },
+                    )
+                    .is_ok()
+                    {
                         has_any = true;
                         active_models += 1;
                     }

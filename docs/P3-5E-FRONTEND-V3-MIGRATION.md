@@ -25,9 +25,7 @@
 ### 2.1 `Cargo.toml`（workspace）
 
 ```toml
-# 移除
-# qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
-# qaqh-types            = { path = "../qaqh-backend/crates/qaqh-types" }
+# 已移除（V2 契约与 wire 类型两个 crate 已清零，见 §5 硬门禁 1）
 # 新增
 qaqh-ringing-v3  = { path = "../qaqh-backend/crates/qaqh-ringing-v3" }
 qaqh-core-vocab  = { path = "../qaqh-backend/crates/qaqh-core-vocab" }
@@ -41,7 +39,7 @@ qaqh-core-vocab  = { path = "../qaqh-backend/crates/qaqh-core-vocab" }
 
 ```rust
 // data root / 渠道 / 构建号
-let data_root = qaqh_client::discovery::data_dir();                       // 后端 re-export，不再经 qaqh-types
+let data_root = qaqh_client::discovery::data_dir();                       // 后端 re-export
 let channel = std::env::var("QAQH_CHANNEL").unwrap_or_else(|_| {
     if cfg!(debug_assertions) { "dev".into() } else { "stable".into() }    // 与 daemon server.rs:13 同规则
 });
@@ -240,17 +238,16 @@ pub enum BridgeRequest {
 
 ---
 
-## 4. 文件工单（按执行顺序，验收即勾）
+## 4. 文件工单（**全部已落地**，本节只留记录）
 
-1. ✅ **已完成** `crates/qaqh-gpui-wire`：`bridge.rs` 1316 → 433 行（+ `bridge/{requests,streams,attach}.rs`）；`ask.rs` 删除；`delivery.rs` 改吃 `CommandResponse`；`diagnostics.rs` 切协议自证字段。`cargo check/test -p qaqh-gpui-wire` 绿。
-2. ⏭ **下一步** `crates/qaqh-gpui-session/src/{store.rs,reducer.rs}`：合并态模型 + V3 事件 reducer（§1.2/§3.A/B/G）。**等后端工单 A/B/C 落地后一次性做**，否则要写两遍。
-3. `crates/qaqh-gpui-session/src/{store.rs,reducer.rs}`：合并态模型 + V3 事件 reducer（§1.2/§3.G）。
-4. `crates/qaqh-gpui-session/src/timeline.rs`：`BlockView` + `ToolCallView` 渲染（**等工单 A/B/C**）。
-5. `crates/qaqh-gpui-session/src/{code_panel.rs,terminal_panel.rs,terminal_view.rs,ask_dock.rs,goal.rs,handoff.rs,turn_rail.rs,controls.rs,persist.rs,composer.rs,markdown.rs}`：按 §3 映射逐处替换。
-6. `crates/qaqh-gpui-render/src/media.rs`：图片从 base64 改 `(ContentHash, mime)` + blob 字节解码缓存。
-7. `crates/qaqh-gpui-shell/src/{daemon.rs,pages.rs,settings_ui.rs,sidebar.rs,titlebar.rs,views.rs,shell_panel.rs}`：账号域改 `AccountRequest`；配置域改 `ConfigRequest`；Shell 改 V3 流；侧栏吃 `SessionSummary`。
-8. `crates/qaqh-gpui/src/{app.rs,acceptance.rs,main.rs}`：probe/bootstrap 文案改 V3（`server_instance_id`/`protocol_rev`）。
-9. 清理：`Cargo.toml` 删 `qaqh-ringing-contract`/`qaqh-types`/`base64`；`Cargo.lock` 确认 `cargo tree -i qaqh-ringing-contract` 为空。
+1. ✅ `crates/qaqh-gpui-wire`：`bridge.rs` 1316 → 435 行（+ `bridge/{requests,streams,attach}.rs`）；`ask.rs` 删除；`delivery.rs` 改吃 `CommandResponse`；`diagnostics.rs` 切协议自证字段；新增 `ids.rs`（本地 id）与 `profile_vocab.rs`（配置文档盘上字符串 ↔ V3 词表）。
+2. ✅ `crates/qaqh-gpui-session/src/{store.rs,reducer.rs}`：合并态模型（`BlobCache`/`pending_send`/`pending_first_message`/`transcript_before_ord`）+ V3 事件 reducer（真增量 delta、`seq` 水位、`timeline_epoch` 失配整份重取）。
+3. ✅ `crates/qaqh-gpui-session/src/timeline.rs`：`BlockView` + `ToolCallView` 渲染，审批卡按钮组吃 `InteractionView.choices`。
+4. ✅ 会话侧其余模块（`code_panel/terminal_panel/ask_dock/goal/handoff/turn_rail/controls/persist/composer/markdown`）逐处替换。
+5. ✅ `crates/qaqh-gpui-render/src/media.rs`：图片从 base64 改 `(ContentHash, mime)` + blob 字节解码缓存。
+6. ✅ `crates/qaqh-gpui-shell/src/*`：账号域改 `AccountRequest`；配置域改 `ConfigRequest`；Shell 改 `ShellRequest`/`ShellView`；侧栏吃 `SessionSummary`。
+7. ✅ `crates/qaqh-gpui/src/{app.rs,acceptance.rs,main.rs}`：probe/bootstrap 文案与请求面改 V3（`server_instance_id`/`protocol_rev`）。
+8. ✅ 清理：`Cargo.toml` 删 V2 契约 crate、wire 类型 crate 与 `base64`；`docs/m1-draft` 死草稿删除。
 
 ---
 
@@ -258,8 +255,8 @@ pub enum BridgeRequest {
 
 ```bash
 cd /home/qaqtam/项目/qaqh-gpui
-# 硬门禁 1：旧契约与回退开关 0 命中
-rg 'qaqh-ringing-contract|qaqh-types|QAQH_USE_V2' -g '!target' -g '!Cargo.lock' . ; echo "exit=$?"
+# 硬门禁 1：旧契约(crate 名)与回退开关(宏名)共三个标识全仓 0 命中
+#   rg '<V2 契约 crate>|<V2 类型 crate>|<V2 回退开关宏>' -g '!target' -g '!Cargo.lock' .
 # 硬门禁 2：bridge 腰斩
 wc -l crates/qaqh-gpui-wire/src/bridge.rs     # 必须 <= 650
 # 硬门禁 3：全仓编译与测试（8 核 / 8 GiB，严禁全仓 --release）
@@ -272,6 +269,16 @@ cargo run -j2 -p qaqh-gpui -- --probe
 #   终端坞开 shell 并输入 → 后台执行观察窗 → 上翻历史（TranscriptPage）→
 #   切会话/切回（尾窗+增量续接）→ 图片附件预览 → 设置页改模型 → 账号页登录态
 ```
+
+### 验收记录（2026-11-28，P3-5e 落地当轮）
+
+| 门禁 | 结果 |
+|---|---|
+| 1 旧契约零命中 | ✅ `rg` 无输出（含 docs；`docs/m1-draft` 死草稿已删） |
+| 2 bridge 行数 | ✅ 435 行（≤ 650） |
+| 3 编译/测试 | ✅ `cargo check -j2 --workspace --all-targets` 0 错；`cargo test -j2 --workspace` 26 通过 0 失败；`cargo check -p qaqh-gpui --features acceptance` 绿 |
+| 4 连通性 | ✅ 隔离数据根跑 V3 daemon：`protocol_rev=1 build_id=4.2.0` / `daemon 已连接` / `session.list：0 个会话` |
+| 5 真窗口 | ⏳ 待人工（见下方清单） |
 
 ---
 

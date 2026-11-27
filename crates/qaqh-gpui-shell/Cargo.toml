@@ -13,10 +13,10 @@ qaqh-gpui-wire = { workspace = true }
 qaqh-gpui-kit = { workspace = true }
 qaqh-gpui-session = { workspace = true }
 gpui-kit = { workspace = true }
-qaqh-client = { workspace = true }
-qaqh-ringing-contract = { workspace = true }
-qaqh-types = { workspace = true }
+qaqh-ringing-v3 = { workspace = true }
+qaqh-core-vocab = { workspace = true }
 qaqh-profile = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

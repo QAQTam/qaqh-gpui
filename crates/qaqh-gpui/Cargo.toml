@@ -3,7 +3,7 @@ name = "qaqh-gpui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "QAQ-Harness GPUI 桌面前端(RingingV2 客户端)"
+description = "QAQ-Harness GPUI 桌面前端(RingingV3 客户端)"
 
 [[bin]]
 name = "qaqh-gpui"
@@ -45,6 +45,7 @@ qaqh-gpui-session = { workspace = true }
 qaqh-gpui-shell = { workspace = true }
 futures = { workspace = true }
 gpui-kit = { workspace = true }
-qaqh-ringing-contract = { workspace = true }
+qaqh-ringing-v3 = { workspace = true }
+qaqh-core-vocab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

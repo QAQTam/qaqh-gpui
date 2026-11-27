@@ -7,8 +7,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, Context, FontWeight, ListOffset, MouseButton, SharedString, Window, div, px,
 };
-use qaqh_ringing_contract::fact::{ActorKind, AssistantBlockKind, InputPurpose};
-use qaqh_ringing_contract::state::TimelineEntry;
+use qaqh_ringing_v3::{BlockActor, BlockKind, BlockView, InputPurpose};
 
 use qaqh_gpui_kit::kit::{RADIUS_POPOVER, shadow_card, shadow_popover, soft};
 use qaqh_gpui_kit::motion::{effective_motion, presence_overlay};
@@ -54,11 +53,14 @@ fn collect_turns(store: &SessionStore, display_items: &[TimelineItem]) -> Vec<Tu
         let TimelineItem::Single(entry_idx) = item else {
             continue;
         };
-        if let Some(TimelineEntry::Input {
-            actor, purpose, ..
+        if let Some(BlockView {
+            kind: BlockKind::User,
+            actor,
+            purpose,
+            ..
         }) = store.entries.get(*entry_idx)
-            && actor.kind == ActorKind::User
-            && *purpose == InputPurpose::TriggerTurn
+            && *actor == Some(BlockActor::User)
+            && *purpose == Some(InputPurpose::TriggerTurn)
         {
             turn_starts.push((*entry_idx, display_idx));
         }
@@ -78,14 +80,15 @@ fn collect_turns(store: &SessionStore, display_items: &[TimelineItem]) -> Vec<Tu
             .unwrap_or(store.entries.len());
 
         let (prompt, turn_id) = match store.entries.get(start_entry) {
-            Some(TimelineEntry::Input {
+            Some(BlockView {
+                kind: BlockKind::User,
                 content,
                 images,
                 attachments,
                 turn_id,
                 ..
             }) => {
-                let text = collapse_preview_text(content_text(content), 120);
+                let text = collapse_preview_text(&content_text(store, content), 120);
                 let prompt = if !text.is_empty() {
                     text
                 } else if !images.is_empty() || !attachments.is_empty() {
@@ -103,33 +106,33 @@ fn collect_turns(store: &SessionStore, display_items: &[TimelineItem]) -> Vec<Tu
         let mut total_ms: u64 = 0;
 
         for entry in store.entries.get(start_entry + 1..end_entry).into_iter().flatten() {
-            let TimelineEntry::AssistantBlock {
-                block_kind,
+            let BlockView {
+                kind,
                 content,
                 generated_ms,
                 turn_id: block_turn_id,
                 ..
-            } = entry
-            else {
-                continue;
-            };
+            } = entry;
             if let Some(tid) = turn_id
-                && block_turn_id != tid
+                && block_turn_id.as_ref() != Some(tid)
             {
+                continue;
+            }
+            if !matches!(kind, BlockKind::Answer | BlockKind::Reasoning) {
                 continue;
             }
             if let Some(ms) = generated_ms {
                 total_ms = total_ms.saturating_add(*ms);
             }
-            let collapsed = collapse_preview_text(content_text(content), 140);
+            let collapsed = collapse_preview_text(&content_text(store, content), 140);
             if collapsed.is_empty() {
                 continue;
             }
-            match block_kind {
-                AssistantBlockKind::Answer if answer_preview.is_none() => {
+            match kind {
+                BlockKind::Answer if answer_preview.is_none() => {
                     answer_preview = Some(collapsed);
                 }
-                AssistantBlockKind::Reasoning if reasoning_preview.is_none() => {
+                BlockKind::Reasoning if reasoning_preview.is_none() => {
                     reasoning_preview = Some(collapsed);
                 }
                 _ => {}
@@ -143,10 +146,10 @@ fn collect_turns(store: &SessionStore, display_items: &[TimelineItem]) -> Vec<Tu
                     continue;
                 }
                 match kind {
-                    AssistantBlockKind::Answer if answer_preview.is_none() => {
+                    BlockKind::Answer if answer_preview.is_none() => {
                         answer_preview = Some(collapsed);
                     }
-                    AssistantBlockKind::Reasoning if reasoning_preview.is_none() => {
+                    BlockKind::Reasoning if reasoning_preview.is_none() => {
                         reasoning_preview = Some(collapsed);
                     }
                     _ => {}

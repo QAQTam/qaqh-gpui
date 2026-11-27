@@ -49,6 +49,7 @@ pub(super) async fn attach_events(
                                 last_seq: stats.last_seq,
                                 resync_cycles: stats.resync_cycles,
                                 ordering_violations: stats.ordering_violations,
+                                ended: true,
                             },
                         ),
                     );

@@ -98,6 +98,8 @@ pub struct StreamProgress {
     pub last_seq: u64,
     pub resync_cycles: u64,
     pub ordering_violations: u64,
+    /// 该流已终止（服务端断开/错误）；`false` = 仍在订阅。
+    pub ended: bool,
 }
 
 /// 桥 → GPUI 方向的消息（载荷全是 V3 强类型）。

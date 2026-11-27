@@ -1,7 +1,7 @@
 //! 后台执行观察窗(electron ExecSessionDrawer / ReadOnlyTerminal 的 GPUI 演进版)。
 //!
 //! 数据面 = RingingV2 exec session(后端 PTY 捕获流,协议最高准则,零转换层):
-//! - live:exec_output_tail 增量(有 slot 时更鲜)否则 ExecSessionView.output_preview
+//! - live:exec_output_tail 增量(有 slot 时更鲜)否则 ExecSessionSnapshot.output_preview
 //!   尾窗,offset 口径 = preview_start_offset / next_offset / slot end_offset;
 //! - 终态:权威 output 全量 rehydrate(electron finalSnapshot 同口径);
 //! - 落后或交叉保留窗口 → reset 重建;单实例屏,切换会话即重建(抽屉纪律 3)。
@@ -31,12 +31,11 @@ use qaqh_gpui_kit::motion::{
 };
 use qaqh_gpui_kit::settings::{self, Typography};
 use qaqh_gpui_kit::theme::{Palette, terminal_palette};
-use qaqh_ringing_contract::fact::ExecSessionId;
-use qaqh_ringing_contract::state::{ExecSessionOutcome, ExecSessionState, ExecSessionView};
+use qaqh_core_vocab::ExecSessionId;
+use qaqh_ringing_v3::{ExecOutcomeView, ExecSessionSnapshot, ExecSessionStateView};
 
 use crate::store::SessionStore;
 use crate::terminal_view::{ColsMode, TerminalView};
-use crate::timeline::content_text;
 
 /// 后端 exec 会话当前固定列数(160 列);未来协议透传 `pty_cols` 时由此唯一入口接管。
 pub const BACKEND_EXEC_PTY_COLS: usize = 160;
@@ -122,15 +121,15 @@ impl TerminalPanel {
     }
 }
 
-fn backend_cols_for(_session: Option<&ExecSessionView>) -> usize {
+fn backend_cols_for(_session: Option<&ExecSessionSnapshot>) -> usize {
     BACKEND_EXEC_PTY_COLS
 }
 
-fn state_code(state: &ExecSessionState) -> u8 {
+fn state_code(state: &ExecSessionStateView) -> u8 {
     match state {
-        ExecSessionState::Running => 0,
-        ExecSessionState::Stopping { .. } => 1,
-        ExecSessionState::Finished { .. } => 2,
+        ExecSessionStateView::Running => 0,
+        ExecSessionStateView::Stopping { .. } => 1,
+        ExecSessionStateView::Finished { .. } => 2,
     }
 }
 
@@ -140,9 +139,9 @@ fn default_pick(store: &SessionStore) -> Option<ExecSessionId> {
         .exec_sessions
         .iter()
         .min_by_key(|session| {
-            (usize::from(session.state.is_terminal()), Reverse(session.started_at_ms))
+            (usize::from(session.finished), Reverse(session.started_at_ms))
         })
-        .map(|session| session.id.clone())
+        .map(|session| session.exec_session_id.clone())
 }
 
 /// 打开面板;指定 exec_id 则选中,否则走默认选中。
@@ -220,11 +219,11 @@ fn copy_text(store: &SessionStore, id: &ExecSessionId, cx: &App) -> String {
     if let Some(selected) = store.terminal_panel.view.read(cx).selection_text() {
         return selected;
     }
-    let Some(session) = store.exec_sessions.iter().find(|session| &session.id == id) else {
+    let Some(session) = store.exec_sessions.iter().find(|session| &session.exec_session_id == id) else {
         return String::new();
     };
-    if let Some(text) = session.output.as_ref().filter(|_| session.state.is_terminal()) {
-        return content_text(text).to_owned();
+    if let Some(text) = session.output.as_ref().filter(|_| session.finished) {
+        return store.content_text(text);
     }
     match store.exec_output_tail.iter().find(|(slot, _, _)| slot == id) {
         Some((_, _, text)) => text.clone(),
@@ -239,7 +238,7 @@ pub fn sync(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
         let sig: Vec<(ExecSessionId, u8)> = store
             .exec_sessions
             .iter()
-            .map(|session| (session.id.clone(), state_code(&session.state)))
+            .map(|session| (session.exec_session_id.clone(), state_code(&session.state)))
             .collect();
         if store.terminal_panel.last_modal_sig != sig {
             store.terminal_panel.last_modal_sig = sig;
@@ -274,7 +273,7 @@ pub fn sync(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
         view.update(cx, |view, _| view.reset_quiet());
         return;
     };
-    let Some(session) = store.exec_sessions.iter().find(|session| session.id == id) else {
+    let Some(session) = store.exec_sessions.iter().find(|session| session.exec_session_id == id) else {
         // 会话消失(裁剪/清除):屏面一并释放,等下一次选中重建。
         store.terminal_panel.active = None;
         store.terminal_panel.synced = None;
@@ -305,7 +304,7 @@ pub fn sync(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
         });
     }
 
-    let is_final = session.state.is_terminal() && session.output.is_some();
+    let is_final = session.finished && session.output.is_some();
     let (target_end, window_start, window_text) = if is_final {
         (
             FINAL_END,
@@ -313,9 +312,8 @@ pub fn sync(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
             session
                 .output
                 .as_ref()
-                .map(content_text)
-                .expect("is_final 已验证")
-                .to_owned(),
+                .map(|content| store.content_text(content))
+                .expect("is_final 已验证"),
         )
     } else if let Some((_, end, text)) = store
         .exec_output_tail
@@ -387,16 +385,16 @@ pub fn sync(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
 }
 
 /// 状态标签与着色(electron execStateLabel / execStateClass 同口径)。
-fn state_view(state: &ExecSessionState, t: &Palette) -> (String, Hsla) {
+fn state_view(state: &ExecSessionStateView, t: &Palette) -> (String, Hsla) {
     match state {
-        ExecSessionState::Running => ("运行中".into(), t.accent),
-        ExecSessionState::Stopping { .. } => ("停止中".into(), t.warn),
-        ExecSessionState::Finished { outcome } => match outcome {
-            ExecSessionOutcome::Exited { exit_code: 0 } => ("已结束".into(), t.ok),
-            ExecSessionOutcome::Exited { exit_code } => (format!("退出 {exit_code}"), t.bad),
-            ExecSessionOutcome::Cancelled { .. } => ("已取消".into(), t.bad),
-            ExecSessionOutcome::TimedOut { .. } => ("已超时".into(), t.warn),
-            ExecSessionOutcome::Interrupted { .. } => ("已中断".into(), t.bad),
+        ExecSessionStateView::Running => ("运行中".into(), t.accent),
+        ExecSessionStateView::Stopping { .. } => ("停止中".into(), t.warn),
+        ExecSessionStateView::Finished { outcome } => match outcome {
+            ExecOutcomeView::Exited { exit_code: 0 } => ("已结束".into(), t.ok),
+            ExecOutcomeView::Exited { exit_code } => (format!("退出 {exit_code}"), t.bad),
+            ExecOutcomeView::Cancelled { .. } => ("已取消".into(), t.bad),
+            ExecOutcomeView::TimedOut { .. } => ("已超时".into(), t.warn),
+            ExecOutcomeView::Interrupted { .. } => ("已中断".into(), t.bad),
         },
     }
 }
@@ -432,12 +430,12 @@ fn sorted_order(store: &SessionStore) -> Vec<usize> {
     let mut order: Vec<usize> = (0..store.exec_sessions.len()).collect();
     order.sort_by_key(|&index| {
         let session = &store.exec_sessions[index];
-        (usize::from(session.state.is_terminal()), Reverse(session.started_at_ms))
+        (usize::from(session.finished), Reverse(session.started_at_ms))
     });
     order
 }
 
-fn session_tooltip(session: &ExecSessionView) -> SharedString {
+fn session_tooltip(session: &ExecSessionSnapshot) -> SharedString {
     match session.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
         Some(cwd) => SharedString::from(format!("{}\ncwd: {cwd}", session.command)),
         None => SharedString::from(session.command.clone()),
@@ -446,21 +444,21 @@ fn session_tooltip(session: &ExecSessionView) -> SharedString {
 
 /// 单行紧凑会话条目(严格 ≤28px,对齐 DESIGN-LAW 密度预算)。
 fn session_row(
-    session: &ExecSessionView,
+    session: &ExecSessionSnapshot,
     selected: bool,
     prefix: &str,
     entity: Entity<SessionStore>,
     t: &Palette,
 ) -> gpui_kit::Stateful<Div> {
     let (label, color) = state_view(&session.state, t);
-    let active = matches!(session.state, ExecSessionState::Running);
-    let id = session.id.clone();
+    let active = matches!(session.state, ExecSessionStateView::Running);
+    let id = session.exec_session_id.clone();
     let tip = session_tooltip(session);
     let selected_bg = t.selected;
     let hover_bg = t.hover;
 
     div()
-        .id(SharedString::from(format!("{prefix}-row-{}", id.0)))
+        .id(SharedString::from(format!("{prefix}-row-{}", id.as_str())))
         .h(px(28.))
         .px_2()
         .rounded(px(RADIUS_CONTROL))
@@ -471,7 +469,7 @@ fn session_row(
         .when(selected, |el| el.bg(selected_bg))
         .when(!selected, |el| el.hover(move |style| style.bg(hover_bg)))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .child(live_dot(format!("{prefix}-dot-{}", id.0), color, active))
+        .child(live_dot(format!("{prefix}-dot-{}", id.as_str()), color, active))
         .child(
             div()
                 .flex_1()
@@ -504,7 +502,7 @@ fn render_header(
     entity: Entity<SessionStore>,
     session_count: usize,
     running_count: usize,
-    selected_session: Option<&ExecSessionView>,
+    selected_session: Option<&ExecSessionSnapshot>,
     mode: PanelMode,
     t: &Palette,
     cx: &App,
@@ -668,16 +666,16 @@ fn render_header(
 }
 
 fn render_info_bar(
-    session: &ExecSessionView,
+    session: &ExecSessionSnapshot,
     entity: Entity<SessionStore>,
     prefix: &str,
     t: &Palette,
 ) -> Div {
     let (label, color) = state_view(&session.state, t);
-    let id = session.id.clone();
+    let id = session.exec_session_id.clone();
     let copy_id = id.clone();
-    let running = matches!(session.state, ExecSessionState::Running);
-    let stopping = matches!(session.state, ExecSessionState::Stopping { .. });
+    let running = matches!(session.state, ExecSessionStateView::Running);
+    let stopping = matches!(session.state, ExecSessionStateView::Stopping { .. });
     let tip = session_tooltip(session);
 
     let copy_entity = entity.clone();
@@ -725,7 +723,7 @@ fn render_info_bar(
                 .gap_0p5()
                 .flex_shrink_0()
                 .child(icon_btn(
-                    SharedString::from(format!("{prefix}-copy-{}", id.0)),
+                    SharedString::from(format!("{prefix}-copy-{}", id.as_str())),
                     IconName::Copy,
                     t.dim,
                     t.accent,
@@ -744,7 +742,7 @@ fn render_info_bar(
                 .children(running.then(|| {
                     let stop_id = id.clone();
                     icon_btn(
-                        SharedString::from(format!("{prefix}-int-{}", stop_id.0)),
+                        SharedString::from(format!("{prefix}-int-{}", stop_id.as_str())),
                         IconName::CircleStop,
                         t.dim,
                         t.warn,
@@ -752,7 +750,7 @@ fn render_info_bar(
                         t,
                         move |_, window, cx| {
                             let _ = int_entity.update(cx, |store, _| {
-                                store.exec_control(stop_id.0.clone(), false);
+                                store.exec_control(stop_id.clone(), false);
                             });
                             window.refresh();
                         },
@@ -761,7 +759,7 @@ fn render_info_bar(
                 .children((running || stopping).then(|| {
                     let term_id = id.clone();
                     icon_btn(
-                        SharedString::from(format!("{prefix}-term-{}", term_id.0)),
+                        SharedString::from(format!("{prefix}-term-{}", term_id.as_str())),
                         IconName::OctagonX,
                         t.dim,
                         t.bad,
@@ -769,7 +767,7 @@ fn render_info_bar(
                         t,
                         move |_, window, cx| {
                             let _ = term_entity.update(cx, |store, _| {
-                                store.exec_control(term_id.0.clone(), true);
+                                store.exec_control(term_id.clone(), true);
                             });
                             window.refresh();
                         },
@@ -850,7 +848,7 @@ fn render_body(
     store: &SessionStore,
     entity: Entity<SessionStore>,
     order: &[usize],
-    selected_session: Option<&ExecSessionView>,
+    selected_session: Option<&ExecSessionSnapshot>,
     mode: PanelMode,
     t: &Palette,
     cx: &App,
@@ -870,7 +868,7 @@ fn render_body(
     let render_rows = |list_div: gpui_kit::Stateful<Div>| {
         list_div.children(order.iter().map(|&index| {
             let session = &store.exec_sessions[index];
-            let selected = panel.selected.as_ref() == Some(&session.id);
+            let selected = panel.selected.as_ref() == Some(&session.exec_session_id);
             session_row(session, selected, prefix, entity.clone(), t)
         }))
     };
@@ -983,13 +981,13 @@ pub fn render(
     let running_count = store
         .exec_sessions
         .iter()
-        .filter(|session| !session.state.is_terminal())
+        .filter(|session| !session.finished)
         .count();
     let selected_session = store
         .terminal_panel
         .selected
         .as_ref()
-        .and_then(|id| store.exec_sessions.iter().find(|session| &session.id == id));
+        .and_then(|id| store.exec_sessions.iter().find(|session| &session.exec_session_id == id));
 
     let entity = cx.entity();
     let card = div()
@@ -1045,13 +1043,13 @@ pub fn render_modal(
     let running_count = store
         .exec_sessions
         .iter()
-        .filter(|item| !item.state.is_terminal())
+        .filter(|item| !item.finished)
         .count();
     let selected_session = store
         .terminal_panel
         .selected
         .as_ref()
-        .and_then(|id| store.exec_sessions.iter().find(|item| &item.id == id));
+        .and_then(|id| store.exec_sessions.iter().find(|item| &item.exec_session_id == id));
 
     let p = progress.clamp(0.0, 1.0);
     let backdrop_entity = session.clone();

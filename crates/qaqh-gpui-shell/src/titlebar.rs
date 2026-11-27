@@ -12,7 +12,7 @@ use qaqh_gpui_kit::motion::live_dot;
 use qaqh_gpui_kit::primitives::titlebar_pill;
 use qaqh_gpui_kit::settings;
 use qaqh_gpui_kit::theme::{Palette, ThemeMode};
-use qaqh_ringing_contract::fact::ActivityState;
+use qaqh_core_vocab::ActivityState;
 
 use crate::daemon::{DaemonStore, PrimarySection};
 
@@ -64,9 +64,9 @@ pub(crate) fn render(
     } else if let Some(session_entity) = &daemon.current {
         let store = session_entity.read(cx);
         let dot_color = match store.activity {
-            Some(ActivityState::Running) => t.accent,
-            Some(ActivityState::WaitingUser | ActivityState::Cancelling) => t.warn,
-            _ => match store.last_turn_tone() {
+            ActivityState::Running => t.accent,
+            ActivityState::WaitingUser | ActivityState::Cancelling => t.warn,
+            ActivityState::Idle => match store.last_turn_tone() {
                 Some(true) => t.ok,
                 Some(false) => t.bad,
                 None => t.dim,
@@ -168,8 +168,7 @@ pub(crate) fn render(
                 .filter(|task| {
                     matches!(
                         task.state,
-                        qaqh_ringing_contract::team::task_types::TaskState::Completed
-                            | qaqh_ringing_contract::team::task_types::TaskState::Closed
+                        qaqh_ringing_v3::TaskState::Completed
                     )
                 })
                 .count();

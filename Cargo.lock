@@ -5367,11 +5367,12 @@ dependencies = [
  "embed-resource",
  "futures",
  "gpui-kit",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
  "qaqh-gpui-session",
  "qaqh-gpui-shell",
  "qaqh-gpui-wire",
- "qaqh-ringing-contract",
+ "qaqh-ringing-v3",
  "serde",
  "serde_json",
 ]
@@ -5389,10 +5390,10 @@ dependencies = [
 name = "qaqh-gpui-render"
 version = "5.0.0"
 dependencies = [
- "base64 0.22.1",
  "gpui-kit",
- "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
+ "qaqh-ringing-v3",
  "tree-sitter-bash",
  "tree-sitter-go",
  "tree-sitter-highlight",
@@ -5411,13 +5412,12 @@ dependencies = [
  "futures",
  "gpui-kit",
  "percent-encoding",
- "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
  "qaqh-gpui-render",
  "qaqh-gpui-wire",
  "qaqh-profile",
- "qaqh-ringing-contract",
- "qaqh-types",
+ "qaqh-ringing-v3",
  "serde",
  "serde_json",
 ]
@@ -5426,15 +5426,15 @@ dependencies = [
 name = "qaqh-gpui-shell"
 version = "5.0.0"
 dependencies = [
+ "bytes",
  "futures",
  "gpui-kit",
- "qaqh-client",
+ "qaqh-core-vocab",
  "qaqh-gpui-kit",
  "qaqh-gpui-session",
  "qaqh-gpui-wire",
  "qaqh-profile",
- "qaqh-ringing-contract",
- "qaqh-types",
+ "qaqh-ringing-v3",
  "serde",
  "serde_json",
 ]

@@ -14,7 +14,9 @@
 ## 第四轮新增(M11/M12)
 
 ### M11 会话级换模型(model_selection)
-- 依赖新增:`qaqh-types = path`(ModelSelection/SettingValue wire 类型权威)
+- 依赖新增:后端 wire 类型 crate(ModelSelection/SettingValue wire 类型权威)。
+  **2026-11 P3-5e 已随 V2 契约整体清零**,今天等价物是 `qaqh-core-vocab` 的
+  `ModelSelection` / `SettingOverride<T>`。
 - bridge:`PatchSessionSettings` 增 `model: Option<(provider_id, model_id)>` +
   `revision: Option<u64>`;组 `SettingValue::Use { ModelSelection { options: default } }`;
   **乐观并发**:preconditions = SettingsRevision(本地持有上次 ack.revision);
@@ -23,7 +25,7 @@
 - store:SessionStore `model/model_options/settings_revision`;patch_effort/tools/model
   全部带 revision;DaemonStore 把 provider 目录投影(封顶 24)喂给所有会话
 - UI:会话头「模型:默认/provider 的 model_id」chip,点击循环 model_options
-- 类型事实:`SettingValue<T> = enum { Use{value:T}, Inherit }`(qaqh-types/provider.rs);
+- 类型事实:`SettingValue<T> = enum { Use{value:T}, Inherit }`(V3 更名 `SettingOverride<T>`);
   provider 目录 = `{revision, providers: {<id>: {models: {<model_id>: ModelDef}}}}`
   (provider_catalog → ProfilesDocument);AckStatus 路径 `qaqh_client::ringing::…`
   (v2.rs:24 把 qaqh_ringing 重导出为 ringing 模块)
@@ -111,8 +113,9 @@
 
 ## 项目定位
 
-QAQ-Harness 的 GPUI 桌面前端,宪法:**RingingV2 协议与命令面最高准则**,前端零自建
-协议、零转换层(`qaqh-client`/`qaqh-ringing-contract` 跨仓 path 依赖)。
+QAQ-Harness 的 GPUI 桌面前端,宪法:**RingingV3 协议与命令面最高准则**,前端零自建
+协议、零转换层(状态直持 `qaqh-ringing-v3` / `qaqh-core-vocab` 强类型;传输实现来自
+`qaqh-client` 的 V3 客户端)。V2 契约与 wire 类型依赖已于 P3-5e 整体清零。
 
 - gpui 依赖:crates.io `gpui-pre` / `gpui-pre-platform` `=0.3.11` + 组件库 `gpui-component` `=0.9.0`(Apache-2.0;2026-11-08 起弃用 `../gpui` path vendor,该检出已删除)
 - `../zed` = 上游克隆;**GPL crates 只借鉴设计,不可抄代码**

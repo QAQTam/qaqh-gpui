@@ -114,7 +114,9 @@ pub fn launch() {
         let notify_window = *window_handle;
         cx.on_system_notification_response(move |response, cx| {
             if let Some(seed) = response.tag.strip_prefix("qaqh-") {
-                let seed = seed.to_string();
+                let Ok(seed) = qaqh_core_vocab::SessionId::new(seed) else {
+                    return;
+                };
                 let _ = notify_window.update(cx, |_, window, cx| {
                     notifications.update(cx, |daemon, cx| {
                         daemon.section = qaqh_gpui_shell::daemon::PrimarySection::Home;
@@ -147,7 +149,6 @@ pub fn launch() {
                             if store.snapshot_pending && matches!(store.stream, qaqh_gpui_session::store::StreamState::Open) {
                                 let _ = store.requests().unbounded_send(BridgeRequest::Refill(store.session_id.clone()));
                             }
-                            if store.outbox.as_ref().is_some_and(|o| matches!(o.state, qaqh_gpui_wire::delivery::DeliveryState::Accepted)) { store.check_receipt(); }
                         }
                     });
                 }).is_err() {

@@ -5,9 +5,9 @@
 //! 流(ws 订阅由桥托管,断联不 kill,§D5),后台编译与前台编译同时活着。
 //!
 //! 渲染与输入内核:每个页签持有独立 [`TerminalView`] (`alacritty_terminal` 无头
-//! VT/ConPTY 状态机 + 原生 GPUI 画布),支持动态列行 `ShellResize`、`CSI 6 n`
+//! VT/ConPTY 状态机 + 原生 GPUI 画布),支持动态列行 `ShellRequest::Resize`、`CSI 6 n`
 //! 应答自动回写、鼠标选区复制、滚轮回滚与 Windows 中文 IME 组合输入;数据面直走
-//! `RingingV2` `ShellStream`,零转换层。
+//! `RingingV3` `ShellPty` 流,零转换层。
 
 use gpui_kit::prelude::*;
 use gpui_kit::{Context, Div, Entity, FontWeight, Hsla, SharedString, Window, div, px};
@@ -21,7 +21,8 @@ use qaqh_gpui_kit::motion::{live_dot, spring_f32, spring_panel_policy};
 use qaqh_gpui_kit::settings;
 use qaqh_gpui_kit::theme::{ActiveTheme, Palette, terminal_palette};
 use qaqh_gpui_session::terminal_view::TerminalView;
-use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState, ShellInfo, ShellUiStatus};
+use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState, ShellUiStatus};
+use qaqh_ringing_v3::{ShellRequest, ShellView};
 
 use crate::daemon::DaemonStore;
 
@@ -52,17 +53,17 @@ fn ensure_tab<'a>(
                 format!("shell-term-{shell_id}"),
                 cx.focus_handle(),
                 move |bytes, _| {
-                    let _ = req_in.unbounded_send(BridgeRequest::ShellStdin {
+                    let _ = req_in.unbounded_send(BridgeRequest::Shell(ShellRequest::Write {
                         shell_id: in_id.clone(),
-                        bytes,
-                    });
+                        bytes: bytes.into(),
+                    }));
                 },
                 move |cols, rows, _| {
-                    let _ = req_resize.unbounded_send(BridgeRequest::ShellResize {
+                    let _ = req_resize.unbounded_send(BridgeRequest::Shell(ShellRequest::Resize {
                         shell_id: resize_id.clone(),
                         cols,
                         rows,
-                    });
+                    }));
                 },
             )
         });
@@ -87,7 +88,7 @@ fn short_shell_name(raw: &str) -> &str {
 }
 
 /// 同名档位多开带序号(electron labelOf 同律);只有一个时显示纯档位名。
-fn tab_label(info: &ShellInfo, all: &[ShellInfo]) -> String {
+fn tab_label(info: &ShellView, all: &[ShellView]) -> String {
     let short = short_shell_name(&info.shell);
     let same_kind = all
         .iter()
@@ -97,7 +98,7 @@ fn tab_label(info: &ShellInfo, all: &[ShellInfo]) -> String {
         let index = all
             .iter()
             .filter(|item| short_shell_name(&item.shell) == short)
-            .position(|item| item.id == info.id)
+            .position(|item| item.shell_id == info.shell_id)
             .map_or(same_kind, |position| position + 1);
         format!("{short} {index}")
     } else {
@@ -109,9 +110,6 @@ fn status_label(status: &ShellUiStatus) -> String {
     match status {
         ShellUiStatus::Connecting => "连接中…".into(),
         ShellUiStatus::Open => String::new(),
-        ShellUiStatus::Reconnecting { retry_ms, reason } => {
-            format!("重连中({reason}),{retry_ms}ms 后重试")
-        }
         ShellUiStatus::Unsubscribed { reason } => {
             format!("订阅已停({reason}),进程仍在运行")
         }
@@ -121,7 +119,7 @@ fn status_label(status: &ShellUiStatus) -> String {
 
 fn status_color(status: &ShellUiStatus, t: &Palette) -> Hsla {
     match status {
-        ShellUiStatus::Connecting | ShellUiStatus::Reconnecting { .. } => t.warn,
+        ShellUiStatus::Connecting => t.warn,
         ShellUiStatus::Open => t.ok,
         ShellUiStatus::Unsubscribed { .. } => t.dim,
         ShellUiStatus::Terminated { .. } => t.bad,
@@ -132,17 +130,17 @@ fn status_color(status: &ShellUiStatus, t: &Palette) -> Hsla {
 
 /// `shell.list` 权威全量。已消失的 shell:标签与终态屏面保留,由 ShellStatus
 /// 收尾;尚未建页签态的 shell 补齐初始态并按需自动选中末项。
-pub fn sync_shells(daemon: &mut DaemonStore, shells: Vec<ShellInfo>, cx: &mut Context<DaemonStore>) {
+pub fn sync_shells(daemon: &mut DaemonStore, shells: Vec<ShellView>, cx: &mut Context<DaemonStore>) {
     daemon.shells = shells.clone();
     for info in &shells {
-        ensure_tab(daemon, &info.id, cx);
+        ensure_tab(daemon, &info.shell_id, cx);
     }
     let active_present = daemon
         .shell_active
         .as_deref()
-        .is_some_and(|active| daemon.shells.iter().any(|item| item.id == active));
+        .is_some_and(|active| daemon.shells.iter().any(|item| item.shell_id == active));
     if !active_present {
-        daemon.shell_active = daemon.shells.last().map(|item| item.id.clone());
+        daemon.shell_active = daemon.shells.last().map(|item| item.shell_id.clone());
     }
     cx.notify();
 }
@@ -150,16 +148,16 @@ pub fn sync_shells(daemon: &mut DaemonStore, shells: Vec<ShellInfo>, cx: &mut Co
 /// `shell.open` 结果:追加标签、聚焦、开坞。cwd 在请求时已编好,这里只落状态。
 pub fn opened(
     daemon: &mut DaemonStore,
-    info: ShellInfo,
+    info: ShellView,
     window: &mut Window,
     cx: &mut Context<DaemonStore>,
 ) {
     daemon.shell_opening = None;
     daemon.shell_error = None;
-    daemon.shells.retain(|item| item.id != info.id);
+    daemon.shells.retain(|item| item.shell_id != info.shell_id);
     daemon.shells.push(info.clone());
-    let view = ensure_tab(daemon, &info.id, cx).view.clone();
-    daemon.shell_active = Some(info.id);
+    let view = ensure_tab(daemon, &info.shell_id, cx).view.clone();
+    daemon.shell_active = Some(info.shell_id);
     daemon.shell_dock_open = true;
     if let Some(kind) = SHELL_KINDS.iter().find(|kind| info.shell.starts_with(**kind)) {
         daemon.shell_last_kind = kind;
@@ -170,10 +168,10 @@ pub fn opened(
 
 /// `shell.close` 成功:本地移除标签与终端实体,聚焦顺延到末位标签。
 pub fn removed(daemon: &mut DaemonStore, shell_id: &str, cx: &mut Context<DaemonStore>) {
-    daemon.shells.retain(|item| item.id != shell_id);
+    daemon.shells.retain(|item| item.shell_id != shell_id);
     daemon.shell_tabs.remove(shell_id);
     if daemon.shell_active.as_deref() == Some(shell_id) {
-        daemon.shell_active = daemon.shells.last().map(|item| item.id.clone());
+        daemon.shell_active = daemon.shells.last().map(|item| item.shell_id.clone());
     }
     cx.notify();
 }
@@ -210,11 +208,13 @@ pub fn on_status(
     };
     if is_open {
         let (cols, rows) = view.read(cx).size();
-        let _ = daemon.requests.unbounded_send(BridgeRequest::ShellResize {
-            shell_id: shell_id.to_string(),
-            cols,
-            rows,
-        });
+        let _ = daemon
+            .requests
+            .unbounded_send(BridgeRequest::Shell(ShellRequest::Resize {
+                shell_id: shell_id.to_string(),
+                cols,
+                rows,
+            }));
     }
     cx.notify();
 }
@@ -265,18 +265,23 @@ pub fn open(daemon: &mut DaemonStore, kind: &'static str, cx: &mut Context<Daemo
     daemon.shell_dock_open = true;
     daemon.shell_opening = Some(kind);
     daemon.shell_error = None;
-    let _ = daemon.requests.unbounded_send(BridgeRequest::ShellOpen {
-        cwd,
-        shell: Some(kind.to_string()),
-    });
+    let _ = daemon
+        .requests
+        .unbounded_send(BridgeRequest::Shell(ShellRequest::Open {
+            session_id: None,
+            cols: qaqh_gpui_session::terminal::DEFAULT_COLS as u16,
+            rows: qaqh_gpui_session::terminal::DEFAULT_ROWS as u16,
+            cwd,
+            shell: Some(kind.to_string()),
+        }));
     cx.notify();
 }
 
 /// 显式关标签 = 真收进程:先退订阅(桥 ShellClose 内先 drop 流)再服务面 kill。
 pub fn close_tab(daemon: &mut DaemonStore, shell_id: String, cx: &mut Context<DaemonStore>) {
-    let _ = daemon
-        .requests
-        .unbounded_send(BridgeRequest::ShellClose { shell_id: shell_id.clone() });
+    let _ = daemon.requests.unbounded_send(BridgeRequest::Shell(ShellRequest::Close {
+        shell_id: shell_id.clone(),
+    }));
     removed(daemon, &shell_id, cx);
 }
 
@@ -292,7 +297,10 @@ pub fn clear_screen(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) {
         }
         let _ = daemon
             .requests
-            .unbounded_send(BridgeRequest::ShellAttach { shell_id: id });
+            .unbounded_send(BridgeRequest::ShellAttach {
+                shell_id: id,
+                from_offset: 0,
+            });
     }
     cx.notify();
 }
@@ -301,7 +309,9 @@ pub fn clear_screen(daemon: &mut DaemonStore, cx: &mut Context<DaemonStore>) {
 pub fn toggle(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<DaemonStore>) {
     daemon.shell_dock_open = !daemon.shell_dock_open;
     if daemon.shell_dock_open {
-        let _ = daemon.requests.unbounded_send(BridgeRequest::ShellList);
+        let _ = daemon
+            .requests
+            .unbounded_send(BridgeRequest::Shell(ShellRequest::List { session_id: None }));
         if let Some(view) = daemon
             .shell_active
             .as_ref()
@@ -367,17 +377,17 @@ pub fn dock(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<Daem
                 ),
         );
     for info in daemon.shells.clone() {
-        let active = daemon.shell_active.as_deref() == Some(info.id.as_str());
+        let active = daemon.shell_active.as_deref() == Some(info.shell_id.as_str());
         let label = tab_label(&info, &daemon.shells);
-        let tab_id = info.id.clone();
+        let tab_id = info.shell_id.clone();
         let tab_status = daemon
             .shell_tabs
-            .get(&info.id)
+            .get(&info.shell_id)
             .map(|tab| tab.status.clone())
             .unwrap_or(ShellUiStatus::Connecting);
         let is_open = matches!(tab_status, ShellUiStatus::Open);
         let mut chip = div()
-            .id(SharedString::from(format!("shell-tab-{}", info.id)))
+            .id(SharedString::from(format!("shell-tab-{}", info.shell_id)))
             .flex()
             .items_center()
             .gap_1p5()
@@ -402,7 +412,7 @@ pub fn dock(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<Daem
                 activate(daemon, tab_id.clone(), window, cx);
             }))
             .child(live_dot(
-                format!("shell-{}", info.id),
+                format!("shell-{}", info.shell_id),
                 status_color(&tab_status, &t),
                 is_open,
             ))
@@ -411,10 +421,13 @@ pub fn dock(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<Daem
                     .map(|icon| render_app_icon(icon, 13.0, if active { t.text } else { t.dim })),
             )
             .child(label);
-        let close_id = info.id.clone();
+        let close_id = info.shell_id.clone();
         chip = chip.child(
             div()
-                .id(SharedString::from(format!("shell-tab-close-{}", info.id)))
+                .id(SharedString::from(format!(
+                    "shell-tab-close-{}",
+                    info.shell_id
+                )))
                 .size(px(16.))
                 .rounded_full()
                 .flex()

@@ -5,3 +5,5 @@
 pub mod bridge;
 pub mod delivery;
 pub mod diagnostics;
+pub mod ids;
+pub mod profile_vocab;

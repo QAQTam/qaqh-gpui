@@ -4,10 +4,11 @@
 //! 结果由会话事件流宣告（`TurnStarted` / `TurnFinished` / `ToolCallUpdated`）。
 //! 所以这里刻意保留 `Uncertain`——"已发送但还没有任何事件证明"。
 use qaqh_ringing_v3::CommandResponse;
+use serde::{Deserialize, Serialize};
 
 use crate::bridge::DeliveryResult;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryState {
     Sending,
     Accepted,
@@ -39,7 +40,7 @@ impl DeliveryState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Outbox {
     /// 幂等键：断线重放复用同一个 id，服务端返回原回执。
     pub command_id: String,

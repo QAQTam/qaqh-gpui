@@ -14,8 +14,8 @@ use qaqh_gpui_kit::kit::{
     RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, RADIUS_STAGE, shadow_stage, soft,
 };
 use qaqh_gpui_kit::motion::{sample_split_drawer, scroll_enter, wrap_split_drawer};
-use qaqh_ringing_contract::fact::{ContentValue, ToolCallId, TurnId};
-use qaqh_ringing_contract::state::ToolCallView;
+use qaqh_core_vocab::{ContentRef, ToolCallId, TurnId};
+use qaqh_ringing_v3::ToolCallView;
 
 use qaqh_gpui_kit::{settings, settings::Typography, theme::Palette};
 use crate::store::SessionStore;
@@ -423,8 +423,8 @@ fn is_edit(tool: &ToolCallView) -> bool {
     tool.diff.is_some()
         || tool.code_delta.is_some()
         || matches!(
-            tool.tool_name.as_deref(),
-            Some("write" | "edit" | "apply_patch" | "delete" | "copy_range")
+            tool.tool_name.as_str(),
+            "write" | "edit" | "apply_patch" | "delete" | "copy_range"
         )
 }
 
@@ -1197,7 +1197,7 @@ pub fn on_live_patch_event(
                 let turn_id = store
                     .tools
                     .iter()
-                    .find(|tool| tool.call_id == call_id)
+                    .find(|tool| tool.tool_call_id == call_id)
                     .and_then(|tool| tool.turn_id.clone());
                 if let Some(turn) = turn_id {
                     open_review(store, turn, false, cx);
@@ -1211,14 +1211,12 @@ pub fn on_live_patch_event(
                 let reason = store
                     .tools
                     .iter()
-                    .find(|tool| tool.call_id == call_id)
+                    .find(|tool| tool.tool_call_id == call_id)
                     .and_then(|tool| tool.output.as_ref())
-                    .and_then(|out| match out {
-                        ContentValue::Inline { text } => {
-                            let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
-                            Some(line.chars().take(120).collect::<String>())
-                        }
-                        _ => None,
+                    .map(|out| store.content_text(out))
+                    .and_then(|text| {
+                        let line = text.lines().find(|l| !l.trim().is_empty())?.trim().to_owned();
+                        Some(line.chars().take(120).collect::<String>())
                     })
                     .unwrap_or_else(|| "补丁未能应用（上下文不匹配或参数错误）".to_owned());
                 if let Some(View::LivePatch(live)) = &mut store.code_panel.view {
@@ -1251,21 +1249,21 @@ fn open_review(
         .iter()
         .filter(|tool| tool.turn_id.as_ref() == Some(&turn) && is_edit(tool))
     {
-        if let Some(diff_val) = &tool.diff {
-            match diff_val {
-                ContentValue::Inline { text } => {
-                    merge_patches(&mut patches, parse_diff(text), root.as_deref());
-                }
-                ContentValue::Ref { content_ref } => references.push(content_ref.clone()),
-                ContentValue::Unavailable(_) => {}
+        let mut text_of = |content: &ContentRef| match content {
+            ContentRef::Inline { text } => Some(text.clone()),
+            ContentRef::Blob { .. } => {
+                references.push(content.clone());
+                None
             }
-        } else {
-            match &tool.output {
-                Some(ContentValue::Inline { text }) => {
-                    merge_patches(&mut patches, patches_from_output(text), root.as_deref());
-                }
-                Some(ContentValue::Ref { content_ref }) => references.push(content_ref.clone()),
-                _ => {}
+            ContentRef::Windowed { preview, .. } => Some(preview.clone()),
+        };
+        if let Some(diff_val) = &tool.diff {
+            if let Some(text) = text_of(diff_val) {
+                merge_patches(&mut patches, parse_diff(&text), root.as_deref());
+            }
+        } else if let Some(output) = &tool.output {
+            if let Some(text) = text_of(output) {
+                merge_patches(&mut patches, patches_from_output(&text), root.as_deref());
             }
         }
     }
@@ -1324,7 +1322,7 @@ pub fn review_button(
         .iter()
         .rev()
         .find(|turn| {
-            turn.outcome.is_some()
+            turn.terminal.is_some()
                 && store
                     .tools
                     .iter()
@@ -1339,8 +1337,8 @@ pub fn review_button(
         .filter_map(|tool| tool.code_delta.as_ref())
         .fold((0usize, 0usize), |(added, removed), delta| {
             (
-                added.saturating_add(delta.lines_added),
-                removed.saturating_add(delta.lines_removed),
+                added.saturating_add(delta.lines_added as usize),
+                removed.saturating_add(delta.lines_removed as usize),
             )
         });
     // git-compare icon 前缀 + 居中悬浮胶囊,置于 Composer 上方。

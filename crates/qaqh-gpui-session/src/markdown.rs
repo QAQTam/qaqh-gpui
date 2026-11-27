@@ -1371,28 +1371,28 @@ mod tests {
     fn link_icons_classify_web_and_source_targets() {
         let ((gh_icon, _), gh_trail) =
             link_icons(&classify_href("https://github.com/QAQTam/qaqh-pets").expect("github"));
-        assert_eq!(gh_icon, IconName::Github);
+        assert_eq!(gh_icon, AppIcon::Lucide(IconName::Github));
         assert_eq!(gh_trail.map(|(i, _)| i), Some(IconName::ExternalLink));
 
         let ((web_icon, _), _) =
             link_icons(&classify_href("https://example.com/docs").expect("web"));
-        assert_eq!(web_icon, IconName::Globe);
+        assert_eq!(web_icon, AppIcon::Lucide(IconName::Globe));
 
         let ((lic_icon, _), _) =
             link_icons(&classify_href("LICENSE-MIT").expect("license"));
-        assert_eq!(lic_icon, IconName::Copyright);
+        assert_eq!(lic_icon, AppIcon::Lucide(IconName::Copyright));
 
         let ((git_icon, _), _) =
             link_icons(&classify_href(".gitignore").expect("gitignore"));
-        assert_eq!(git_icon, IconName::GitBranch);
+        assert_eq!(git_icon, AppIcon::Brand(qaqh_gpui_kit::icons::BrandIcon::Git));
 
         let ((cfg_icon, _), _) =
             link_icons(&classify_href("Cargo.toml").expect("cargo"));
-        assert_eq!(cfg_icon, IconName::FileCog);
+        assert_eq!(cfg_icon, AppIcon::Brand(qaqh_gpui_kit::icons::BrandIcon::Rust));
 
         let ((rs_icon, _), _) =
             link_icons(&classify_href("crates/qaqh-gpui-shell/src/sidebar.rs#L10-L20").expect("rs"));
-        assert_eq!(rs_icon, IconName::FileCode);
+        assert_eq!(rs_icon, AppIcon::Brand(qaqh_gpui_kit::icons::BrandIcon::Rust));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! (字段缺省自动落默认,serde(default))。
 //!
 //! 注意分层边界:daemon 侧配置(config.toml/provider/profile)是另一层,
-//! 走 RingingV2 `config.save` 命令面,本期不接(见 docs/HANDOFF.md)。
+//! 走 RingingV3 `config.patchFull` 命令面(`qaqh-gpui-shell::settings_ui`)。
 
 use std::path::PathBuf;
 
