@@ -3,6 +3,8 @@
 > **状态（2026-11-27）**：前置已就绪——`../qaqh-backend` `main` 已合入 `P3-5a`～`P3-5d`（`3e4a8b35`，含 `local_ipc`、`v3_bridge`、`V3Client::connect_local`）；本仓在途改动已落盘（`e875e4a`）。
 > **阻塞项**：V3 契约不够前端渲染，工单在 `../qaqh-backend/docs/v4.3-4.8/P3_5E_V3_CONTRACT_GAPS.md`。**本文件第 3 节的 A/B/C 项必须在后端补齐后才能开工**（否则 `timeline.rs` 要写两遍）。
 > **可立即开工**：第 2 节（依赖与客户端接线）+ 第 3 节的 D/E/F/G/H/I（不依赖 A/B/C 的富字段）。
+>
+> **已完成（分支 `feat/v4.7-p3-5e-ringing-v3`，commit `6147c8c`）**：`qaqh-gpui-wire` 整层切 V3——`bridge.rs` 1316 行 → 433 行（+ `bridge/{requests,streams,attach}.rs`，单文件全部 <650），`cargo check/test -p qaqh-gpui-wire` 全绿（2 tests）。**下游 `qaqh-gpui-session` / `qaqh-gpui-shell` / `qaqh-gpui-render` 尚未迁移，全仓 `cargo check` 目前仍是红的**——这是本分支的预期中间态。
 
 ---
 
@@ -70,6 +72,93 @@ while let Some(frame) = stream.next().await { /* 转发 BridgeMsg::Event */ }
 ---
 
 ## 3. 类型映射表（逐文件执行的依据）
+
+### 2.5 桥层已落地的 API 面（下游按这张表接线）
+
+`qaqh_gpui_wire::bridge` 现在只有这些入口：
+
+```rust
+pub fn run(to_ui: UnboundedSender<BridgeMsg>, requests: UnboundedReceiver<BridgeRequest>, client_instance_id: String);
+pub fn probe();
+pub fn connection_generation() -> u64;
+
+pub enum ConnectionState { Connecting, Ready { server_instance_id: String, build_id: String }, Failed { detail: String } }
+pub enum DeliveryResult { Accepted { command_id: String }, Rejected(String), Unknown(String) }
+pub struct PreparedAttachment { pub hash: ContentHash, pub len: u64, pub mime: String }
+pub enum ShellUiStatus { Connecting, Open, Unsubscribed { reason: String }, Terminated { reason: String } }
+pub struct StreamProgress { pub frames: u64, pub last_seq: u64, pub resync_cycles: u64, pub ordering_violations: u64 }
+
+pub enum BridgeMsg {
+    FromConnection(u64, Box<BridgeMsg>),
+    Connection(ConnectionState),
+    Line(String),
+    Sessions(Vec<SessionSummary>),          // session.list（含 archived）
+    Workspaces(Vec<WorkspaceEntry>),        // workspace.list
+    Snapshot(Box<SessionSnapshot>),         // 尾部窗口（TAIL_BLOCKS=500 / TAIL_TURNS=60）
+    Transcript(Box<TranscriptPage>),        // 向上翻页
+    Event(SessionId, SessionEventFrame),    // 唯一状态真相源
+    Stream(SessionId, StreamProgress),
+    Session(Result<SessionResponse, String>),
+    Command { session_id: Option<SessionId>, command_id: String, result: Result<CommandResponse, String> },
+    Config(Result<ConfigResponse, String>),
+    Account(Result<AccountResponse, String>),
+    Workspace(Result<WorkspaceResponse, String>),
+    ToolCatalog(Result<ToolCatalogResponse, String>),
+    Shell(Result<ShellResponse, String>),
+    Shells(Vec<ShellView>),
+    ShellOpened(ShellView),
+    ShellRemoved(String),
+    ShellBytes { shell_id: String, bytes: Vec<u8> },
+    ShellStatus { shell_id: String, status: ShellUiStatus },
+    ShellError(String),
+    Blob { hash: ContentHash, bytes: Vec<u8> },
+    Attachment { session_id: SessionId, result: Result<PreparedAttachment, String> },
+    ReviewContent { session_id: SessionId, turn: TurnId, request: usize, texts: Vec<Result<String, String>> },
+    Watchdog(String),
+}
+
+pub enum BridgeRequest {
+    Reconnect,
+    Select { session_id: SessionId, since_seq: u64 },   // since_seq = 已收到的最后序号
+    RefreshRoster,
+    Refill(SessionId),                                  // 快照 + todos + team
+    LoadTranscript { session_id: SessionId, before_ord: u64, limit: u32, timeline_epoch: u64 },
+    Session(SessionRequest),                            // 创建/重命名/归档/设置/目标/todo/team/技能目录
+    Command { command_id: String, request: CommandRequest },
+    Config(ConfigRequest),
+    Account(AccountRequest),
+    Workspace(WorkspaceRequest),
+    ToolCatalog(ToolCatalogRequest),
+    Shell(ShellRequest),                                // Open/Close/List 带流副作用
+    ShellAttach { shell_id: String, from_offset: u64 },
+    FetchBlob(ContentHash),
+    AttachFile { session_id: SessionId, path: PathBuf },
+    ReviewContent { session_id: SessionId, turn: TurnId, request: usize, references: Vec<ContentRef> },
+    Watchdog { label: String, after_ms: u64 },
+}
+```
+
+下游接线要点：
+
+| 旧调用点 | 新写法 |
+|---|---|
+| `BridgeRequest::SendMessage{seed, outbox}` | `BridgeRequest::Command { command_id: outbox.command_id.clone(), request: CommandRequest::SendPrompt { session_id, input_id: InputId::new(&outbox.command_id)?, text, attachments } }` |
+| `BridgeRequest::RespondPermission` | `CommandRequest::RespondInteraction { resolution: CommandInteractionResolution::Approve{scope} / Reject{text} }` |
+| `BridgeRequest::RespondAsk` / `DismissAsk` | 同上，`Answer{answers}` / `Dismiss` |
+| `BridgeRequest::ExecControl` | `CommandRequest::ExecInterrupt{exec_session_id}` / `ExecTerminate{..}` |
+| `BridgeRequest::Cancel` | `CommandRequest::CancelTurn{session_id}` |
+| `BridgeRequest::CreateSession` | `SessionRequest::Create{title,cwd,tool_mode,model_selection,custom_tools,handoff_from}`，回执 `SessionResponse::Created(summary)` |
+| `BridgeRequest::PatchSessionSettings` | `SessionRequest::PatchSettings{session_id,patch,expected_revision}` |
+| `BridgeRequest::RenameSession` / `DeleteSession` / `MoveSession` | `SessionRequest::{Rename,Delete}` / `WorkspaceRequest::MoveSession` |
+| `BridgeRequest::QueryTodo` / `QueryTeam` / `QuerySkills` | `SessionRequest::{GetTodos,GetTeam,GetSkillsCatalog}` |
+| `BridgeRequest::QueryConfig` / `SaveConfig` / `ListProviders` / `ListProviderPresets` / `ManageCatalog` | `ConfigRequest::{LoadFull,PatchFull,ListProviders,ListProviderPresets,UpsertProvider,...}` |
+| `BridgeRequest::Service{method,params}` | `AccountRequest::{SiwcStatus,DsStatus,DsBalance,DsBonuses,DsSignInStart,...}` |
+| `BridgeRequest::ShellList/Open/Close/Stdin/Resize` | `BridgeRequest::Shell(ShellRequest::{List,Open,Close,Write,Resize})` |
+| `BridgeRequest::ShellAttach` | `BridgeRequest::ShellAttach { shell_id, from_offset }` |
+| `BridgeRequest::Receipt` | **删除**：V3 没有异步回执查询，`CommandResponse::Accepted` + 事件流即权威 |
+| `BridgeMsg::Reset` | **删除**：用 `SessionEvent::ResyncRequired` |
+
+> `BridgeMsg::FromConnection(generation, _)` 必须继续在 `daemon.rs` 的收件处过滤（`connection_generation()`），这是防旧连接串话的唯一机制。
 
 ### A/B/C 组（**等后端工单落地**）
 
@@ -153,11 +242,8 @@ while let Some(frame) = stream.next().await { /* 转发 BridgeMsg::Event */ }
 
 ## 4. 文件工单（按执行顺序，验收即勾）
 
-1. `crates/qaqh-gpui-wire/src/bridge.rs` **1316 → ≤650 行**：连接/事件流/Blob/Shell/控制面全部按 §2 重写；`BridgeMsg`/`BridgeRequest` 载荷换 V3 类型；删 `ShellInfo/SkillCatalogEntry/ProviderPresetView/…` 本地镜像（V3 有同名类型）。
-2. `crates/qaqh-gpui-wire/src/{ask.rs,delivery.rs,diagnostics.rs}`：
-   - `ask.rs` 删掉（V3 `InteractionView.questions` 已是结构化 `AskQuestionView`，不需要 JSON 解析）；
-   - `delivery.rs` 改吃 `CommandResponse`（`Accepted/CancelAccepted/InteractionAccepted`）+ 幂等 `command_id`；
-   - `diagnostics.rs` 用 `qaqh_ringing_v3::{PROTOCOL_REV,PROTOCOL_FINGERPRINT}` 与 `build_id` 取代 `COMMAND_CONTRACT_REVISION/SESSION_CONTRACT_REVISION`。
+1. ✅ **已完成** `crates/qaqh-gpui-wire`：`bridge.rs` 1316 → 433 行（+ `bridge/{requests,streams,attach}.rs`）；`ask.rs` 删除；`delivery.rs` 改吃 `CommandResponse`；`diagnostics.rs` 切协议自证字段。`cargo check/test -p qaqh-gpui-wire` 绿。
+2. ⏭ **下一步** `crates/qaqh-gpui-session/src/{store.rs,reducer.rs}`：合并态模型 + V3 事件 reducer（§1.2/§3.A/B/G）。**等后端工单 A/B/C 落地后一次性做**，否则要写两遍。
 3. `crates/qaqh-gpui-session/src/{store.rs,reducer.rs}`：合并态模型 + V3 事件 reducer（§1.2/§3.G）。
 4. `crates/qaqh-gpui-session/src/timeline.rs`：`BlockView` + `ToolCallView` 渲染（**等工单 A/B/C**）。
 5. `crates/qaqh-gpui-session/src/{code_panel.rs,terminal_panel.rs,terminal_view.rs,ask_dock.rs,goal.rs,handoff.rs,turn_rail.rs,controls.rs,persist.rs,composer.rs,markdown.rs}`：按 §3 映射逐处替换。
