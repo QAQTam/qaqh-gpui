@@ -3,18 +3,17 @@ name = "qaqh-gpui-wire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "QAQ-Harness GPUI 前端 RingingV2 接线层:桥/投递/诊断/ASK 解析(无 gpui,可头less验证)"
+description = "QAQ-Harness GPUI 前端 RingingV3 接线层:桥/投递/诊断(无 gpui,可头less验证)"
 
 [lints]
 workspace = true
 
 [dependencies]
-base64 = { workspace = true }
 futures = { workspace = true }
-qaqh-client = { workspace = true, features = ["shell-stream"] }
+qaqh-client = { workspace = true }
 qaqh-ringing-v3 = { workspace = true }
-qaqh-ringing-contract = { workspace = true }
-qaqh-types = { workspace = true }
+qaqh-core-vocab = { workspace = true }
+qaqh-v3-transport = { workspace = true }
 qaqh-profile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

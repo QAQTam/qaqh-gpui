@@ -44,6 +44,8 @@ gpui-kit = "=0.11.0"
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
 # RingingV3 契约域(P3-5e):前端直接持有其强类型,零前端 DTO、零转换层。
 qaqh-ringing-v3 = { path = "../qaqh-backend/crates/qaqh-ringing-v3" }
+qaqh-core-vocab = { path = "../qaqh-backend/crates/qaqh-core-vocab" }
+qaqh-v3-transport = { path = "../qaqh-backend/crates/qaqh-v3-transport" }
 # 契约类型直用(store 字段直接持有 TimelineEntry/ToolCallView 等),非转换层。
 qaqh-ringing-contract = { path = "../qaqh-backend/crates/qaqh-ringing-contract" }
 # ModelSelection/SettingValue wire 类型(session.settings.patch 组装用,零转换层)。
