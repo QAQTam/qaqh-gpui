@@ -578,21 +578,6 @@ pub(crate) fn settings_page(
                 }),
             ));
 
-        let width_buttons: Vec<AnyElement> = [640.0, 760.0, 850.0, 960.0]
-            .into_iter()
-            .map(|width| {
-                segmented_item(
-                    format!("content-width-{width:.0}"),
-                    format!("{width:.0}"),
-                    (typo.content_width - width).abs() < 1.0,
-                    &t,
-                    cx.listener(move |_, _, _, cx| {
-                        settings::update(cx, |content| content.typography.content_width = width);
-                    }),
-                )
-            })
-            .collect();
-
         let terminal_buttons: Vec<AnyElement> = TerminalScheme::ALL
             .into_iter()
             .map(|scheme| {
@@ -614,6 +599,26 @@ pub(crate) fn settings_page(
             .on_change(|checked, _, cx| {
                 let val = *checked;
                 settings::update(cx, |content| content.behavior.stream_follow = val);
+            })
+            .into_any_element();
+
+        let work_trace_switch = Switch::new("local-collapse-work-trace")
+            .checked(behavior.collapse_work_trace)
+            .small()
+            .on_change(|checked, _, cx| {
+                let val = *checked;
+                settings::update(cx, |content| content.behavior.collapse_work_trace = val);
+            })
+            .into_any_element();
+
+        let live_patch_switch = Switch::new("exp-live-patch-preview")
+            .checked(behavior.exp_live_patch_preview)
+            .small()
+            .on_change(|checked, _, cx| {
+                let val = *checked;
+                settings::update(cx, |content| {
+                    content.behavior.exp_live_patch_preview = val;
+                });
             })
             .into_any_element();
 
@@ -755,12 +760,6 @@ pub(crate) fn settings_page(
                         line_height_stepper.into_any_element(),
                         &t,
                     ),
-                    setting_row(
-                        "阅读列宽 (px)",
-                        "",
-                        segmented_strip(width_buttons, &t).into_any_element(),
-                        &t,
-                    ),
                 ],
                 &t,
             ))
@@ -769,12 +768,28 @@ pub(crate) fn settings_page(
                 vec![
                     setting_row("自动跟随底部", "", follow_switch, &t),
                     setting_row(
+                        "折叠过程轨迹视窗",
+                        "把思考链、工具调用与已被新正文替代的中间回复收进限高滚动视窗",
+                        work_trace_switch,
+                        &t,
+                    ),
+                    setting_row(
                         "工具输出尾窗上限",
                         "",
                         segmented_strip(tail_buttons, &t).into_any_element(),
                         &t,
                     ),
                 ],
+                &t,
+            ))
+            .child(section_card(
+                "实验性功能 (Exp)",
+                vec![setting_row(
+                    "实时补丁跟随预览",
+                    "apply_patch 开始流式输出时自动右侧展开目标文件并锁定行号预演改动（失败自动置灰）",
+                    live_patch_switch,
+                    &t,
+                )],
                 &t,
             ))
             .child(section_card(
@@ -844,6 +859,45 @@ pub(crate) fn settings_page(
                 ),
         );
 
+    let op_banner = daemon.last_operation.as_ref().map(|message| {
+        div()
+            .mb_4()
+            .px_3()
+            .py_2()
+            .rounded(px(RADIUS_CONTROL))
+            .bg(qaqh_gpui_kit::kit::soft(t.bad, 0.10))
+            .border_1()
+            .border_color(qaqh_gpui_kit::kit::soft(t.bad, 0.28))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(t.bad)
+                    .child(SharedString::from(message.clone())),
+            )
+            .child(
+                div()
+                    .id("dismiss-settings-error")
+                    .size(px(20.))
+                    .rounded(px(RADIUS_CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.hover))
+                    .on_click(cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                        daemon.last_operation = None;
+                        cx.notify();
+                    }))
+                    .child(Icon::new(IconName::X).with_size(Size::XSmall).text_color(t.bad)),
+            )
+    });
+
     div()
         .flex_1()
         .min_w_0()
@@ -871,6 +925,7 @@ pub(crate) fn settings_page(
                         .flex()
                         .flex_col()
                         .child(header_bar)
+                        .children(op_banner)
                         .child(body),
                 ),
         )

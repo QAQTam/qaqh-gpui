@@ -27,6 +27,13 @@ pub fn apply_snapshot(store: &mut SessionStore, state: SessionState) {
     store.turns = state.turns;
     store.entries = state.timeline;
     store.expanded_groups.clear();
+    store.expanded_traces.clear();
+    store.collapsed_traces.clear();
+    store.trace_scroll_handles.clear();
+    store.trace_started_at.clear();
+    store.trace_elapsed_ms.clear();
+    store.turn_started_at.clear();
+    store.turn_elapsed_ms.clear();
     store.timeline_list.reset(store.entries.len() + 1);
     store.tools = state.tools;
     store.interactions = state.interactions;
@@ -70,6 +77,10 @@ pub fn sync_handoff_after_snapshot(store: &mut SessionStore, cx: &mut Context<Se
         }
         store.handoff_open = (facts.sealed && facts.planned_open_at_ms.is_some()).then_some(facts);
         arm_handoff_tick(store, cx);
+    }
+
+    if store.is_running() {
+        arm_trace_tick(store, cx);
     }
 
     if let Some(first_input) = store
@@ -124,26 +135,52 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
             current_turn_id,
         } => {
             store.activity = Some(activity);
-            store.current_turn_id = current_turn_id;
+            if matches!(activity, qaqh_ringing_contract::fact::ActivityState::Running) {
+                if let Some(tid) = current_turn_id.as_ref() {
+                    store
+                        .turn_started_at
+                        .entry(tid.clone())
+                        .or_insert_with(std::time::Instant::now);
+                }
+                store.current_turn_id = current_turn_id;
+                arm_trace_tick(store, cx);
+            } else {
+                store.current_turn_id = current_turn_id;
+            }
         }
         SessionEvent::TurnStarted { turn_id, input_id } => {
-            upsert_turn(store, turn_id, |turn| turn.input_id = input_id)
+            store
+                .turn_started_at
+                .entry(turn_id.clone())
+                .or_insert_with(std::time::Instant::now);
+            upsert_turn(store, turn_id, |turn| turn.input_id = input_id);
+            arm_trace_tick(store, cx);
         }
         SessionEvent::TurnPhaseChanged { turn_id, phase } => {
             upsert_turn(store, turn_id, |turn| turn.phase = Some(phase));
         }
         SessionEvent::TurnEnded { turn_id, outcome } => {
+            if let Some(started) = store.turn_started_at.remove(&turn_id) {
+                store
+                    .turn_elapsed_ms
+                    .insert(turn_id.clone(), started.elapsed().as_millis() as u64);
+            }
             upsert_turn(store, turn_id, |turn| {
                 turn.outcome = Some(outcome);
                 turn.phase = None;
             });
         }
         SessionEvent::MessageDelta {
-            turn_id: _,
+            turn_id,
             block_id,
             block_kind,
             text,
         } => {
+            store
+                .turn_started_at
+                .entry(turn_id)
+                .or_insert_with(std::time::Instant::now);
+            arm_trace_tick(store, cx);
             // tok/s 采样:Answer 流的净增字符入 3s 滑窗(替换语义取差值)。
             if block_kind == qaqh_ringing_contract::fact::AssistantBlockKind::Answer {
                 let delta = match store.streaming.iter().find(|slot| slot.0 == block_id) {
@@ -159,36 +196,48 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
         }
         SessionEvent::ToolArgumentsDelta {
             call_id,
-            turn_id: _,
+            turn_id,
             tool_name,
             text,
             lines_added,
             lines_removed,
             target_files,
             args_complete,
-        } => match store.arg_stream.iter_mut().find(|slot| slot.call_id == call_id) {
-            Some(slot) => {
-                slot.tool_name = tool_name;
-                slot.text = text;
-                slot.lines = lines_added.zip(lines_removed);
-                slot.target_files = target_files;
-                slot.args_complete = args_complete;
+        } => {
+            store
+                .turn_started_at
+                .entry(turn_id)
+                .or_insert_with(std::time::Instant::now);
+            arm_trace_tick(store, cx);
+            match store.arg_stream.iter_mut().find(|slot| slot.call_id == call_id) {
+                Some(slot) => {
+                    slot.tool_name = tool_name;
+                    slot.text = text;
+                    slot.lines = lines_added.zip(lines_removed);
+                    slot.target_files = target_files;
+                    slot.args_complete = args_complete;
+                }
+                None => store.arg_stream.push(ArgStream {
+                    call_id,
+                    tool_name,
+                    text,
+                    lines: lines_added.zip(lines_removed),
+                    target_files,
+                    args_complete,
+                }),
             }
-            None => store.arg_stream.push(ArgStream {
-                call_id,
-                tool_name,
-                text,
-                lines: lines_added.zip(lines_removed),
-                target_files,
-                args_complete,
-            }),
-        },
+        }
         SessionEvent::ToolDeclared {
             call_id,
             turn_id,
             tool_name,
             args,
         } => {
+            store
+                .turn_started_at
+                .entry(turn_id.clone())
+                .or_insert_with(std::time::Instant::now);
+            arm_trace_tick(store, cx);
             store.arg_stream.retain(|slot| slot.call_id != call_id);
             let updated = upsert_tool(store, &call_id, |existing| {
                 existing.turn_id = Some(turn_id.clone());
@@ -397,6 +446,11 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
                 TimelineEntry::Compaction { .. } => true,
             });
             store.expanded_groups.clear();
+            store.expanded_traces.clear();
+            store.collapsed_traces.clear();
+            store.trace_scroll_handles.clear();
+            store.trace_started_at.clear();
+            store.trace_elapsed_ms.clear();
             store.timeline_list.reset(store.entries.len() + 1);
         }
         SessionEvent::InteractionRequested { interaction } => {
@@ -483,6 +537,36 @@ fn apply_event(store: &mut SessionStore, event: SessionEvent, cx: &mut Context<S
         }
         SessionEvent::HookStarted { .. } | SessionEvent::HookFinished { .. } => {}
     }
+}
+
+/// 过程实时计时 ticker:仅在 `store.is_running()` 时每秒刷新一次界面以驱动「1分22秒」走表,
+/// 会话离开 Running 即自动停表退出,空闲零 CPU 消耗。
+fn arm_trace_tick(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
+    if !store.is_running() || store.trace_ticking {
+        return;
+    }
+    store.trace_ticking = true;
+    cx.spawn(async move |entity, cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(1))
+                .await;
+            let keep_going = entity
+                .update(cx, |store, cx| {
+                    let active = store.is_running();
+                    if !active {
+                        store.trace_ticking = false;
+                    }
+                    cx.notify();
+                    active
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 /// 倒计时 ticker:纯展示驱动(ADR-0016 §决策 3)——到点停表,不自做任何事;

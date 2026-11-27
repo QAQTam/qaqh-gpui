@@ -404,7 +404,7 @@ fn render_structured(
                 IconName::ChevronDown
             },
             t.dim,
-            if collapsed { "展开提问" } else { "折叠提问 (Esc)" },
+            if collapsed { "展开提问" } else { "折叠提问" },
             false,
             t,
             cx.listener(move |store, _, _, cx| {

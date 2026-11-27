@@ -3,8 +3,9 @@
 //! gpui-component 的 InputState/TextareaState(InputState::new 需要
 //! &mut Window,故实体构造一律在窗口上下文内完成)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::App;
@@ -13,6 +14,7 @@ use gpui_kit::Context;
 use gpui_kit::Entity;
 use gpui_kit::FocusHandle;
 use gpui_kit::Focusable;
+use gpui_kit::ScrollHandle;
 use gpui_kit::Subscription;
 use gpui_kit::Window;
 use gpui_kit::{ListAlignment, ListState, px};
@@ -39,7 +41,7 @@ use qaqh_client::{
     CommandTarget, RingingCommand, SessionSettingsPatch, ToolsSettingPatch,
 };
 use qaqh_profile::ProfilesDocument;
-use qaqh_types::{ModelSelection, SessionListEntry, SessionRunStatus, SettingValue};
+use qaqh_types::{CredentialSource, ModelSelection, SessionListEntry, SessionRunStatus, SettingValue};
 use qaqh_ringing_contract::state::ToolCallState;
 
 /// 单会话 SSE 流状态(由 `V2StreamStatus` 映射,避免 store 依赖 SDK 内部枚举形状)。
@@ -89,6 +91,10 @@ pub enum SessionNavEvent {
         session_id: String,
         fly_from_session: Option<String>,
     },
+    SidePanelOpenChanged {
+        open: bool,
+    },
+    OpenAccess,
 }
 
 impl gpui_kit::EventEmitter<SessionNavEvent> for SessionStore {}
@@ -273,6 +279,11 @@ pub struct SessionStore {
     pub output_budget: usize,
     pub search: Entity<InputState>,
     pub search_open: bool,
+    /// 左侧轮次导轨感应状态(对话 >= 2 轮且鼠标靠近时间线左缘时显现)。
+    pub turn_rail_near_left: bool,
+    pub turn_rail_hovered: bool,
+    pub turn_rail_hovered_idx: Option<usize>,
+    pub turn_rail_last_idx: Option<usize>,
     pub code_panel: crate::code_panel::CodePanel,
     pub session_id: String,
     pub title: Option<String>,
@@ -291,6 +302,24 @@ pub struct SessionStore {
     pub expanded_thinking: HashSet<BlockId>,
     /// 展开的连续工具轨迹组(以组内首条 entry 索引为 key)。
     pub expanded_groups: HashSet<usize>,
+    /// 折叠模式下用户手动展开的已收口过程视窗(以稳定 trace_key 为 key)。
+    pub expanded_traces: HashSet<String>,
+    /// 折叠模式下用户手动收起的活跃过程视窗(以稳定 trace_key 为 key)。
+    pub collapsed_traces: HashSet<String>,
+    /// 过程视窗的内部滚动句柄(按 trace_key 保持滚动位置与自动粘底)。
+    pub trace_scroll_handles: HashMap<String, ScrollHandle>,
+    /// 过程视窗实时计时锚点(仅活跃期记录,收口时冻结进 `trace_elapsed_ms`)。
+    pub trace_started_at: HashMap<String, Instant>,
+    /// 已收口过程视窗的实测耗时(ms)。
+    pub trace_elapsed_ms: HashMap<String, u64>,
+    /// 回合实时计时锚点(收到 `TurnStarted` 或首条活跃事件时记录,仅前端补位)。
+    pub turn_started_at: HashMap<TurnId, Instant>,
+    /// 已结束回合的实测耗时(ms)。
+    pub turn_elapsed_ms: HashMap<TurnId, u64>,
+    /// 1s 计时刷新 ticker 是否已武装(会话非 Running 即停)。
+    pub trace_ticking: bool,
+    /// 用户手切过的消息区原位 Todo 卡片(相对默认 `total <= 12` 展开规则取反)。
+    pub toggled_todo_cards: HashSet<ToolCallId>,
     /// 未 declare 的参数生成流:call_id → 流式摘要。
     pub arg_stream: Vec<ArgStream>,
     /// 运行中工具的输出尾窗:call_id → 累计文本。
@@ -352,6 +381,8 @@ pub struct SessionStore {
     pub settings: Option<SessionListEntry>,
     pub settings_pending: bool,
     pub catalog: Option<Arc<ProfilesDocument>>,
+    pub siwc_ready: bool,
+    pub dsaccount_signed_in: bool,
     /// composer 状态(M2):组件库 Textarea(auto_grow,Enter 提交,Shift+Enter 换行)。
     pub composer: Entity<TextareaState>,
     /// 重命名草稿(Some = 重命名模式)。
@@ -436,6 +467,10 @@ impl SessionStore {
             output_budget: qaqh_gpui_kit::settings::get(cx).behavior.output_tail_max,
             search,
             search_open: false,
+            turn_rail_near_left: false,
+            turn_rail_hovered: false,
+            turn_rail_hovered_idx: None,
+            turn_rail_last_idx: None,
             session_id,
             title: None,
             activity: None,
@@ -448,6 +483,15 @@ impl SessionStore {
             expanded_tools: HashSet::new(),
             expanded_thinking: HashSet::new(),
             expanded_groups: HashSet::new(),
+            expanded_traces: HashSet::new(),
+            collapsed_traces: HashSet::new(),
+            trace_scroll_handles: HashMap::new(),
+            trace_started_at: HashMap::new(),
+            trace_elapsed_ms: HashMap::new(),
+            turn_started_at: HashMap::new(),
+            turn_elapsed_ms: HashMap::new(),
+            trace_ticking: false,
+            toggled_todo_cards: HashSet::new(),
             arg_stream: Vec::new(),
             output_tail: Vec::new(),
             interactions: Vec::new(),
@@ -482,6 +526,8 @@ provider_retry: None,
             settings: None,
             settings_pending: false,
             catalog: None,
+            siwc_ready: false,
+            dsaccount_signed_in: false,
             composer,
             ask_drafts: Vec::new(),
             ask_hint: None,
@@ -494,6 +540,17 @@ provider_retry: None,
             model_params_custom_tools: None,
             requests,
         }
+    }
+
+    pub fn provider_account_unauthenticated(&self, provider_id: &str) -> bool {
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| catalog.providers.get(provider_id))
+            .is_some_and(|provider| match provider.credential {
+                CredentialSource::ApiKey => false,
+                CredentialSource::ChatgptPlan => !self.siwc_ready,
+                CredentialSource::DeepseekAccount => !self.dsaccount_signed_in,
+            })
     }
 
     /// 发送受阻原因(与 composer 提示同一来源)。
@@ -982,6 +1039,11 @@ provider_retry: None,
         });
     }
 
+    /// 跳转到外壳「接入」页完成账号授权。
+    pub fn open_access(&self, cx: &mut Context<Self>) {
+        cx.emit(SessionNavEvent::OpenAccess);
+    }
+
     /// 「不拽我」:停掉阅读窗自动倒计时，HandoffSealed 落地后不再自动跳走。
     pub fn cancel_handoff_auto(&mut self) {
         self.handoff_stay = true;
@@ -1065,8 +1127,20 @@ provider_retry: None,
         }
     }
 
+    /// 当前会话实际生效的模型选择（会话显式覆盖优先，未设置时回退全局默认）。
+    pub fn effective_model_selection(&self) -> Option<ModelSelection> {
+        self.settings
+            .as_ref()
+            .and_then(|settings| settings.meta.model_selection.clone())
+            .or_else(|| {
+                self.catalog
+                    .as_deref()
+                    .and_then(|catalog| catalog.default_model_selection.clone())
+            })
+    }
+
     pub fn patch_effort(&mut self, effort: Option<String>) {
-        if let Some(mut model) = self.settings.as_ref().and_then(|settings| settings.meta.model_selection.clone()) {
+        if let Some(mut model) = self.effective_model_selection() {
             model.options.reasoning_effort = effort;
             self.patch_model(model);
         }
@@ -1088,9 +1162,7 @@ provider_retry: None,
 
     pub fn open_model_params(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let max_out_val = self
-            .settings
-            .as_ref()
-            .and_then(|s| s.meta.model_selection.as_ref())
+            .effective_model_selection()
             .and_then(|m| m.options.max_output_tokens)
             .map(|n| n.to_string())
             .unwrap_or_default();
@@ -1125,22 +1197,14 @@ provider_retry: None,
     }
 
     pub fn patch_max_output_tokens(&mut self, max_output_tokens: Option<u32>) {
-        if let Some(mut model) = self
-            .settings
-            .as_ref()
-            .and_then(|settings| settings.meta.model_selection.clone())
-        {
+        if let Some(mut model) = self.effective_model_selection() {
             model.options.max_output_tokens = max_output_tokens;
             self.patch_model(model);
         }
     }
 
     pub fn patch_native_web_search(&mut self, native_web_search: Option<bool>) {
-        if let Some(mut model) = self
-            .settings
-            .as_ref()
-            .and_then(|settings| settings.meta.model_selection.clone())
-        {
+        if let Some(mut model) = self.effective_model_selection() {
             model.options.native_web_search = native_web_search;
             self.patch_model(model);
         }
@@ -1425,14 +1489,18 @@ pub fn rows_from(entries: &[SessionListEntry]) -> Vec<SessionRow> {
 #[derive(Clone)]
 pub struct TodoRow {
     pub title: String,
+    pub description: String,
     pub status: String,
+    pub evidence: Option<String>,
 }
 
 pub fn todos_from(value: &qaqh_ringing_contract::todo::TodoListSnapshot) -> Vec<TodoRow> {
     value.items.iter()
         .map(|item| TodoRow {
             title: item.title.clone(),
+            description: item.description.clone(),
             status: item.status.clone(),
+            evidence: item.evidence.clone(),
         })
         .collect()
 }
@@ -1654,15 +1722,19 @@ pub struct AccountSignIn {
 
 impl AccountSignIn {
     pub fn poll_request(&self) -> BridgeRequest {
-        let (method, key) = match self.service {
-            AccountService::Siwc => ("siwc.sign_in.status", "flow_id"),
-            AccountService::Dsaccount => ("dsaccount.sign_in.status", "attempt_id"),
+        let (method, params) = match self.service {
+            AccountService::Siwc => (
+                "siwc.sign_in.status",
+                serde_json::json!({ "flow_id": self.flow_id }),
+            ),
+            AccountService::Dsaccount => (
+                "dsaccount.sign_in.status",
+                serde_json::Value::Object(Default::default()),
+            ),
         };
-        let mut params = serde_json::Map::new();
-        params.insert(key.into(), serde_json::Value::String(self.flow_id.clone()));
         BridgeRequest::Service {
             method: method.into(),
-            params: serde_json::Value::Object(params),
+            params,
         }
     }
 }
@@ -1690,5 +1762,18 @@ pub fn model_effort_levels(catalog: &qaqh_profile::ProfilesDocument, model: &qaq
         .and_then(|provider| provider.models.get(&model.model_id))
         .filter(|model| model.capabilities.reasoning)
         .map(|model| model.reasoning_levels.clone()).unwrap_or_default()
+}
+
+pub fn model_default_effort(
+    catalog: &qaqh_profile::ProfilesDocument,
+    model: &qaqh_types::ModelSelection,
+) -> Option<String> {
+    catalog
+        .providers
+        .get(&model.provider_id)
+        .and_then(|provider| provider.models.get(&model.model_id))
+        .filter(|model| model.capabilities.reasoning)
+        .and_then(|model| model.defaults.reasoning_effort.clone())
+        .filter(|effort| !effort.is_empty())
 }
 

@@ -39,8 +39,8 @@ impl Render for RootShell {
 pub fn launch() {
     gpui_kit::application()
         // Assets 仅含组件库最小子集(约 60 个),会导致业务侧图标静默空白;
-        // AllAssets 内嵌全部 1,831 个 Lucide SVG(~749 KB),保证全仓 IconName 完整渲染。
-        .with_assets(gpui_kit::assets::AllAssets)
+        // AppAssets 优先内嵌彩色语言/工具品牌 SVG,其余全部回退完整 Lucide AllAssets。
+        .with_assets(qaqh_gpui_kit::icons::AppAssets)
         .run(|cx: &mut App| {
         cx.set_app_identity("io.github.QAQTam.QAQHarness", "QAQHarness");
         // 顺序:settings 先于 theme(theme::init 读设置的主题模式);

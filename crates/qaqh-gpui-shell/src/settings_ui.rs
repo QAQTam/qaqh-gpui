@@ -18,7 +18,7 @@ use qaqh_client::{
 use qaqh_profile::{
     ConfigPatch, ExecPatch, GoalsPatch, ModelDef, ProfilesDocument, ProviderDef, SandboxPatch,
 };
-use qaqh_types::{CredentialSource, ModelSelection, Wire};
+use qaqh_types::{CredentialSource, EndpointCompat, ModelSelection, Wire};
 
 use qaqh_gpui_kit::kit::{
     BtnKind, RADIUS_CHIP, RADIUS_CONTROL, button, card, card_padded, pill, relative_time, soft,
@@ -145,6 +145,7 @@ fn begin(
     submit: impl Fn(&[Field], &mut DaemonStore, &mut Context<DaemonStore>) -> Result<(), String>
         + 'static,
 ) {
+    daemon.last_operation = None;
     daemon.settings_form = Some(Form {
         title: title.into(),
         fields,
@@ -174,7 +175,7 @@ fn catalog_command(
 
 fn report(daemon: &mut DaemonStore, result: Result<(), String>) {
     if let Err(error) = result {
-        daemon.lines.push(error);
+        daemon.last_operation = Some(error);
     }
 }
 
@@ -687,11 +688,26 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
     } else {
         ("未登录", t.dim)
     };
-    let who = status
+    let account_meta = status
         .account
         .as_ref()
-        .map(|account| account.label.as_str())
-        .filter(|label| !label.is_empty())
+        .map(|account| {
+            let mut parts = Vec::new();
+            if !account.label.is_empty() {
+                parts.push(account.label.clone());
+            }
+            if let Some(provider) = &account.provider
+                && !provider.is_empty()
+            {
+                parts.push(provider.clone());
+            }
+            if let Some(currency) = &account.currency
+                && !currency.is_empty()
+            {
+                parts.push(currency.clone());
+            }
+            parts.join(" · ")
+        })
         .unwrap_or_default();
 
     let mut actions = div().flex().items_center().gap_2();
@@ -713,6 +729,46 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
         ));
     } else if status.signed_in {
         actions = actions
+            .child(button(
+                cx,
+                BtnKind::Soft,
+                "ds-sync-models",
+                if daemon.ds_models_syncing {
+                    "同步中…"
+                } else {
+                    "刷新模型"
+                },
+                t,
+                cx.listener(|daemon, _, _, cx| {
+                    if !daemon.ds_models_syncing {
+                        daemon.sync_dsaccount_models();
+                    }
+                    cx.notify();
+                }),
+            ))
+            .child(button(
+                cx,
+                BtnKind::Ghost,
+                "ds-verify",
+                "验证凭据",
+                t,
+                cx.listener(|daemon, _, _, cx| {
+                    daemon.verify_dsaccount();
+                    cx.notify();
+                }),
+            ))
+            .child(button(
+                cx,
+                BtnKind::Soft,
+                "ds-usage",
+                "查看用量",
+                t,
+                cx.listener(|daemon, _, _, cx| {
+                    if let Some(status) = &daemon.dsaccount {
+                        cx.open_url(&status.usage_url);
+                    }
+                }),
+            ))
             .child(button(
                 cx,
                 BtnKind::Soft,
@@ -775,12 +831,12 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                             )
                             .child(pill(state, color, t)),
                     )
-                    .when(!who.is_empty(), |col| {
+                    .when(!account_meta.is_empty(), |col| {
                         col.child(
                             div()
                                 .text_xs()
                                 .text_color(t.dim)
-                                .child(SharedString::from(who.to_owned())),
+                                .child(SharedString::from(account_meta.clone())),
                         )
                     }),
             )
@@ -793,6 +849,61 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
                 .text_xs()
                 .text_color(t.bad)
                 .child(SharedString::from(format!("本地凭据读取失败: {error}"))),
+        );
+    }
+
+    if status.revoke.state == "failed" {
+        let msg = status
+            .revoke
+            .message
+            .as_deref()
+            .unwrap_or("远端撤销未成功，可前往平台手动撤销授权");
+        base = base.child(
+            div()
+                .text_xs()
+                .text_color(t.warn)
+                .child(SharedString::from(format!("上次登出远端撤销失败：{msg}"))),
+        );
+    }
+
+    for bonus in &daemon.ds_bonuses {
+        let order_id = bonus.order_id.clone();
+        let summary = if bonus.message.trim().is_empty() {
+            format!("未读赠额：{} {}", bonus.amount, bonus.currency)
+        } else {
+            format!("{}（{} {}）", bonus.message, bonus.amount, bonus.currency)
+        };
+        base = base.child(
+            div()
+                .px_3()
+                .py_2()
+                .rounded(px(RADIUS_CONTROL))
+                .bg(soft(t.accent, 0.08))
+                .border_1()
+                .border_color(soft(t.accent, 0.24))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(t.text)
+                        .child(SharedString::from(summary)),
+                )
+                .child(button(
+                    cx,
+                    BtnKind::Ghost,
+                    SharedString::from(format!("ds-ack-bonus-{}", bonus.order_id)),
+                    "确认",
+                    t,
+                    cx.listener(move |daemon, _, _, cx| {
+                        daemon.ack_dsaccount_bonus(order_id.clone());
+                        cx.notify();
+                    }),
+                )),
         );
     }
 
@@ -831,6 +942,143 @@ fn dsaccount_card(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palet
         }
         if !balance.has_usable_balance {
             base = base.child(div().text_xs().text_color(t.bad).child("当前没有可用余额"));
+        }
+    }
+
+    if status.signed_in {
+        let ds_entry = daemon.providers.as_deref().and_then(|catalog| {
+            catalog
+                .providers
+                .iter()
+                .find(|(_, provider)| provider.credential == CredentialSource::DeepseekAccount)
+                .map(|(provider_id, provider)| (catalog, provider_id, provider))
+        });
+        match ds_entry {
+            Some((catalog, provider_id, provider)) if !provider.models.is_empty() => {
+                let mut models_box = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.dim)
+                                    .child("可用模型"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(t.faint)
+                                    .child(SharedString::from(format!(
+                                        "{} · {} 个模型",
+                                        provider.name,
+                                        provider.models.len()
+                                    ))),
+                            ),
+                    );
+                let revision = catalog.revision;
+                for (model_id, model) in &provider.models {
+                    let selection = ModelSelection {
+                        provider_id: provider_id.clone(),
+                        model_id: model_id.clone(),
+                        options: Default::default(),
+                    };
+                    let is_default = catalog
+                        .default_model_selection
+                        .as_ref()
+                        .is_some_and(|m| m.provider_id == *provider_id && m.model_id == *model_id);
+                    let valid = qaqh_profile::resolve_model_selection(catalog, &selection).is_ok();
+                    let name = model.display_name.as_deref().unwrap_or(model_id);
+                    let mut meta_parts = vec![format!("{} ctx", token_label(model.context_window))];
+                    if !model.reasoning_levels.is_empty() {
+                        meta_parts.push(format!("推理: {}", model.reasoning_levels.join("/")));
+                    }
+                    let mut left = div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(t.text)
+                                .truncate()
+                                .child(SharedString::from(name.to_owned())),
+                        )
+                        .child(
+                            div()
+                                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                                .text_xs()
+                                .text_color(t.faint)
+                                .truncate()
+                                .child(SharedString::from(meta_parts.join(" · "))),
+                        );
+                    if is_default {
+                        left = left.child(pill("默认", t.accent, t));
+                    } else if !model.enabled {
+                        left = left.child(pill("已停用", t.warn, t));
+                    }
+                    let right = (valid && !is_default).then(|| {
+                        let sel = selection.clone();
+                        dim_button(
+                            cx,
+                            t,
+                            format!("ds-model-default-{provider_id}-{model_id}"),
+                            "设为默认",
+                            move |daemon, _, _| {
+                                let result = catalog_command(
+                                    daemon,
+                                    revision,
+                                    RingingCommand::ModelSelectionSetDefault {
+                                        selection: sel.clone(),
+                                    },
+                                );
+                                report(daemon, result);
+                            },
+                        )
+                    });
+                    models_box = models_box.child(
+                        div()
+                            .px_2p5()
+                            .py_1p5()
+                            .rounded(px(RADIUS_CHIP))
+                            .bg(t.surface_subtle)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(left)
+                            .children(right),
+                    );
+                }
+                base = base.child(models_box);
+            }
+            _ => {
+                let hint = if daemon.ds_models_syncing {
+                    "正在同步 DeepSeek 账号模型…"
+                } else {
+                    "暂未同步到可用模型，请点击「刷新模型」"
+                };
+                base = base.child(
+                    div()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(t.border_subtle)
+                        .text_xs()
+                        .text_color(t.dim)
+                        .child(hint),
+                );
+            }
         }
     }
     base
@@ -1107,26 +1355,53 @@ pub(crate) fn render_form(
                     "返回",
                     t,
                     cx.listener(|daemon: &mut DaemonStore, _, _, cx| {
+                        daemon.last_operation = None;
                         daemon.settings_form = None;
                         cx.notify();
                     }),
                 )),
         );
 
+    let credential_choice = form
+        .fields
+        .iter()
+        .find(|f| f.key == "credential")
+        .map(|f| f.value(cx));
     let mut index = 0;
     while index < form.fields.len() {
         let field = &form.fields[index];
+        if let Some(cred) = credential_choice.as_deref() {
+            if matches!(field.key, "api_key" | "clear_key") && cred != "API 密钥" {
+                index += 1;
+                continue;
+            }
+            if field.key == "official_web_tools" && cred != "DeepSeek 账号" {
+                index += 1;
+                continue;
+            }
+        }
         if matches!(field.control, FieldControl::Switch(_)) {
             let mut run = Vec::new();
             while index < form.fields.len()
                 && matches!(form.fields[index].control, FieldControl::Switch(_))
             {
+                let key = form.fields[index].key;
+                if credential_choice.as_deref().is_some_and(|cred| {
+                    (key == "clear_key" && cred != "API 密钥")
+                        || (key == "official_web_tools" && cred != "DeepSeek 账号")
+                }) {
+                    index += 1;
+                    continue;
+                }
                 run.push(index);
                 index += 1;
             }
-            body = body.child(switch_run_row(form, &run, cx, t));
+            if !run.is_empty() {
+                body = body.child(switch_run_row(form, &run, cx, t));
+            }
             continue;
         }
+        let field_key = field.key;
         let control = match &field.control {
             FieldControl::Input(state) => {
                 div().w(px(300.)).child(Input::new(state).small()).into_any_element()
@@ -1141,12 +1416,49 @@ pub(crate) fn render_form(
                         t,
                         {
                             let choice = choice.clone();
-                            cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
+                            cx.listener(move |daemon: &mut DaemonStore, _, window, cx| {
+                                let base_url_field = daemon.settings_form.as_ref().and_then(|form| {
+                                    form.fields.iter().find(|f| f.key == "base_url").and_then(|f| {
+                                        match &f.control {
+                                            FieldControl::Input(state) => Some(state.clone()),
+                                            _ => None,
+                                        }
+                                    })
+                                });
                                 if let Some(form) = &mut daemon.settings_form
                                     && let FieldControl::Choice { value, .. } =
                                         &mut form.fields[index].control
                                 {
                                     *value = choice.clone();
+                                    if field_key == "credential" {
+                                        daemon.last_operation = None;
+                                        if matches!(
+                                            choice.as_str(),
+                                            "DeepSeek 账号" | "ChatGPT 套餐"
+                                        ) {
+                                            for other in &mut form.fields {
+                                                if other.key == "wire"
+                                                    && let FieldControl::Choice {
+                                                        value: wire_val,
+                                                        ..
+                                                    } = &mut other.control
+                                                {
+                                                    *wire_val = "responses".to_owned();
+                                                }
+                                            }
+                                        }
+                                        if choice == "DeepSeek 账号"
+                                            && let Some(url_state) = base_url_field
+                                        {
+                                            url_state.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    "https://api.deepseek.com",
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }
                                 }
                                 cx.notify();
                             })
@@ -1164,6 +1476,15 @@ pub(crate) fn render_form(
         body = body.child(setting_row(field.label, "", control, t));
         index += 1;
     }
+    if credential_choice.as_deref() == Some("DeepSeek 账号") {
+        body = body.child(
+            div()
+                .pt_2()
+                .text_xs()
+                .text_color(t.dim)
+                .child("DeepSeek 账号凭据强制走官方 Responses 端点 (https://api.deepseek.com)，不使用 API 密钥。"),
+        );
+    }
 
     body = body.child(
         div()
@@ -1178,6 +1499,7 @@ pub(crate) fn render_form(
                 "取消",
                 t,
                 cx.listener(move |daemon: &mut DaemonStore, _, _, cx| {
+                    daemon.last_operation = None;
                     daemon.settings_form = None;
                     cx.notify();
                 }),
@@ -1201,7 +1523,7 @@ pub(crate) fn render_form(
                         && let Err(error) = (form.submit)(&form.fields, daemon, cx)
                     {
                         daemon.settings_form = Some(form);
-                        daemon.lines.push(error);
+                        daemon.last_operation = Some(error);
                     }
                     cx.notify();
                 }),
@@ -1580,6 +1902,13 @@ fn provider_form(
             credential,
             ["API 密钥", "ChatGPT 套餐", "DeepSeek 账号"],
         ),
+        Field::switch(
+            "official_web_tools",
+            "官网联网工具 (Search / Fetch)",
+            provider
+                .and_then(|p| p.compat.as_ref())
+                .is_some_and(|compat| compat.official_web_tools),
+        ),
         Field::secret("api_key", "新 API 密钥（留空保留）", window, cx),
         Field::switch("clear_key", "清除已存密钥", false),
     ]);
@@ -1594,15 +1923,48 @@ fn provider_form(
             None => Field::find(fields, "provider_id")?.required(cx)?,
         };
         let provider = existing.as_ref().map(|(_, p)| p);
-        let api_key = match (
-            Field::find(fields, "api_key")?.value(cx).as_str(),
-            Field::find(fields, "clear_key")?.value(cx).as_str(),
-        ) {
-            ("", "是") => SecretWrite::Clear,
-            ("", _) => SecretWrite::Keep,
-            (_, "是") => return Err("请在设置新密钥与清除密钥之间选择一项".into()),
-            (key, _) => SecretWrite::Set(key.into()),
+        let credential = match Field::find(fields, "credential")?.value(cx).as_str() {
+            "ChatGPT 套餐" => CredentialSource::ChatgptPlan,
+            "DeepSeek 账号" => CredentialSource::DeepseekAccount,
+            _ => CredentialSource::ApiKey,
         };
+        let wire = Wire::parse(&Field::find(fields, "wire")?.value(cx))
+            .ok_or("请选择接口协议")?;
+        let base_url = Field::find(fields, "base_url")?.required(cx)?;
+        if credential == CredentialSource::DeepseekAccount {
+            if wire != Wire::Responses {
+                return Err("DeepSeek 账号额度仅支持 responses 接口协议".into());
+            }
+            if base_url.trim_end_matches('/') != "https://api.deepseek.com" {
+                return Err("DeepSeek 账号额度端点 URL 必须是 https://api.deepseek.com".into());
+            }
+        }
+        let api_key = if credential == CredentialSource::ApiKey {
+            match (
+                Field::find(fields, "api_key")?.value(cx).as_str(),
+                Field::find(fields, "clear_key")?.value(cx).as_str(),
+            ) {
+                ("", "是") => SecretWrite::Clear,
+                ("", _) => SecretWrite::Keep,
+                (_, "是") => return Err("请在设置新密钥与清除密钥之间选择一项".into()),
+                (key, _) => SecretWrite::Set(key.into()),
+            }
+        } else {
+            SecretWrite::Keep
+        };
+        let mut compat = provider.and_then(|p| p.compat.clone());
+        if credential == CredentialSource::DeepseekAccount {
+            let official_web = Field::find(fields, "official_web_tools")?.value(cx) == "是";
+            if official_web || compat.is_some() {
+                let mut next = compat.unwrap_or_default();
+                next.official_web_tools = official_web;
+                compat = if next == EndpointCompat::default() {
+                    None
+                } else {
+                    Some(next)
+                };
+            }
+        }
         catalog_command(
             daemon,
             revision,
@@ -1610,16 +1972,11 @@ fn provider_form(
                 id,
                 provider: ProviderUpsertDto {
                     name: Field::find(fields, "name")?.required(cx)?,
-                    base_url: Field::find(fields, "base_url")?.required(cx)?,
-                    wire: Wire::parse(&Field::find(fields, "wire")?.value(cx))
-                        .ok_or("请选择接口协议")?,
-                    credential: match Field::find(fields, "credential")?.value(cx).as_str() {
-                        "ChatGPT 套餐" => CredentialSource::ChatgptPlan,
-                        "DeepSeek 账号" => CredentialSource::DeepseekAccount,
-                        _ => CredentialSource::ApiKey,
-                    },
+                    base_url,
+                    wire,
+                    credential,
                     headers: provider.map(|p| p.headers.clone()).unwrap_or_default(),
-                    compat: provider.and_then(|p| p.compat.clone()),
+                    compat,
                     api_key,
                 },
             },
@@ -1859,8 +2216,9 @@ fn catalog(daemon: &DaemonStore, cx: &mut Context<DaemonStore>, t: &Palette) -> 
                 .child(div().flex().flex_wrap().gap_2().children(chips)),
         );
     }
+    let ds_signed_in = daemon.dsaccount_signed_in();
     for (id, provider) in &catalog.providers {
-        body = body.child(provider_card(catalog, id, provider, cx, t));
+        body = body.child(provider_card(catalog, id, provider, ds_signed_in, cx, t));
     }
     body
 }
@@ -1869,10 +2227,33 @@ fn provider_card(
     catalog: &ProfilesDocument,
     id: &str,
     provider: &ProviderDef,
+    ds_signed_in: bool,
     cx: &mut Context<DaemonStore>,
     t: &Palette,
 ) -> Div {
     let revision = catalog.revision;
+    let is_ds_oauth = provider.credential == CredentialSource::DeepseekAccount;
+    let sync_models = is_ds_oauth.then(|| {
+        button(
+            cx,
+            BtnKind::Soft,
+            format!("ds-sync-models-{id}"),
+            if ds_signed_in {
+                "同步账号模型"
+            } else {
+                "去登录账号"
+            },
+            t,
+            cx.listener(move |daemon, _, window, cx| {
+                if daemon.dsaccount_signed_in() {
+                    daemon.sync_dsaccount_models();
+                } else {
+                    daemon.open_settings(qaqh_gpui_session::store::SettingsEditor::Accounts, window, cx);
+                }
+                cx.notify();
+            }),
+        )
+    });
     let provider_id = id.to_owned();
     let add_model = button(
         cx,
@@ -1909,6 +2290,45 @@ fn provider_card(
         provider.wire.as_str(),
         credential_label(provider.credential)
     );
+    let mut header_badges = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.text)
+                .truncate()
+                .child(provider.name.clone()),
+        )
+        .child(
+            div()
+                .px_2()
+                .py(px(1.))
+                .rounded_full()
+                .bg(t.btn)
+                .text_xs()
+                .text_color(t.dim)
+                .child(SharedString::from(format!(
+                    "{} 个模型",
+                    provider.models.len()
+                ))),
+        );
+    if is_ds_oauth {
+        if ds_signed_in {
+            header_badges = header_badges.child(pill("账号已登录", t.ok, t));
+        } else {
+            header_badges = header_badges.child(pill("未登录", t.warn, t));
+        }
+        if provider
+            .compat
+            .as_ref()
+            .is_some_and(|compat| compat.official_web_tools)
+        {
+            header_badges = header_badges.child(pill("官网联网", t.accent, t));
+        }
+    }
     let mut c = card(t)
         .flex()
         .flex_col()
@@ -1930,33 +2350,7 @@ fn provider_card(
                         .flex_col()
                         .gap_0p5()
                         .min_w_0()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(t.text)
-                                        .truncate()
-                                        .child(provider.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py(px(1.))
-                                        .rounded_full()
-                                        .bg(t.btn)
-                                        .text_xs()
-                                        .text_color(t.dim)
-                                        .child(SharedString::from(format!(
-                                            "{} 个模型",
-                                            provider.models.len()
-                                        ))),
-                                ),
-                        )
+                        .child(header_badges)
                         .child(
                             div()
                                 .text_xs()
@@ -1971,6 +2365,7 @@ fn provider_card(
                         .flex()
                         .items_center()
                         .gap_1p5()
+                        .children(sync_models)
                         .child(add_model)
                         .child(edit)
                         .child(remove),

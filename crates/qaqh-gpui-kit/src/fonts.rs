@@ -79,6 +79,24 @@ pub fn mono_font_fallbacks() -> Option<FontFallbacks> {
     MONO_FALLBACKS.get().and_then(|v| v.clone())
 }
 
+/// 构造带本机 CJK 无衬线回退链的 UI 字体,避免 `SemiBold(600)` 在缺少该字重的
+/// CJK 无衬线体时跨家族跳回 `Noto Serif CJK` 宋体字形。
+pub fn ui_font(custom_family: &str) -> gpui_kit::Font {
+    let trimmed = custom_family.trim();
+    let family = if trimmed.is_empty() {
+        ui_font_family()
+    } else {
+        SharedString::from(trimmed.to_owned())
+    };
+    gpui_kit::Font {
+        family,
+        features: Default::default(),
+        fallbacks: ui_font_fallbacks(),
+        weight: gpui_kit::FontWeight::NORMAL,
+        style: gpui_kit::FontStyle::Normal,
+    }
+}
+
 fn pick_fallbacks(candidates: &[&str], installed: &[String]) -> Option<FontFallbacks> {
     let picked: Vec<String> = candidates
         .iter()

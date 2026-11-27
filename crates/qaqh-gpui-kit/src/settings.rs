@@ -116,6 +116,9 @@ impl Default for AppearanceContent {
     }
 }
 
+/// 消息区最大列宽(px);窄窗口或二分抽屉压缩时通过 `.w_full().max_w(...)` 自动收缩。
+pub const MESSAGE_MAX_WIDTH_PX: f32 = 880.0;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TypographyContent {
@@ -125,12 +128,10 @@ pub struct TypographyContent {
     pub ui_font_family: String,
     /// 代码块字号(绝对 px,不随 rem)。
     pub code_font_size: f32,
-    /// 后台执行观察窗终端字号(绝对 px,默认 10px 以高密度对齐 80 列)。
+    /// 后台执行观察窗终端字号(绝对 px,默认 10px 以高密度对齐 160 列)。
     pub exec_font_size: f32,
     /// 消息段落行高倍数。
     pub prose_line_height: f32,
-    /// 时间线内容列宽(px)。
-    pub content_width: f32,
 }
 
 impl Default for TypographyContent {
@@ -141,7 +142,6 @@ impl Default for TypographyContent {
             code_font_size: 12.0,
             exec_font_size: 10.0,
             prose_line_height: 1.55,
-            content_width: 760.0,
         }
     }
 }
@@ -151,15 +151,21 @@ impl Default for TypographyContent {
 pub struct BehaviorContent {
     /// 流式时自动跟随底部(滚轮上滚暂停/下滚恢复)。
     pub stream_follow: bool,
+    /// 折叠过程轨迹：把思考链、工具调用与已被新正文替代的中间回复收进限高视窗。
+    pub collapse_work_trace: bool,
     /// 工具/执行输出尾窗上限(字节,UTF-8 安全截断)。
     pub output_tail_max: usize,
+    /// 实验性特性：`apply_patch` 开始流式输出时自动右侧展开目标文件并锁定行号预演改动。
+    pub exp_live_patch_preview: bool,
 }
 
 impl Default for BehaviorContent {
     fn default() -> Self {
         Self {
             stream_follow: true,
+            collapse_work_trace: true,
             output_tail_max: 16 * 1024,
+            exp_live_patch_preview: false,
         }
     }
 }
@@ -179,7 +185,6 @@ impl SettingsContent {
             code_font_size: self.typography.code_font_size,
             exec_font_size: self.typography.exec_font_size,
             prose_line_height: self.typography.prose_line_height,
-            content_width: self.typography.content_width,
             density_shift: self.appearance.density.shift(),
         }
     }
@@ -191,7 +196,6 @@ pub struct Typography {
     pub code_font_size: f32,
     pub exec_font_size: f32,
     pub prose_line_height: f32,
-    pub content_width: f32,
     pub density_shift: f32,
 }
 

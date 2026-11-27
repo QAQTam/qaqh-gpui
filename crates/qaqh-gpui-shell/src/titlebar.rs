@@ -1,6 +1,6 @@
 //! 融合自定义 TitleBar(42px,透出 Win11 Mica):
 //! 左侧 = 侧栏弹簧切换钮 + 当前会话面包屑(呼吸光点 / 工作区 / 清洗标题 / Goal / 封箱 / tok·s);
-//! 右侧 = 任务板切换胶囊 + 终端切换胶囊 + 主题切换 + 设置(紧接系统三键)。
+//! 右侧 = 任务板切换胶囊 + 终端切换胶囊 + 主题切换(紧接系统三键)。
 
 use gpui_kit::prelude::*;
 use gpui_kit::{Context, FontWeight, MouseButton, SharedString, div, px};
@@ -12,7 +12,6 @@ use qaqh_gpui_kit::motion::live_dot;
 use qaqh_gpui_kit::primitives::titlebar_pill;
 use qaqh_gpui_kit::settings;
 use qaqh_gpui_kit::theme::{Palette, ThemeMode};
-use qaqh_gpui_session::store::SettingsEditor;
 use qaqh_ringing_contract::fact::ActivityState;
 
 use crate::daemon::{DaemonStore, PrimarySection};
@@ -32,14 +31,13 @@ pub(crate) fn render(
             None,
             daemon.sidebar_open,
             if daemon.sidebar_open {
-                "收起侧栏 (Ctrl+B)"
+                "收起侧栏"
             } else {
-                "展开侧栏 (Ctrl+B)"
+                "展开侧栏"
             },
             t,
             cx.listener(|daemon, _, _, cx| {
-                daemon.sidebar_open = !daemon.sidebar_open;
-                cx.notify();
+                daemon.toggle_sidebar_manual(None, cx);
             }),
         ))
         .child(qaqh_gpui_session::handoff::anchor_probe(move |bounds| {
@@ -263,24 +261,30 @@ pub(crate) fn render(
         }),
     );
 
-    let settings_btn = titlebar_pill(
-        "tb-settings",
-        IconName::Settings,
-        Some("设置".into()),
-        None,
-        daemon.settings_open,
-        "打开设置 (Ctrl+,)",
-        t,
-        cx.listener(|daemon, _, window, cx| {
-            if daemon.settings_open {
-                daemon.settings_open = false;
-                daemon.settings_form = None;
-                cx.notify();
+    let collapse_work_trace = settings::get(cx).behavior.collapse_work_trace;
+    let trace_btn = in_session.then(|| {
+        titlebar_pill(
+            "tb-work-trace",
+            if collapse_work_trace {
+                IconName::ListChevronsDownUp
             } else {
-                daemon.open_settings(SettingsEditor::Local, window, cx);
-            }
-        }),
-    );
+                IconName::ListChevronsUpDown
+            },
+            None,
+            None,
+            collapse_work_trace,
+            if collapse_work_trace {
+                "过程轨迹：已折叠（点击展开全部思考、工具与中间回复）"
+            } else {
+                "过程轨迹：已展开（点击折叠过程视窗，仅保留最新正文）"
+            },
+            t,
+            cx.listener(|_, _, _, cx| {
+                let next = !settings::get(cx).behavior.collapse_work_trace;
+                settings::update(cx, |content| content.behavior.collapse_work_trace = next);
+            }),
+        )
+    });
 
     let right = div()
         .flex()
@@ -288,11 +292,11 @@ pub(crate) fn render(
         .gap_1p5()
         .pr_2()
         .flex_shrink_0()
+        .children(trace_btn)
         .children(todo_btn)
         .children(team_btn)
         .child(terminal_btn)
-        .child(theme_btn)
-        .child(settings_btn);
+        .child(theme_btn);
 
     TitleBar::new()
         .h(px(42.))

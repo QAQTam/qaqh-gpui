@@ -5,12 +5,14 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, Div, Entity, FollowMode,
-    FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, list, px, relative,
+    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, Div, Entity, FollowMode, Font,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement,
+    Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, TextRun, Window,
+    div, list, px, relative, rems,
 };
 use gpui_kit::base::{SelectableText, TextSelection};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
@@ -19,45 +21,249 @@ use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
 use qaqh_ringing_contract::fact::{
     ActorKind, AssistantBlockKind, BlockId, ContentValue, InputPurpose, InteractionKind,
-    PermissionGrantScope, ToolCallId,
+    PermissionGrantScope, ToolCallId, TurnId,
 };
 use qaqh_ringing_contract::state::{
     ExecSessionState, TimelineEntry, ToolCallState, ToolCallView,
 };
 use qaqh_types::{SessionRunStatus, ToolCallOutcome};
 
+use qaqh_gpui_kit::icons::{AppIcon, command_icon, render_app_icon};
 use qaqh_gpui_kit::kit::{
-    RADIUS_BUBBLE, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, shadow_popover, soft,
+    RADIUS_BUBBLE, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, RADIUS_POPOVER, shadow_card,
+    shadow_popover, soft,
 };
 use qaqh_gpui_kit::motion::{
-    accordion_reveal, bottom_fade_mask, effective_motion, live_dot, shimmer_label, spring_chevron,
+    accordion_reveal, bottom_fade_mask, effective_motion, live_dot, presence_overlay,
+    shimmer_label, spring_chevron, top_fade_mask,
 };
 use qaqh_gpui_kit::primitives::action_button;
-use qaqh_gpui_kit::settings::{self, MotionLevel};
+use qaqh_gpui_kit::settings::{self, MESSAGE_MAX_WIDTH_PX, MotionLevel};
 use qaqh_gpui_kit::theme::{ActiveTheme, Palette};
 
 use crate::store::{ArgStream, SessionStore};
 
-/// 自动换行悬停提示卡:用于单行截断的 Todo 条目,悬停展示完整多行内容。
+const TOOLTIP_PAD_X: f32 = 12.0;
+const TOOLTIP_PAD_Y: f32 = 8.0;
+const TOOLTIP_BORDER: f32 = 1.0;
+const TOOLTIP_CHROME_W: f32 = (TOOLTIP_PAD_X + TOOLTIP_BORDER) * 2.0;
+const TOOLTIP_EDGE_MARGIN: f32 = 16.0;
+const TOOLTIP_MIN_INNER_W: f32 = 64.0;
+const TOOLTIP_MIN_RIGHT_W: f32 = 280.0;
+const TOOLTIP_MAX_OUTER_W: f32 = 680.0;
+const TOOLTIP_MEASURE_SLACK: f32 = 4.0;
+
+fn collapse_tooltip_text(raw: &str) -> SharedString {
+    let joined = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    SharedString::from(joined)
+}
+
+fn measure_unwrapped_width(
+    text: &SharedString,
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    window: &Window,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let runs = [TextRun {
+        len: text.len(),
+        font,
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    match window
+        .text_system()
+        .shape_text(text.clone(), font_size, &runs, None, None)
+    {
+        Ok(lines) => lines
+            .iter()
+            .map(|line| f32::from(line.size(line_height).width))
+            .fold(0.0_f32, f32::max)
+            .ceil(),
+        Err(_) => 0.0,
+    }
+}
+
+/// 动态向右延伸、最多两行的悬停提示卡:用于 Todo 条目展示标题、说明与完成/更新依据。
 struct WrappingTooltip {
-    text: SharedString,
+    title: SharedString,
+    description: Option<SharedString>,
+    evidence: Option<SharedString>,
 }
 
 impl Render for WrappingTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.colors();
+        let title = collapse_tooltip_text(self.title.as_ref());
+        let description = self
+            .description
+            .as_deref()
+            .map(collapse_tooltip_text)
+            .filter(|s| !s.is_empty());
+        let evidence = self
+            .evidence
+            .as_deref()
+            .map(|ev| collapse_tooltip_text(&format!("原因：{ev}")))
+            .filter(|s| !s.is_empty());
+
+        let rem_size = window.rem_size();
+        let font_size = rems(0.75).to_pixels(rem_size);
+        let base_style = window.text_style();
+        let line_height = base_style
+            .line_height
+            .to_pixels(font_size.into(), rem_size);
+        let normal_font = base_style.font();
+        let title_font = Font {
+            weight: FontWeight::MEDIUM,
+            ..normal_font.clone()
+        };
+
+        let mut natural_w =
+            measure_unwrapped_width(&title, title_font, font_size, line_height, window);
+        if let Some(desc) = &description {
+            natural_w = natural_w.max(measure_unwrapped_width(
+                desc,
+                normal_font.clone(),
+                font_size,
+                line_height,
+                window,
+            ));
+        }
+        if let Some(ev) = &evidence {
+            natural_w = natural_w.max(measure_unwrapped_width(
+                ev,
+                normal_font,
+                font_size,
+                line_height,
+                window,
+            ));
+        }
+
+        let viewport_w = f32::from(window.viewport_size().width);
+        let mouse_x = f32::from(window.mouse_position().x);
+        let viewport_cap = (viewport_w - TOOLTIP_EDGE_MARGIN).clamp(120.0, TOOLTIP_MAX_OUTER_W);
+        let right_avail = (viewport_w - mouse_x - TOOLTIP_EDGE_MARGIN).max(0.0);
+        let left_avail = (mouse_x - TOOLTIP_EDGE_MARGIN).max(0.0);
+        let max_outer_w = if right_avail >= TOOLTIP_MIN_RIGHT_W {
+            right_avail.min(viewport_cap)
+        } else {
+            right_avail
+                .max(left_avail)
+                .min(viewport_cap)
+                .max(120.0_f32.min(viewport_cap))
+        };
+        let max_inner_w = (max_outer_w - TOOLTIP_CHROME_W).max(TOOLTIP_MIN_INNER_W);
+        let inner_w = (natural_w + TOOLTIP_MEASURE_SLACK)
+            .clamp(TOOLTIP_MIN_INNER_W.min(max_inner_w), max_inner_w);
+        let outer_w = inner_w + TOOLTIP_CHROME_W;
+
+        let has_detail = description.is_some() || evidence.is_some();
+        let has_evidence = evidence.is_some();
+
+        let title_el = if has_detail {
+            div()
+                .w(px(inner_w))
+                .truncate()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.text)
+                .child(title)
+        } else {
+            div()
+                .w(px(inner_w))
+                .line_clamp(2)
+                .text_ellipsis()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.text)
+                .child(title)
+        };
+
         div()
-            .max_w(px(320.))
-            .px_2p5()
-            .py_1p5()
-            .rounded(px(RADIUS_CHIP))
+            .w(px(outer_w))
+            .px(px(TOOLTIP_PAD_X))
+            .py(px(TOOLTIP_PAD_Y))
+            .rounded(px(RADIUS_POPOVER))
             .bg(t.card)
             .border_1()
             .border_color(t.border)
             .shadow(shadow_popover(&t))
-            .text_xs()
-            .text_color(t.text)
-            .child(self.text.clone())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(title_el)
+            .children(description.map(|desc| {
+                let row = div().w(px(inner_w)).text_xs().text_color(t.dim);
+                if has_evidence {
+                    row.truncate().child(desc)
+                } else {
+                    row.line_clamp(2).text_ellipsis().child(desc)
+                }
+            }))
+            .children(evidence.map(|ev| {
+                div()
+                    .w(px(inner_w))
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child(ev)
+            }))
+    }
+}
+
+fn todo_status_icon(anim_id: SharedString, status: &str, animate_motion: bool, t: &Palette) -> AnyElement {
+    match status {
+        "completed" => Icon::new(IconName::CircleCheck)
+            .with_size(Size::XSmall)
+            .text_color(t.ok)
+            .into_any_element(),
+        "cancelled" => Icon::new(IconName::CircleX)
+            .with_size(Size::XSmall)
+            .text_color(t.bad)
+            .into_any_element(),
+        "in_progress" => {
+            let icon = Icon::new(IconName::LoaderCircle)
+                .with_size(Size::XSmall)
+                .text_color(t.accent);
+            if animate_motion {
+                icon.with_animation(
+                    anim_id,
+                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                    |icon, val| icon.rotate(gpui_kit::Radians(val * std::f32::consts::TAU)),
+                )
+                .into_any_element()
+            } else {
+                icon.into_any_element()
+            }
+        }
+        _ => Icon::new(IconName::Circle)
+            .with_size(Size::XSmall)
+            .text_color(t.faint)
+            .into_any_element(),
+    }
+}
+
+fn todo_status_label(status: &str, t: &Palette) -> (&'static str, Hsla) {
+    match status {
+        "completed" => ("已完成", t.ok),
+        "in_progress" => ("进行中", t.accent),
+        "cancelled" => ("已取消", t.bad),
+        _ => ("待办", t.dim),
     }
 }
 
@@ -168,33 +374,25 @@ fn todo_floating_card(
         .flex_col()
         .gap_0p5();
 
+    let animate_motion = effective_motion(cx) != MotionLevel::Off;
     for (idx, item) in store.todos.iter().enumerate() {
         let in_progress = item.status == "in_progress";
         let settled = item.status == "completed" || item.status == "cancelled";
-        let icon_el: AnyElement = match item.status.as_str() {
-            "completed" => Icon::new(IconName::CircleCheck)
-                .with_size(Size::XSmall)
-                .text_color(t.ok)
-                .into_any_element(),
-            "cancelled" => Icon::new(IconName::CircleX)
-                .with_size(Size::XSmall)
-                .text_color(t.bad)
-                .into_any_element(),
-            "in_progress" => Icon::new(IconName::LoaderCircle)
-                .with_size(Size::XSmall)
-                .text_color(t.accent)
-                .with_animation(
-                    SharedString::from(format!("floating-todo-spin-{idx}")),
-                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
-                    |icon, val| icon.rotate(gpui_kit::Radians(val * std::f32::consts::TAU)),
-                )
-                .into_any_element(),
-            _ => Icon::new(IconName::Circle)
-                .with_size(Size::XSmall)
-                .text_color(t.faint)
-                .into_any_element(),
-        };
+        let icon_el = todo_status_icon(
+            SharedString::from(format!("floating-todo-spin-{idx}")),
+            item.status.as_str(),
+            animate_motion,
+            t,
+        );
         let full_title = SharedString::from(item.title.clone());
+        let tip_desc = (!item.description.trim().is_empty())
+            .then(|| SharedString::from(item.description.trim().to_owned()));
+        let tip_evidence = item
+            .evidence
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| SharedString::from(s.to_owned()));
         list = list.child(
             div()
                 .id(SharedString::from(format!("floating-todo-row-{idx}")))
@@ -207,8 +405,15 @@ fn todo_floating_card(
                 .items_center()
                 .gap_2()
                 .tooltip(move |_window, cx| {
-                    let text = full_title.clone();
-                    cx.new(move |_| WrappingTooltip { text }).into()
+                    let title = full_title.clone();
+                    let description = tip_desc.clone();
+                    let evidence = tip_evidence.clone();
+                    cx.new(move |_| WrappingTooltip {
+                        title,
+                        description,
+                        evidence,
+                    })
+                    .into()
                 })
                 .child(div().flex_shrink_0().child(icon_el))
                 .child(
@@ -258,23 +463,47 @@ pub(crate) fn content_text(value: &ContentValue) -> &str {
     }
 }
 
-/// 视图投影条目:单条或连续成功工具归组(不改变 entries 数据真值)。
+/// 视图投影条目:单条、连续成功工具归组(展开模式)、或限高过程轨迹视窗(折叠模式)。
 pub(crate) enum TimelineItem {
     Single(usize),
     ToolBurst {
         group_id: usize,
         indices: Vec<usize>,
     },
+    WorkTrace {
+        trace_key: String,
+        turn_id: Option<TurnId>,
+        indices: Vec<usize>,
+        attach_live_tail: bool,
+    },
+}
+
+pub(crate) struct TimelineProjection {
+    pub(crate) items: Vec<TimelineItem>,
+    pub(crate) live_tail_attached: bool,
+    pub(crate) live_tail_key: String,
+    pub(crate) live_tail_turn_id: Option<TurnId>,
+}
+
+fn find_tool<'a>(store: &'a SessionStore, call_id: &ToolCallId) -> Option<&'a ToolCallView> {
+    store.tools.iter().find(|tool| &tool.call_id == call_id)
+}
+
+fn is_trace_foldable_tool_view(tool: &ToolCallView) -> bool {
+    if crate::store::handoff_facts(tool).is_some() || todo_card_data(tool).is_some() {
+        return false;
+    }
+    !matches!(tool.state, ToolCallState::AwaitingInteraction { .. })
 }
 
 fn is_groupable_tool(store: &SessionStore, entry: &TimelineEntry) -> bool {
     let TimelineEntry::ToolCall { call_id, .. } = entry else {
         return false;
     };
-    let Some(tool) = store.tools.iter().find(|tool| &tool.call_id == call_id) else {
+    let Some(tool) = find_tool(store, call_id) else {
         return false;
     };
-    if crate::store::handoff_facts(tool).is_some() {
+    if crate::store::handoff_facts(tool).is_some() || todo_card_data(tool).is_some() {
         return false;
     }
     matches!(
@@ -283,46 +512,222 @@ fn is_groupable_tool(store: &SessionStore, entry: &TimelineEntry) -> bool {
     )
 }
 
-pub(crate) fn build_timeline_items(store: &SessionStore) -> Vec<TimelineItem> {
-    let mut items = Vec::new();
-    let mut burst: Vec<usize> = Vec::new();
-    let flush = |burst: &mut Vec<usize>, items: &mut Vec<TimelineItem>| {
-        if burst.len() >= 2 {
-            let group_id = burst[0];
-            items.push(TimelineItem::ToolBurst {
-                group_id,
-                indices: std::mem::take(burst),
-            });
-        } else if let Some(single) = burst.pop() {
-            items.push(TimelineItem::Single(single));
-        }
-    };
-
-    for (index, entry) in store.entries.iter().enumerate() {
-        if hidden_timeline_entry(entry) {
-            continue;
-        }
-        if is_groupable_tool(store, entry) {
-            burst.push(index);
-        } else {
-            flush(&mut burst, &mut items);
-            items.push(TimelineItem::Single(index));
-        }
-    }
-    flush(&mut burst, &mut items);
-    items
+fn has_live_answer_stream(store: &SessionStore) -> bool {
+    store.streaming.iter().any(|(_, kind, text)| {
+        *kind == AssistantBlockKind::Answer && has_assistant_text(*kind, text)
+    })
 }
 
-/// 搜索跳转索引映射:原始 entry 下标 → 当前投影列表项下标。
-pub(crate) fn display_index_for_entry(store: &SessionStore, entry_index: usize) -> usize {
-    let items = build_timeline_items(store);
-    items
+fn has_live_foldable_tail(store: &SessionStore) -> bool {
+    let has_live_reasoning = store.streaming.iter().any(|(_, kind, text)| {
+        *kind != AssistantBlockKind::Answer && has_assistant_text(*kind, text)
+    });
+    if has_live_reasoning || !store.arg_stream.is_empty() {
+        return true;
+    }
+    let referenced: HashSet<&ToolCallId> = store
+        .entries
         .iter()
-        .position(|item| match item {
-            TimelineItem::Single(index) => *index == entry_index,
-            TimelineItem::ToolBurst { indices, .. } => indices.contains(&entry_index),
+        .filter_map(|entry| match entry {
+            TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
+            _ => None,
         })
-        .unwrap_or(0)
+        .collect();
+    store
+        .tools
+        .iter()
+        .any(|tool| !referenced.contains(&tool.call_id) && is_trace_foldable_tool_view(tool))
+}
+
+fn entry_turn_id(entry: &TimelineEntry) -> Option<TurnId> {
+    match entry {
+        TimelineEntry::Input { turn_id, .. }
+        | TimelineEntry::ToolCall { turn_id, .. }
+        | TimelineEntry::ToolResult { turn_id, .. } => turn_id.clone(),
+        TimelineEntry::AssistantBlock { turn_id, .. } => Some(turn_id.clone()),
+        TimelineEntry::Compaction { .. } => None,
+    }
+}
+
+fn is_user_turn_trigger(entry: &TimelineEntry) -> bool {
+    matches!(
+        entry,
+        TimelineEntry::Input { actor, purpose, .. }
+            if actor.kind == ActorKind::User && *purpose == InputPurpose::TriggerTurn
+    )
+}
+
+pub(crate) fn build_timeline_items(
+    store: &SessionStore,
+    collapse_work_trace: bool,
+) -> TimelineProjection {
+    let has_live_answer = has_live_answer_stream(store);
+    if !collapse_work_trace {
+        let mut items = Vec::new();
+        let mut burst: Vec<usize> = Vec::new();
+        let flush = |burst: &mut Vec<usize>, items: &mut Vec<TimelineItem>| {
+            if burst.len() >= 2 {
+                let group_id = burst[0];
+                items.push(TimelineItem::ToolBurst {
+                    group_id,
+                    indices: std::mem::take(burst),
+                });
+            } else if let Some(single) = burst.pop() {
+                items.push(TimelineItem::Single(single));
+            }
+        };
+
+        for (index, entry) in store.entries.iter().enumerate() {
+            if hidden_timeline_entry(entry) {
+                continue;
+            }
+            if is_groupable_tool(store, entry) {
+                burst.push(index);
+            } else {
+                flush(&mut burst, &mut items);
+                items.push(TimelineItem::Single(index));
+            }
+        }
+        flush(&mut burst, &mut items);
+        return TimelineProjection {
+            items,
+            live_tail_attached: false,
+            live_tail_key: format!("trace-{}", store.entries.len()),
+            live_tail_turn_id: store.current_turn_id.clone(),
+        };
+    }
+
+    // 按用户轮次分段:每轮仅保留最新一条非空 Answer 在主舞台,其余思考/工具/旧 Answer 归入 WorkTrace。
+    let mut turn_bounds: Vec<usize> = store
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| is_user_turn_trigger(entry).then_some(idx))
+        .collect();
+    if turn_bounds.first().copied() != Some(0) && !store.entries.is_empty() {
+        turn_bounds.insert(0, 0);
+    }
+
+    let mut items = Vec::new();
+    let mut last_non_foldable_anchor: usize = 0;
+
+    for (turn_idx, &turn_start) in turn_bounds.iter().enumerate() {
+        let turn_end = turn_bounds
+            .get(turn_idx + 1)
+            .copied()
+            .unwrap_or(store.entries.len());
+        let is_last_turn = turn_idx + 1 == turn_bounds.len();
+        let turn_id = store.entries[turn_start..turn_end]
+            .iter()
+            .find_map(entry_turn_id);
+
+        // 若本轮当前正在流式输出新的非空 Answer,则本轮所有已落库 Answer 均退回折叠区;
+        // 否则仅本轮最后一条非空 Answer 留在主舞台。
+        let promoted_answer_idx = if is_last_turn && has_live_answer {
+            None
+        } else {
+            (turn_start..turn_end).rev().find(|&idx| {
+                matches!(
+                    store.entries.get(idx),
+                    Some(TimelineEntry::AssistantBlock {
+                        block_kind: AssistantBlockKind::Answer,
+                        content,
+                        ..
+                    }) if has_assistant_text(AssistantBlockKind::Answer, content_text(content))
+                )
+            })
+        };
+
+        let mut trace_indices: Vec<usize> = Vec::new();
+        let mut trace_anchor = last_non_foldable_anchor;
+        let flush_trace = |trace_indices: &mut Vec<usize>,
+                           items: &mut Vec<TimelineItem>,
+                           anchor: usize,
+                           turn_id: &Option<TurnId>| {
+            if trace_indices.is_empty() {
+                return;
+            }
+            items.push(TimelineItem::WorkTrace {
+                trace_key: format!("trace-{anchor}"),
+                turn_id: turn_id.clone(),
+                indices: std::mem::take(trace_indices),
+                attach_live_tail: false,
+            });
+        };
+
+        for index in turn_start..turn_end {
+            let Some(entry) = store.entries.get(index) else {
+                continue;
+            };
+            if hidden_timeline_entry(entry) {
+                continue;
+            }
+            let foldable = match entry {
+                TimelineEntry::AssistantBlock { block_kind, .. } => match block_kind {
+                    AssistantBlockKind::Reasoning | AssistantBlockKind::ToolCall => true,
+                    AssistantBlockKind::Answer => Some(index) != promoted_answer_idx,
+                },
+                TimelineEntry::ToolCall { call_id, .. } => {
+                    find_tool(store, call_id).is_some_and(is_trace_foldable_tool_view)
+                }
+                TimelineEntry::Input { .. }
+                | TimelineEntry::Compaction { .. }
+                | TimelineEntry::ToolResult { .. } => false,
+            };
+
+            if foldable {
+                if trace_indices.is_empty() {
+                    trace_anchor = last_non_foldable_anchor;
+                }
+                trace_indices.push(index);
+            } else {
+                flush_trace(&mut trace_indices, &mut items, trace_anchor, &turn_id);
+                items.push(TimelineItem::Single(index));
+                last_non_foldable_anchor = index + 1;
+            }
+        }
+        flush_trace(&mut trace_indices, &mut items, trace_anchor, &turn_id);
+    }
+
+    let live_foldable = has_live_foldable_tail(store);
+    let can_attach = (live_foldable || (store.is_running() && !has_live_answer))
+        && matches!(items.last(), Some(TimelineItem::WorkTrace { .. }));
+    let mut live_tail_attached = false;
+    if can_attach && let Some(TimelineItem::WorkTrace { attach_live_tail, .. }) = items.last_mut() {
+        *attach_live_tail = true;
+        live_tail_attached = true;
+    }
+
+    TimelineProjection {
+        items,
+        live_tail_attached,
+        live_tail_key: format!("trace-{last_non_foldable_anchor}"),
+        live_tail_turn_id: store.current_turn_id.clone(),
+    }
+}
+
+/// 搜索跳转索引映射:原始 entry 下标 → (投影列表项下标, 若位于折叠 WorkTrace 内则返回 trace_key)。
+pub(crate) fn display_index_for_entry(
+    store: &SessionStore,
+    collapse_work_trace: bool,
+    entry_index: usize,
+) -> (usize, Option<String>) {
+    let projection = build_timeline_items(store, collapse_work_trace);
+    for (idx, item) in projection.items.iter().enumerate() {
+        match item {
+            TimelineItem::Single(index) if *index == entry_index => return (idx, None),
+            TimelineItem::ToolBurst { indices, .. } if indices.contains(&entry_index) => {
+                return (idx, None);
+            }
+            TimelineItem::WorkTrace {
+                trace_key, indices, ..
+            } if indices.contains(&entry_index) => {
+                return (idx, Some(trace_key.clone()));
+            }
+            _ => {}
+        }
+    }
+    (0, None)
 }
 
 /// 「复制对话」:跟随最后一条 assistant 输出,把当前时间线全文写进剪贴板。
@@ -687,13 +1092,26 @@ fn tool_status_icon(call_id: &ToolCallId, state: &ToolCallState, t: &Palette) ->
     }
 }
 
+fn tool_exec_icon(
+    name: &str,
+    is_exec: bool,
+    command: Option<&str>,
+    shell: Option<&str>,
+) -> AppIcon {
+    if is_exec {
+        command_icon(command, shell).unwrap_or(AppIcon::Lucide(IconName::Terminal))
+    } else {
+        AppIcon::Lucide(tool_category_icon(name, false))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tool_toggle(
     entity: &Entity<SessionStore>,
     call_id: &ToolCallId,
     expanded: bool,
     status: AnyElement,
-    category: IconName,
+    category: AppIcon,
     title: String,
     delta: Option<(usize, usize)>,
     animate_motion: bool,
@@ -714,11 +1132,7 @@ fn tool_toggle(
         .cursor_pointer()
         .hover(|style| style.bg(t.hover).text_color(t.text))
         .child(div().flex_shrink_0().child(status))
-        .child(
-            Icon::new(category)
-                .with_size(Size::XSmall)
-                .text_color(t.dim),
-        )
+        .child(render_app_icon(category, 14.0, t.dim))
         .child(div().flex_1().min_w_0().truncate().child(SharedString::from(title)))
         .children(delta.filter(|&(a, r)| a > 0 || r > 0).map(|(added, removed)| {
             div()
@@ -788,6 +1202,463 @@ fn args_summary(args: &serde_json::Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("  "))
 }
 
+const MAX_TODO_CARD_ITEMS: usize = 50;
+
+struct TodoCardItem {
+    title: String,
+    status: &'static str,
+    description: Option<String>,
+    evidence: Option<String>,
+}
+
+enum TodoCardData {
+    List {
+        items: Vec<TodoCardItem>,
+        omitted: usize,
+    },
+    Update {
+        title: String,
+        status: &'static str,
+        evidence: Option<String>,
+    },
+}
+
+fn normalize_todo_status(raw: Option<&str>) -> &'static str {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "in_progress" | "in-progress" | "active" | "working" => "in_progress",
+        "completed" | "done" => "completed",
+        "cancelled" | "canceled" => "cancelled",
+        _ => "pending",
+    }
+}
+
+fn parse_todo_list_text(text: &str) -> Option<Vec<TodoCardItem>> {
+    let mut items = Vec::new();
+    for raw in text.lines() {
+        let mut body = raw.trim();
+        if body.is_empty() {
+            continue;
+        }
+        // 弹头 `- ` 仅在后随空白时剥离,`[-]` 取消标记自身以 `-` 开头。
+        if let Some(stripped) = body.strip_prefix("- ") {
+            body = stripped.trim_start();
+        }
+        if !body.starts_with('[') {
+            return None;
+        }
+        let close = body.find(']')?;
+        let marker = &body[1..close];
+        let status = match marker {
+            " " => "pending",
+            "~" => "in_progress",
+            "x" | "X" => "completed",
+            "-" => "cancelled",
+            _ => return None,
+        };
+        let rest = body[close + 1..].trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let fields: Vec<&str> = rest.split('|').collect();
+        if fields.len() > 3 {
+            return None;
+        }
+        let title = fields[0].trim();
+        if title.is_empty() {
+            return None;
+        }
+        let description = fields
+            .get(1)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let evidence = fields
+            .get(2)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        items.push(TodoCardItem {
+            title: title.to_owned(),
+            status,
+            description,
+            evidence,
+        });
+    }
+    Some(items)
+}
+
+fn parse_todo_card_item(raw: &serde_json::Value) -> Option<TodoCardItem> {
+    let obj = raw.as_object()?;
+    let title = obj.get("title")?.as_str()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let description = obj
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let evidence = obj
+        .get("evidence")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    Some(TodoCardItem {
+        title: title.to_owned(),
+        status: normalize_todo_status(obj.get("status").and_then(|v| v.as_str())),
+        description,
+        evidence,
+    })
+}
+
+/// 仅当 todo 写操作处于成功终态且入参可解析时返回时间线原位快照卡片数据;
+/// 只读 `todo_list` / 非成功终态 / 解析失败一律返回 `None` 回退普通状态行。
+fn todo_card_data(tool: &ToolCallView) -> Option<TodoCardData> {
+    let name = tool.tool_name.as_deref()?;
+    if !matches!(name, "todo" | "todo_write" | "todo_create" | "todo_update") {
+        return None;
+    }
+    if !matches!(
+        &tool.state,
+        ToolCallState::Finished { outcome } if outcome.is_success()
+    ) {
+        return None;
+    }
+    let args = tool.args.as_ref()?.as_object()?;
+    if let Some(list_text) = args.get("list").and_then(|v| v.as_str()) {
+        let parsed = parse_todo_list_text(list_text)?;
+        if parsed.is_empty() {
+            return None;
+        }
+        let omitted = parsed.len().saturating_sub(MAX_TODO_CARD_ITEMS);
+        let items = parsed.into_iter().take(MAX_TODO_CARD_ITEMS).collect();
+        return Some(TodoCardData::List { items, omitted });
+    }
+    let raw_items = args
+        .get("items")
+        .and_then(|v| v.as_array())
+        .or_else(|| args.get("todos").and_then(|v| v.as_array()));
+    if let Some(raw_items) = raw_items {
+        let parsed: Vec<TodoCardItem> = raw_items.iter().filter_map(parse_todo_card_item).collect();
+        if parsed.is_empty() {
+            return None;
+        }
+        let omitted = parsed.len().saturating_sub(MAX_TODO_CARD_ITEMS);
+        let items = parsed.into_iter().take(MAX_TODO_CARD_ITEMS).collect();
+        return Some(TodoCardData::List { items, omitted });
+    }
+    let title = args
+        .get("title")
+        .or_else(|| args.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let evidence = args
+        .get("evidence")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    Some(TodoCardData::Update {
+        title: title.to_owned(),
+        status: normalize_todo_status(args.get("status").and_then(|v| v.as_str())),
+        evidence,
+    })
+}
+
+fn render_inline_todo_card(
+    store: &SessionStore,
+    entity: &Entity<SessionStore>,
+    tool: &ToolCallView,
+    name: &str,
+    data: TodoCardData,
+    animate_motion: bool,
+    t: &Palette,
+) -> Div {
+    let action = if name == "todo_create" { "已创建" } else { "已更新" };
+    match data {
+        TodoCardData::Update {
+            title,
+            status,
+            evidence,
+        } => {
+            let (status_label, status_color) = todo_status_label(status, t);
+            let icon_el = todo_status_icon(
+                SharedString::from(format!("todo-inline-spin-{}", tool.call_id.0)),
+                status,
+                animate_motion,
+                t,
+            );
+            div()
+                .rounded(px(RADIUS_CARD))
+                .border_1()
+                .border_color(t.border_subtle)
+                .bg(t.card)
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1p5()
+                        .bg(t.surface_subtle)
+                        .border_b_1()
+                        .border_color(t.border_subtle)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    Icon::new(IconName::ListChecks)
+                                        .with_size(Size::XSmall)
+                                        .text_color(t.dim),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(t.text)
+                                        .child("待办"),
+                                )
+                                .child(div().text_xs().text_color(t.dim).child(action)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(status_color)
+                                .child(status_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().pt(px(2.)).flex_shrink_0().child(icon_el))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(t.text)
+                                        .child(SharedString::from(title)),
+                                )
+                                .children(evidence.map(|ev| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(t.dim)
+                                        .child(SharedString::from(format!("原因：{ev}")))
+                                })),
+                        ),
+                )
+        }
+        TodoCardData::List { items, omitted } => {
+            let total = items.len();
+            let done = items.iter().filter(|i| i.status == "completed").count();
+            let ratio = if total == 0 {
+                0.0
+            } else {
+                done as f32 / total as f32
+            };
+            let is_open = (total <= 12) ^ store.toggled_todo_cards.contains(&tool.call_id);
+            let call_id = tool.call_id.clone();
+            let toggle_entity = entity.clone();
+
+            let header = div()
+                .id(SharedString::from(format!("todo-inline-toggle-{}", tool.call_id.0)))
+                .px_3()
+                .py_1p5()
+                .bg(t.surface_subtle)
+                .when(is_open, |el| el.border_b_1().border_color(t.border_subtle))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(t.hover))
+                .on_click(move |_, _, cx| {
+                    let call_id = call_id.clone();
+                    let _ = toggle_entity.update(cx, |store, cx| {
+                        if !store.toggled_todo_cards.remove(&call_id) {
+                            store.toggled_todo_cards.insert(call_id);
+                        }
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::ListChecks)
+                                .with_size(Size::XSmall)
+                                .text_color(if done == total { t.ok } else { t.dim }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text)
+                                .child("待办"),
+                        )
+                        .child(div().text_xs().text_color(t.dim).child(action)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                                .text_xs()
+                                .text_color(if done == total { t.ok } else { t.dim })
+                                .child(SharedString::from(format!("{done}/{total}"))),
+                        )
+                        .child(
+                            Icon::new(if is_open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .with_size(Size::XSmall)
+                            .text_color(t.dim),
+                        ),
+                );
+
+            let mut card = div()
+                .rounded(px(RADIUS_CARD))
+                .border_1()
+                .border_color(t.border_subtle)
+                .bg(t.card)
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(header);
+
+            if is_open {
+                let mut list = div()
+                    .id(SharedString::from(format!("todo-inline-list-{}", tool.call_id.0)))
+                    .max_h(px(264.))
+                    .overflow_y_scroll()
+                    .px_2()
+                    .py_1p5()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5();
+
+                for (idx, item) in items.into_iter().enumerate() {
+                    let settled = item.status == "completed" || item.status == "cancelled";
+                    let icon_el = todo_status_icon(
+                        SharedString::from(format!("todo-inline-spin-{}-{idx}", tool.call_id.0)),
+                        item.status,
+                        animate_motion,
+                        t,
+                    );
+                    let tip_title = SharedString::from(item.title.clone());
+                    let tip_desc = item.description.clone().map(SharedString::from);
+                    let tip_ev = item.evidence.clone().map(SharedString::from);
+
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "todo-inline-row-{}-{idx}",
+                                tool.call_id.0
+                            )))
+                            .px_1p5()
+                            .py_1()
+                            .rounded(px(RADIUS_CHIP))
+                            .hover(|s| s.bg(t.hover))
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .tooltip(move |_window, cx| {
+                                let title = tip_title.clone();
+                                let description = tip_desc.clone();
+                                let evidence = tip_ev.clone();
+                                cx.new(move |_| WrappingTooltip {
+                                    title,
+                                    description,
+                                    evidence,
+                                })
+                                .into()
+                            })
+                            .child(div().pt(px(2.)).flex_shrink_0().child(icon_el))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(if settled { t.dim } else { t.text })
+                                            .child(SharedString::from(item.title)),
+                                    )
+                                    .children(item.evidence.map(|ev| {
+                                        div()
+                                            .line_clamp(2)
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .text_color(t.faint)
+                                            .child(SharedString::from(format!("原因：{ev}")))
+                                    })),
+                            ),
+                    );
+                }
+
+                if omitted > 0 {
+                    list = list.child(
+                        div()
+                            .px_1p5()
+                            .py_1()
+                            .text_xs()
+                            .text_color(t.faint)
+                            .child(SharedString::from(format!(
+                                "仅显示前 {MAX_TODO_CARD_ITEMS} 项，另省略 {omitted} 项"
+                            ))),
+                    );
+                }
+
+                card = card
+                    .child(
+                        div()
+                            .h(px(3.))
+                            .w_full()
+                            .bg(t.surface_subtle)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(ratio))
+                                    .bg(if done == total { t.ok } else { t.accent }),
+                            ),
+                    )
+                    .child(list);
+            }
+            card
+        }
+    }
+}
+
 fn tool_card(
     cx: &gpui_kit::App,
     store: &SessionStore,
@@ -823,6 +1694,10 @@ fn tool_card(
     } else {
         format!("{name}  ·  {status}{fork_suffix}")
     };
+    if let Some(data) = todo_card_data(tool) {
+        let animate_motion = effective_motion(cx) != MotionLevel::Off;
+        return render_inline_todo_card(store, entity, tool, name, data, animate_motion, t);
+    }
     if tool_status_only(name) {
         return tool_status_line(name, title, &tool.state, t);
     }
@@ -832,12 +1707,17 @@ fn tool_card(
         .as_ref()
         .map(|d| (d.lines_added, d.lines_removed));
     let animate_motion = effective_motion(cx) != MotionLevel::Off;
+    let shell = tool
+        .args
+        .as_ref()
+        .and_then(|args| args.get("shell")?.as_str());
+    let category = tool_exec_icon(name, is_exec, command, shell);
     let header = tool_toggle(
         entity,
         &tool.call_id,
         expanded,
         tool_status_icon(&tool.call_id, &tool.state, t),
-        tool_category_icon(name, is_exec),
+        category,
         title,
         delta,
         animate_motion,
@@ -1117,6 +1997,722 @@ fn tool_burst_card(
         .children(revealed)
 }
 
+fn format_elapsed_cn(ms: u64, live: bool) -> Option<String> {
+    if ms == 0 && !live {
+        return None;
+    }
+    if ms < 1_000 {
+        return Some(if live {
+            "0秒".to_owned()
+        } else {
+            format!("{ms}ms")
+        });
+    }
+    let secs = ms / 1_000;
+    if secs < 60 {
+        Some(format!("{secs}秒"))
+    } else if secs < 3_600 {
+        Some(format!("{}分{}秒", secs / 60, secs % 60))
+    } else {
+        Some(format!("{}小时{}分", secs / 3_600, (secs % 3_600) / 60))
+    }
+}
+
+fn work_trace_elapsed_ms(
+    store: &SessionStore,
+    trace_key: &str,
+    indices: &[usize],
+    is_live: bool,
+) -> Option<u64> {
+    if is_live {
+        return store
+            .trace_started_at
+            .get(trace_key)
+            .map(|started| started.elapsed().as_millis() as u64);
+    }
+    if let Some(&ms) = store.trace_elapsed_ms.get(trace_key) {
+        return Some(ms);
+    }
+    let mut min_start: Option<i64> = None;
+    let mut max_end: Option<i64> = None;
+    let mut gen_ms: u64 = 0;
+    for &idx in indices {
+        match store.entries.get(idx) {
+            Some(TimelineEntry::ToolCall { call_id, .. }) => {
+                if let Some(tool) = find_tool(store, call_id)
+                    && let Some(metrics) = &tool.metrics
+                {
+                    min_start = Some(min_start.map_or(metrics.started_at_ms, |v| v.min(metrics.started_at_ms)));
+                    max_end = Some(max_end.map_or(metrics.finished_at_ms, |v| v.max(metrics.finished_at_ms)));
+                }
+            }
+            Some(TimelineEntry::AssistantBlock {
+                generated_ms: Some(ms),
+                ..
+            }) => {
+                gen_ms = gen_ms.saturating_add(*ms);
+            }
+            _ => {}
+        }
+    }
+    if let (Some(s), Some(e)) = (min_start, max_end)
+        && e >= s
+    {
+        return Some((e - s) as u64);
+    }
+    (gen_ms > 0).then_some(gen_ms)
+}
+
+fn classify_tool_bucket(store: &SessionStore, tool: &ToolCallView) -> &'static str {
+    let name = tool.tool_name.as_deref().unwrap_or("");
+    let is_exec = name == "exec_command"
+        || store
+            .exec_sessions
+            .iter()
+            .any(|e| e.origin_call_id == tool.call_id);
+    if is_exec {
+        "cmd"
+    } else if matches!(name, "edit" | "apply_patch" | "write" | "delete") {
+        "file"
+    } else if matches!(name, "read" | "read_image" | "glob" | "grep" | "search" | "web_fetch") {
+        "search"
+    } else if matches!(name, "todo_write" | "todo_update" | "todo_list") {
+        "todo"
+    } else if name.starts_with("spawn_")
+        || name.ends_with("_agent")
+        || name.starts_with("task_")
+        || name.starts_with("board_")
+    {
+        "agent"
+    } else {
+        "other"
+    }
+}
+
+fn summarize_work_trace(store: &SessionStore, indices: &[usize], attach_live: bool) -> String {
+    let (mut cmds, mut files, mut searches, mut todos, mut agents, mut others) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut reasonings, mut retracted_answers) = (0usize, 0usize);
+
+    let mut bump_tool = |bucket: &str| match bucket {
+        "cmd" => cmds += 1,
+        "file" => files += 1,
+        "search" => searches += 1,
+        "todo" => todos += 1,
+        "agent" => agents += 1,
+        _ => others += 1,
+    };
+
+    for &idx in indices {
+        match store.entries.get(idx) {
+            Some(TimelineEntry::ToolCall { call_id, .. }) => {
+                if let Some(tool) = find_tool(store, call_id) {
+                    bump_tool(classify_tool_bucket(store, tool));
+                } else {
+                    bump_tool("other");
+                }
+            }
+            Some(TimelineEntry::AssistantBlock {
+                block_kind: AssistantBlockKind::Reasoning,
+                ..
+            }) => reasonings += 1,
+            Some(TimelineEntry::AssistantBlock {
+                block_kind: AssistantBlockKind::Answer,
+                ..
+            }) => retracted_answers += 1,
+            _ => {}
+        }
+    }
+
+    if attach_live {
+        let referenced: HashSet<&ToolCallId> = store
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        for (_, kind, text) in &store.streaming {
+            if *kind == AssistantBlockKind::Reasoning && has_assistant_text(*kind, text) {
+                reasonings += 1;
+            }
+        }
+        for tool in &store.tools {
+            if !referenced.contains(&tool.call_id) && is_trace_foldable_tool_view(tool) {
+                bump_tool(classify_tool_bucket(store, tool));
+            }
+        }
+        drop(bump_tool);
+        others += store.arg_stream.len();
+    }
+
+    let mut parts = Vec::new();
+    if searches > 0 {
+        parts.push(format!("查阅 ×{searches}"));
+    }
+    if files > 0 {
+        parts.push(format!("改写 ×{files}"));
+    }
+    if cmds > 0 {
+        parts.push(format!("命令 ×{cmds}"));
+    }
+    if todos > 0 {
+        parts.push(format!("待办 ×{todos}"));
+    }
+    if agents > 0 {
+        parts.push(format!("协作 ×{agents}"));
+    }
+    if others > 0 {
+        parts.push(format!("工具 ×{others}"));
+    }
+    if reasonings > 0 {
+        parts.push(format!("思考 ×{reasonings}"));
+    }
+    if retracted_answers > 0 {
+        parts.push(format!("中间消息 ×{retracted_answers}"));
+    }
+
+    if attach_live {
+        if parts.is_empty() {
+            String::new()
+        } else {
+            parts.join(" · ")
+        }
+    } else if parts.is_empty() {
+        format!("已完成 {} 步工作过程", indices.len())
+    } else {
+        format!("已完成工作过程 · {}", parts.join(" · "))
+    }
+}
+
+fn render_arg_stream_item(
+    store: &SessionStore,
+    entity: &Entity<SessionStore>,
+    stream: &ArgStream,
+    animate_motion: bool,
+    t: &Palette,
+) -> AnyElement {
+    let ArgStream {
+        call_id,
+        tool_name,
+        text,
+        lines,
+        target_files,
+        args_complete,
+    } = stream;
+    if tool_status_only(tool_name) {
+        let title = tool_summary(tool_name, &ToolCallState::Declared)
+            .map_or_else(|| format!("正在准备 {tool_name}"), str::to_owned);
+        return tool_status_line(tool_name, title, &ToolCallState::Declared, t).into_any_element();
+    }
+    let mut title = format!("正在准备 {tool_name}");
+    if let Some((added, removed)) = lines {
+        title.push_str(&format!("  +{added} −{removed}"));
+    }
+    if !target_files.is_empty() {
+        title.push_str(&format!("  · {}", target_files.join(", ")));
+    }
+    if *args_complete {
+        title.push_str("  · 参数已就绪");
+    }
+    let parsed_args = (*args_complete)
+        .then(|| serde_json::from_str::<serde_json::Value>(text).ok())
+        .flatten();
+    let stream_cmd = parsed_args
+        .as_ref()
+        .and_then(|args| args.get("cmd")?.as_str());
+    let stream_shell = parsed_args
+        .as_ref()
+        .and_then(|args| args.get("shell")?.as_str());
+    let expanded = store.expanded_tools.contains(call_id);
+    div()
+        .child(tool_toggle(
+            entity,
+            call_id,
+            expanded,
+            tool_status_icon(call_id, &ToolCallState::Running, t),
+            tool_exec_icon(
+                tool_name,
+                tool_name == "exec_command",
+                stream_cmd,
+                stream_shell,
+            ),
+            title,
+            None,
+            animate_motion,
+            t,
+        ))
+        .children(expanded.then(|| {
+            div()
+                .px_3()
+                .py_1p5()
+                .rounded(px(RADIUS_CHIP))
+                .bg(t.code_bg)
+                .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                .text_xs()
+                .text_color(t.dim)
+                .max_h(px(240.))
+                .id(SharedString::from(format!("arg-stream-{}", call_id.0)))
+                .overflow_y_scroll()
+                .child(SharedString::from(text.clone()))
+        }))
+        .into_any_element()
+}
+
+/// 已退回折叠区的中间正文行:紧凑预览 + 点击手风琴展开完整正文。
+#[allow(clippy::too_many_arguments)]
+fn retracted_answer_row(
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+    entity: &Entity<SessionStore>,
+    source: AssistantSource,
+    block_id: &BlockId,
+    section: usize,
+    t: &Palette,
+    ty: &settings::Typography,
+) -> AnyElement {
+    let animate_motion = effective_motion(cx) != MotionLevel::Off;
+    let weak = entity.downgrade();
+    let (expanded, preview, md_key, md_extensions) = {
+        let store = entity.read(cx);
+        let text = assistant_source_text(store, source);
+        let first = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("");
+        let snippet: String = first.chars().take(52).collect();
+        let preview = if snippet.is_empty() {
+            "中间消息".to_owned()
+        } else {
+            format!(
+                "中间消息 · {snippet}{}",
+                if first.chars().count() > 52 { "…" } else { "" }
+            )
+        };
+        (
+            store.expanded_thinking.contains(block_id),
+            preview,
+            SharedString::from(format!("md-retracted-{}-{}-{section}", store.session_id, block_id.0)),
+            store.md_extensions.clone(),
+        )
+    };
+    let toggle_block = block_id.clone();
+    let header = div()
+        .id(SharedString::from(format!("retracted-toggle-{}", block_id.0)))
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2p5()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
+        .text_xs()
+        .text_color(t.dim)
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover).text_color(t.text))
+        .child(
+            Icon::new(IconName::MessageSquare)
+                .with_size(Size::XSmall)
+                .text_color(t.dim),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(preview)))
+        .child(spring_chevron(
+            SharedString::from(format!("retracted-chev-{}", block_id.0)),
+            expanded,
+            t.faint,
+            animate_motion,
+        ))
+        .on_click(move |_, _, cx| {
+            let _ = weak.update(cx, |store, cx| {
+                if !store.expanded_thinking.remove(&toggle_block) {
+                    store.expanded_thinking.insert(toggle_block.clone());
+                }
+                cx.notify();
+            });
+        });
+
+    let entity_for_body = entity.clone();
+    let t_copy = *t;
+    let ty_copy = *ty;
+    let revealed = accordion_reveal(
+        SharedString::from(format!("retracted-reveal-{}", block_id.0)),
+        expanded,
+        window,
+        cx,
+        move |cx| {
+            let store = entity_for_body.read(cx);
+            let text = assistant_source_text(store, source);
+            let body = crate::markdown::render_document(
+                md_key,
+                text,
+                &md_extensions,
+                entity_for_body.downgrade(),
+                &t_copy,
+                &ty_copy,
+            );
+            div()
+                .ml_2p5()
+                .pl_3()
+                .border_l_1()
+                .border_color(t_copy.border_subtle)
+                .child(body)
+                .into_any_element()
+        },
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(header)
+        .children(revealed)
+        .into_any_element()
+}
+
+/// 折叠模式下的「工作过程有限视窗」:
+/// - 进行中默认展开为固定上限高度(224px)内部可滚动视窗 + 上下渐隐遮罩 + 实时计时;
+/// - 收口后默认折叠为单行摘要 + 耗时,随时可手风琴展开回看历史步骤与旧中间回复。
+#[allow(clippy::too_many_arguments)]
+fn work_trace_card(
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+    entity: &Entity<SessionStore>,
+    trace_key: String,
+    indices: &[usize],
+    attach_live_tail: bool,
+    t: &Palette,
+    ty: &settings::Typography,
+    tail_max: usize,
+) -> Div {
+    let animate_motion = effective_motion(cx) != MotionLevel::Off;
+    let (expanded, summary, elapsed_label, scroll_handle) = {
+        let store = entity.read(cx);
+        let expanded = if attach_live_tail {
+            !store.collapsed_traces.contains(&trace_key)
+        } else {
+            store.expanded_traces.contains(&trace_key)
+        };
+        let summary = summarize_work_trace(store, indices, attach_live_tail);
+        let elapsed_label = work_trace_elapsed_ms(store, &trace_key, indices, attach_live_tail)
+            .and_then(|ms| format_elapsed_cn(ms, attach_live_tail));
+        let scroll_handle = store
+            .trace_scroll_handles
+            .get(&trace_key)
+            .cloned()
+            .unwrap_or_else(ScrollHandle::new);
+        (expanded, summary, elapsed_label, scroll_handle)
+    };
+
+    let weak = entity.downgrade();
+    let toggle_key = trace_key.clone();
+    let header_title: AnyElement = if attach_live_tail {
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .flex_1()
+            .child(shimmer_label(
+                SharedString::from(format!("trace-shimmer-{trace_key}")),
+                "正在执行中",
+                t,
+            ));
+        if let Some(dur) = &elapsed_label {
+            row = row
+                .child(div().text_xs().text_color(t.faint).child("·"))
+                .child(
+                    div()
+                        .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                        .text_xs()
+                        .text_color(t.dim)
+                        .child(SharedString::from(dur.clone())),
+                );
+        }
+        if !summary.is_empty() {
+            row = row
+                .child(div().text_xs().text_color(t.faint).child("·"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.dim)
+                        .truncate()
+                        .child(SharedString::from(summary)),
+                );
+        }
+        row.into_any_element()
+    } else {
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .flex_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.dim)
+                    .truncate()
+                    .child(SharedString::from(summary)),
+            );
+        if let Some(dur) = &elapsed_label {
+            row = row
+                .child(div().text_xs().text_color(t.faint).child("·"))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                        .text_xs()
+                        .text_color(t.faint)
+                        .child(SharedString::from(dur.clone())),
+                );
+        }
+        row.into_any_element()
+    };
+
+    let header = div()
+        .id(SharedString::from(format!("work-trace-{trace_key}")))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded(px(RADIUS_CHIP))
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_click(move |_, _, cx| {
+            let _ = weak.update(cx, |store, cx| {
+                if attach_live_tail {
+                    if !store.collapsed_traces.remove(&toggle_key) {
+                        store.collapsed_traces.insert(toggle_key.clone());
+                    }
+                } else if !store.expanded_traces.remove(&toggle_key) {
+                    store.expanded_traces.insert(toggle_key.clone());
+                }
+                cx.notify();
+            });
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .flex_1()
+                .child(if attach_live_tail {
+                    live_dot(format!("trace-dot-{trace_key}"), t.accent, true)
+                } else {
+                    Icon::new(IconName::CircleCheck)
+                        .with_size(Size::XSmall)
+                        .text_color(t.ok)
+                        .into_any_element()
+                })
+                .child(header_title),
+        )
+        .child(spring_chevron(
+            SharedString::from(format!("trace-chev-{trace_key}")),
+            expanded,
+            t.faint,
+            animate_motion,
+        ));
+
+    let entity_for_body = entity.clone();
+    let indices_owned = indices.to_vec();
+    let t_copy = *t;
+    let ty_copy = *ty;
+    let key_for_body = trace_key.clone();
+
+    let mut body_rows = Vec::new();
+    if expanded {
+        enum TraceSlot {
+            EntryTool(ToolCallId),
+            Assistant {
+                kind: AssistantBlockKind,
+                source: AssistantSource,
+                live: bool,
+                section: usize,
+                block_id: BlockId,
+            },
+            ArgStream(usize),
+            UnrefTool(ToolCallId),
+        }
+
+        let slots: Vec<TraceSlot> = {
+            let store = entity_for_body.read(cx);
+            let mut slots = Vec::new();
+            for &idx in &indices_owned {
+                match store.entries.get(idx) {
+                    Some(TimelineEntry::ToolCall { call_id, .. }) => {
+                        slots.push(TraceSlot::EntryTool(call_id.clone()));
+                    }
+                    Some(TimelineEntry::AssistantBlock {
+                        block_id,
+                        block_kind,
+                        ..
+                    }) => {
+                        slots.push(TraceSlot::Assistant {
+                            kind: *block_kind,
+                            source: AssistantSource::Entry(idx),
+                            live: false,
+                            section: idx * 2,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if attach_live_tail {
+                for (i, (block_id, kind, text)) in store.streaming.iter().enumerate() {
+                    if *kind != AssistantBlockKind::Answer && has_assistant_text(*kind, text) {
+                        slots.push(TraceSlot::Assistant {
+                            kind: *kind,
+                            source: AssistantSource::Streaming(i),
+                            live: true,
+                            section: i * 2 + 1,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                }
+                for i in 0..store.arg_stream.len() {
+                    slots.push(TraceSlot::ArgStream(i));
+                }
+                let referenced: HashSet<&ToolCallId> = store
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        TimelineEntry::ToolCall { call_id, .. } => Some(call_id),
+                        _ => None,
+                    })
+                    .collect();
+                for tool in &store.tools {
+                    if !referenced.contains(&tool.call_id) && is_trace_foldable_tool_view(tool) {
+                        slots.push(TraceSlot::UnrefTool(tool.call_id.clone()));
+                    }
+                }
+            }
+            slots
+        };
+
+        for slot in slots {
+            match slot {
+                TraceSlot::EntryTool(call_id) | TraceSlot::UnrefTool(call_id) => {
+                    let store = entity_for_body.read(cx);
+                    if let Some(tool) = find_tool(store, &call_id) {
+                        body_rows.push(
+                            tool_card(cx, store, &entity_for_body, tool, &t_copy, tail_max)
+                                .into_any_element(),
+                        );
+                    }
+                }
+                TraceSlot::Assistant {
+                    kind: AssistantBlockKind::Answer,
+                    source,
+                    section,
+                    block_id,
+                    ..
+                } => {
+                    body_rows.push(retracted_answer_row(
+                        window,
+                        cx,
+                        &entity_for_body,
+                        source,
+                        &block_id,
+                        section,
+                        &t_copy,
+                        &ty_copy,
+                    ));
+                }
+                TraceSlot::Assistant {
+                    kind,
+                    source,
+                    live,
+                    section,
+                    block_id,
+                } => {
+                    body_rows.push(assistant_section(
+                        window,
+                        cx,
+                        &kind,
+                        source,
+                        live,
+                        section,
+                        &block_id,
+                        &entity_for_body,
+                        &t_copy,
+                        &ty_copy,
+                    ));
+                }
+                TraceSlot::ArgStream(i) => {
+                    let store = entity_for_body.read(cx);
+                    if let Some(stream) = store.arg_stream.get(i) {
+                        body_rows.push(render_arg_stream_item(
+                            store,
+                            &entity_for_body,
+                            stream,
+                            animate_motion,
+                            &t_copy,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let revealed = accordion_reveal(
+        SharedString::from(format!("trace-reveal-{trace_key}")),
+        expanded,
+        window,
+        cx,
+        move |_cx| {
+            let scroll_list = div()
+                .id(SharedString::from(format!("trace-scroll-{key_for_body}")))
+                .max_h(px(224.))
+                .w_full()
+                .overflow_y_scroll()
+                .track_scroll(&scroll_handle)
+                .py_1p5()
+                .pr_2p5()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(body_rows);
+
+            div()
+                .relative()
+                .mt_1()
+                .ml_2p5()
+                .pl_3()
+                .border_l_1()
+                .border_color(t_copy.border_subtle)
+                .vertical_scrollbar(&scroll_handle)
+                .child(scroll_list)
+                .child(
+                    top_fade_mask(t_copy.stage, 12.)
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0(),
+                )
+                .child(
+                    bottom_fade_mask(t_copy.stage, 12.)
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0(),
+                )
+                .into_any_element()
+        },
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .child(header)
+        .children(revealed)
+}
+
 /// Provider 重试横幅:居中圆角警示胶囊。
 pub(crate) fn provider_retry_banner(store: &SessionStore, t: &Palette) -> Option<Div> {
     let retry = store.provider_retry.as_ref()?;
@@ -1244,13 +2840,83 @@ fn assistant_source_text<'a>(store: &'a SessionStore, source: AssistantSource) -
     }
 }
 
-/// 标准正文阅读轨(与原对话宽度像素一致),表格破栏块以外的所有元素统一走此轨道居中。
-fn prose_rail(ty: &settings::Typography) -> Div {
+/// 标准正文阅读轨(最宽 880px,窄屏或分栏压缩时自动收缩),表格破栏块以外的所有元素统一走此轨道居中。
+fn prose_rail(_ty: &settings::Typography) -> Div {
     div()
         .w_full()
-        .max_w(px(ty.content_width + crate::markdown::PROSE_RAIL_PAD_PX))
+        .max_w(px(MESSAGE_MAX_WIDTH_PX))
         .mx_auto()
         .px_4()
+}
+
+/// 回到最新消息悬浮图标按钮:仅在偏离底部时经 `presence_overlay` 居中显现,纯 ↓ 图标无文字。
+fn scroll_to_latest_button(
+    store: &SessionStore,
+    t: &Palette,
+    window: &mut Window,
+    cx: &mut Context<SessionStore>,
+) -> Option<AnyElement> {
+    let list = &store.timeline_list;
+    let remaining = (f32::from(list.max_offset_for_scrollbar().y)
+        + f32::from(list.scroll_px_offset_for_scrollbar().y))
+    .max(0.0);
+    let away_from_bottom = !list.is_following_tail()
+        && (list.is_scrolled_to_end() == Some(false) || remaining > 40.0)
+        && remaining > 24.0;
+    let sample = presence_overlay("timeline-scroll-latest", away_from_bottom, 160, window, cx);
+    if !sample.should_render() {
+        return None;
+    }
+    let p = sample.progress.clamp(0.0, 1.0);
+    let shift = if effective_motion(cx) == MotionLevel::Full {
+        (1.0 - p) * 8.0
+    } else {
+        0.0
+    };
+    Some(
+        div()
+            .absolute()
+            .bottom_3()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("scroll-to-latest-msg")
+                    .size(px(32.))
+                    .mt(px(shift))
+                    .opacity(p)
+                    .rounded_full()
+                    .bg(t.card)
+                    .border_1()
+                    .border_color(t.border)
+                    .shadow(shadow_card(t))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(t.card_hover))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("回到最新消息")
+                            .build(window, cx)
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|store, _, _, cx| {
+                        store.timeline_list.scroll_to_end();
+                        if settings::get(cx).behavior.stream_follow {
+                            store.timeline_list.set_follow_mode(FollowMode::Tail);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(IconName::ArrowDown)
+                            .with_size(Size::XSmall)
+                            .text_color(t.text),
+                    ),
+            )
+            .into_any_element(),
+    )
 }
 
 /// 助手块 markdown 区(Reasoning 使用无框思考行 + 左侧 1px 脊柱 MotionReveal 展开)。
@@ -1791,9 +3457,74 @@ impl Render for SessionStore {
         let settings = settings::get(cx).clone();
         let ty = settings.typography();
         let tail_max = settings.behavior.output_tail_max;
+        let collapse_work_trace = settings.behavior.collapse_work_trace;
         self.output_budget = tail_max;
 
-        let display_items = Arc::new(build_timeline_items(self));
+        let projection = build_timeline_items(self, collapse_work_trace);
+        if collapse_work_trace {
+            let mut active_live: Vec<(String, Option<TurnId>)> = projection
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    TimelineItem::WorkTrace {
+                        trace_key,
+                        turn_id,
+                        attach_live_tail: true,
+                        ..
+                    } => Some((trace_key.clone(), turn_id.clone())),
+                    _ => None,
+                })
+                .collect();
+            if !projection.live_tail_attached && has_live_foldable_tail(self) {
+                active_live.push((
+                    projection.live_tail_key.clone(),
+                    projection.live_tail_turn_id.clone(),
+                ));
+            }
+            let finished_keys: Vec<String> = self
+                .trace_started_at
+                .keys()
+                .filter(|k| !active_live.iter().any(|(ak, _)| ak == *k))
+                .cloned()
+                .collect();
+            for k in finished_keys {
+                if let Some(started) = self.trace_started_at.remove(&k) {
+                    self.trace_elapsed_ms
+                        .insert(k, started.elapsed().as_millis() as u64);
+                }
+            }
+            for (key, turn_id) in &active_live {
+                self.trace_started_at.entry(key.clone()).or_insert_with(|| {
+                    turn_id
+                        .as_ref()
+                        .and_then(|tid| self.turn_started_at.get(tid).copied())
+                        .filter(|_| self.trace_elapsed_ms.is_empty())
+                        .unwrap_or_else(Instant::now)
+                });
+                let handle = self
+                    .trace_scroll_handles
+                    .entry(key.clone())
+                    .or_insert_with(ScrollHandle::new);
+                if !self.collapsed_traces.contains(key) {
+                    let max_y = handle.max_offset().y;
+                    let off_y = handle.offset().y;
+                    if max_y <= px(0.0) || off_y <= -max_y + px(28.0) {
+                        handle.scroll_to_bottom();
+                    }
+                }
+            }
+            for item in &projection.items {
+                if let TimelineItem::WorkTrace { trace_key, .. } = item {
+                    self.trace_scroll_handles
+                        .entry(trace_key.clone())
+                        .or_insert_with(ScrollHandle::new);
+                }
+            }
+        }
+
+        let live_tail_attached = projection.live_tail_attached;
+        let live_tail_key = projection.live_tail_key;
+        let display_items = Arc::new(projection.items);
         let list_state = self.timeline_list.clone();
         let target_count = display_items.len() + 1;
         let current_count = list_state.item_count();
@@ -1829,10 +3560,18 @@ impl Render for SessionStore {
                                 store.entries.get(*entry_idx),
                                 Some(TimelineEntry::AssistantBlock { .. })
                             );
-                            let last_assistant = store
-                                .entries
-                                .iter()
-                                .rposition(|entry| matches!(entry, TimelineEntry::AssistantBlock { .. }));
+                            let last_assistant = items_for_list.iter().rev().find_map(|item| {
+                                if let TimelineItem::Single(idx) = item
+                                    && matches!(
+                                        store.entries.get(*idx),
+                                        Some(TimelineEntry::AssistantBlock { .. })
+                                    )
+                                {
+                                    Some(*idx)
+                                } else {
+                                    None
+                                }
+                            });
                             (is_assistant, last_assistant)
                         };
                         match timeline_entry(window, cx, &entity, *entry_idx, &t, &ty, tail_max) {
@@ -1859,19 +3598,62 @@ impl Render for SessionStore {
                             window, cx, &entity, *group_id, indices, &t, tail_max,
                         )))
                         .into_any_element(),
+                    TimelineItem::WorkTrace {
+                        trace_key,
+                        indices,
+                        attach_live_tail,
+                        ..
+                    } => row
+                        .pb(gap)
+                        .child(prose_rail(&ty).child(work_trace_card(
+                            window,
+                            cx,
+                            &entity,
+                            trace_key.clone(),
+                            indices,
+                            *attach_live_tail,
+                            &t,
+                            &ty,
+                            tail_max,
+                        )))
+                        .into_any_element(),
                 };
             }
 
-            let streaming_meta: Vec<(usize, BlockId, AssistantBlockKind)> = {
+            let (streaming_meta, show_unattached_live_trace) = {
                 let store = entity.read(cx);
-                store
+                let streaming_meta: Vec<(usize, BlockId, AssistantBlockKind)> = store
                     .streaming
                     .iter()
                     .enumerate()
-                    .filter(|(_, (_, kind, text))| has_assistant_text(*kind, text))
+                    .filter(|(_, (_, kind, text))| {
+                        has_assistant_text(*kind, text)
+                            && (!collapse_work_trace || *kind == AssistantBlockKind::Answer)
+                    })
                     .map(|(i, (block_id, kind, _))| (i, block_id.clone(), *kind))
-                    .collect()
+                    .collect();
+                let show_live_trace = collapse_work_trace
+                    && !live_tail_attached
+                    && has_live_foldable_tail(store);
+                (streaming_meta, show_live_trace)
             };
+
+            let live_trace_el = show_unattached_live_trace.then(|| {
+                prose_rail(&ty)
+                    .child(work_trace_card(
+                        window,
+                        cx,
+                        &entity,
+                        live_tail_key.clone(),
+                        &[],
+                        true,
+                        &t,
+                        &ty,
+                        tail_max,
+                    ))
+                    .into_any_element()
+            });
+
             let streaming_els: Vec<AnyElement> = streaming_meta
                 .into_iter()
                 .map(|(i, block_id, kind)| {
@@ -1902,74 +3684,34 @@ impl Render for SessionStore {
                 })
                 .collect();
 
-            div()
-                .w_full()
-                .when(index == 0, |row| row.pt_4())
-                .pb_6()
-                .flex()
-                .flex_col()
-                .gap(gap)
-                .children(streaming_els)
-                .children(store.arg_stream.iter().map(|stream| {
-                    let ArgStream {
-                        call_id,
-                        tool_name,
-                        text,
-                        lines,
-                        target_files,
-                        args_complete,
-                    } = stream;
-                    if tool_status_only(tool_name) {
-                        let title = tool_summary(tool_name, &ToolCallState::Declared)
-                            .map_or_else(|| format!("正在准备 {tool_name}"), str::to_owned);
-                        return prose_rail(&ty)
-                            .child(tool_status_line(tool_name, title, &ToolCallState::Declared, &t))
-                            .into_any_element();
-                    }
-                    let mut title = format!("正在准备 {tool_name}");
-                    if let Some((added, removed)) = lines {
-                        title.push_str(&format!("  +{added} −{removed}"));
-                    }
-                    if !target_files.is_empty() {
-                        title.push_str(&format!("  · {}", target_files.join(", ")));
-                    }
-                    if *args_complete {
-                        title.push_str("  · 参数已就绪");
-                    }
-                    let expanded = store.expanded_tools.contains(call_id);
-                    prose_rail(&ty)
-                        .child(
-                            div()
-                                .child(tool_toggle(
-                                    &entity,
-                                    call_id,
-                                    expanded,
-                                    tool_status_icon(call_id, &ToolCallState::Running, &t),
-                                    tool_category_icon(tool_name, tool_name == "exec_command"),
-                                    title,
-                                    None,
-                                    animate_motion,
-                                    &t,
-                                ))
-                                .children(expanded.then(|| {
-                                    div()
-                                        .px_3()
-                                        .py_1p5()
-                                        .rounded(px(RADIUS_CHIP))
-                                        .bg(t.code_bg)
-                                        .font_family(qaqh_gpui_kit::fonts::mono_font_family())
-                                        .text_xs()
-                                        .text_color(t.dim)
-                                        .max_h(px(240.))
-                                        .id(SharedString::from(format!("arg-stream-{}", call_id.0)))
-                                        .overflow_y_scroll()
-                                        .child(SharedString::from(text.clone()))
-                                })),
-                        )
-                        .into_any_element()
-                }))
-                .children(store.tools.iter().filter_map(|tool| {
+            let arg_stream_els: Vec<AnyElement> = if collapse_work_trace {
+                Vec::new()
+            } else {
+                store
+                    .arg_stream
+                    .iter()
+                    .map(|stream| {
+                        prose_rail(&ty)
+                            .child(render_arg_stream_item(
+                                store,
+                                &entity,
+                                stream,
+                                animate_motion,
+                                &t,
+                            ))
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+
+            let unref_tool_els: Vec<AnyElement> = store
+                .tools
+                .iter()
+                .filter_map(|tool| {
                     if referenced_tools.contains(&tool.call_id) {
+                        return None;
+                    }
+                    if collapse_work_trace && is_trace_foldable_tool_view(tool) {
                         return None;
                     }
                     Some(
@@ -1977,7 +3719,20 @@ impl Render for SessionStore {
                             .child(tool_card(cx, store, &entity, tool, &t, tail_max))
                             .into_any_element(),
                     )
-                }))
+                })
+                .collect();
+
+            div()
+                .w_full()
+                .when(index == 0, |row| row.pt_4())
+                .pb_6()
+                .flex()
+                .flex_col()
+                .gap(gap)
+                .children(live_trace_el)
+                .children(streaming_els)
+                .children(arg_stream_els)
+                .children(unref_tool_els)
                 .children(store.subagents.iter().map(|subagent| {
                     let status = subagent
                         .status
@@ -2021,6 +3776,29 @@ impl Render for SessionStore {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
+            .on_mouse_move(cx.listener(|store, event: &MouseMoveEvent, _, cx| {
+                let bounds = store.timeline_list.viewport_bounds();
+                if f32::from(bounds.size.width) <= 0.0 {
+                    return;
+                }
+                let rel_x = f32::from(event.position.x - bounds.origin.x);
+                let threshold = if store.turn_rail_near_left {
+                    104.0
+                } else {
+                    72.0
+                };
+                let near = rel_x >= 0.0 && rel_x <= threshold;
+                if store.turn_rail_near_left != near {
+                    store.turn_rail_near_left = near;
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(|store, hovered: &bool, _, cx| {
+                if !*hovered && store.turn_rail_near_left {
+                    store.turn_rail_near_left = false;
+                    cx.notify();
+                }
+            }))
             .vertical_scrollbar(&self.timeline_list)
             .child(timeline_list_el)
             .child(
@@ -2030,7 +3808,15 @@ impl Render for SessionStore {
                     .left_0()
                     .right_0(),
             )
-            .children(todo_floating_card(self, cx, &t));
+            .children(todo_floating_card(self, cx, &t))
+            .children(crate::turn_rail::render(
+                self,
+                &display_items,
+                &t,
+                window,
+                cx,
+            ))
+            .children(scroll_to_latest_button(self, &t, window, cx));
 
         let mut pending_interactions = Vec::new();
         for interaction in self.interactions.clone().iter() {
@@ -2155,7 +3941,7 @@ impl Render for SessionStore {
         let interactions_box = (!pending_interactions.is_empty()).then(|| {
             div()
                 .w_full()
-                .max_w(px(ty.content_width + 48.))
+                .max_w(px(MESSAGE_MAX_WIDTH_PX))
                 .mx_auto()
                 .px_4()
                 .pb_2()
@@ -2165,7 +3951,7 @@ impl Render for SessionStore {
                 .children(pending_interactions)
         });
 
-        let composer = crate::composer::render(self, cx, &t, ty.content_width);
+        let composer = crate::composer::render(self, cx, &t);
 
         let conversation = qaqh_gpui_kit::kit::stage_surface(&t)
             .flex_1()
@@ -2187,7 +3973,7 @@ impl Render for SessionStore {
             .min_w_0()
             .min_h_0()
             .child(conversation)
-            .children(crate::code_panel::render(self, &t, &ty, cx))
+            .children(crate::code_panel::render(self, &t, &ty, window, cx))
             .children(crate::terminal_panel::render(self, &t, &ty, window, cx))
             .children(crate::composer::model_params_modal(self, cx, &t))
     }

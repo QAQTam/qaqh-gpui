@@ -3,6 +3,7 @@
 //! motion(物理弹簧/呼吸点/GPU扫光/渐隐遮罩)、kit(圆角/阴影/舞台原语)、primitives(交互原语)。
 
 pub mod fonts;
+pub mod icons;
 pub mod kit;
 pub mod motion;
 pub mod primitives;

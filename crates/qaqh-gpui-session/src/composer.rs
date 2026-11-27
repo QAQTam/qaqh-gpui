@@ -308,9 +308,12 @@ fn popover_trigger(
         .tooltip(tooltip)
 }
 
-fn popover_card(t: &Palette, width: f32) -> Div {
+fn popover_card(cx: &gpui_kit::App, t: &Palette, width: f32) -> Div {
+    let ui_font =
+        qaqh_gpui_kit::fonts::ui_font(&qaqh_gpui_kit::settings::get(cx).typography.ui_font_family);
     div()
         .w(px(width))
+        .font(ui_font)
         .rounded(px(RADIUS_POPOVER))
         .bg(t.card)
         .border_1()
@@ -389,11 +392,7 @@ fn model_popover(
     cx: &gpui_kit::App,
     t: &Palette,
 ) -> AnyElement {
-    let current = store
-        .settings
-        .as_ref()
-        .and_then(|s| s.meta.model_selection.as_ref())
-        .cloned();
+    let current = store.effective_model_selection();
     let label = match (&store.catalog, &current) {
         (Some(catalog), Some(sel)) => catalog
             .providers
@@ -419,6 +418,7 @@ fn model_popover(
     #[derive(Clone)]
     struct ModelGroup {
         provider_name: String,
+        unauthenticated: bool,
         items: Vec<(ModelSelection, String, String)>,
     }
     let groups: Vec<ModelGroup> = store
@@ -453,6 +453,7 @@ fn model_popover(
                         } else {
                             provider.name.clone()
                         },
+                        unauthenticated: store.provider_account_unauthenticated(pid),
                         items,
                     })
                 })
@@ -466,7 +467,7 @@ fn model_popover(
         .trigger(trigger)
         .content(move |_state, _window, cx| {
             let popover: WeakEntity<PopoverState> = cx.entity().downgrade();
-            let mut card = popover_card(&t, 280.);
+            let mut card = popover_card(cx, &t, 280.);
             let manage_row = {
                 let entity = entity.clone();
                 let popover = popover.clone();
@@ -540,16 +541,35 @@ fn model_popover(
                         div()
                             .px_2()
                             .pt_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.faint)
-                            .child(group.provider_name.clone()),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.faint)
+                                    .child(group.provider_name.clone()),
+                            )
+                            .children(group.unauthenticated.then(|| {
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(t.warn)
+                                    .child("未登录")
+                            })),
                     )
                     .children(group.items.iter().map(|(selection, display, ctx)| {
+                        let unauthenticated = group.unauthenticated;
                         let is_selected = current.as_ref().is_some_and(|cur| {
                             cur.provider_id == selection.provider_id
                                 && cur.model_id == selection.model_id
                         });
+                        let subtitle = if unauthenticated {
+                            "需先登录对应账号".to_owned()
+                        } else {
+                            ctx.clone()
+                        };
                         let sel = selection.clone();
                         let entity = entity.clone();
                         let popover = popover.clone();
@@ -559,13 +579,17 @@ fn model_popover(
                                 sel.provider_id, sel.model_id
                             )),
                             SharedString::from(display.clone()),
-                            Some(SharedString::from(ctx.clone())),
+                            Some(SharedString::from(subtitle)),
                             is_selected,
                             &t,
                             move |window, cx| {
                                 let sel = sel.clone();
                                 let _ = entity.update(cx, |store, cx| {
-                                    store.patch_model(sel);
+                                    if unauthenticated {
+                                        store.open_access(cx);
+                                    } else {
+                                        store.patch_model(sel);
+                                    }
                                     cx.notify();
                                 });
                                 let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
@@ -585,18 +609,24 @@ fn effort_popover(
     cx: &gpui_kit::App,
     t: &Palette,
 ) -> AnyElement {
-    let model = store
-        .settings
-        .as_ref()
-        .and_then(|s| s.meta.model_selection.as_ref());
-    let current_effort = model.and_then(|m| m.options.reasoning_effort.clone());
-    let label = current_effort.as_deref().unwrap_or("默认").to_owned();
+    let model = store.effective_model_selection();
+    let current_effort = model.as_ref().and_then(|m| m.options.reasoning_effort.clone());
     let levels: Vec<String> = store
         .catalog
         .as_deref()
-        .zip(model)
+        .zip(model.as_ref())
         .map(|(catalog, m)| crate::store::model_effort_levels(catalog, m))
         .unwrap_or_default();
+    let default_effort = store
+        .catalog
+        .as_deref()
+        .zip(model.as_ref())
+        .and_then(|(catalog, m)| crate::store::model_default_effort(catalog, m));
+    let label = match (&current_effort, &default_effort) {
+        (Some(effort), _) => effort.clone(),
+        (None, Some(def)) => format!("默认 · {def}"),
+        (None, None) => "默认".to_owned(),
+    };
 
     let trigger = popover_trigger(
         cx,
@@ -613,7 +643,7 @@ fn effort_popover(
         .trigger(trigger)
         .content(move |_state, _window, cx| {
             let popover = cx.entity().downgrade();
-            let mut card = popover_card(&t, 180.);
+            let mut card = popover_card(cx, &t, 180.);
             card = card.child(
                 div()
                     .px_2()
@@ -623,18 +653,22 @@ fn effort_popover(
                     .text_color(t.faint)
                     .child("推理强度"),
             );
-            let mut options: Vec<(Option<String>, String)> = vec![(None, "默认".to_owned())];
+            let default_sub = default_effort
+                .as_deref()
+                .map(|def| format!("模型默认 ({def})"));
+            let mut options: Vec<(Option<String>, String, Option<String>)> =
+                vec![(None, "默认".to_owned(), default_sub)];
             for level in &levels {
-                options.push((Some(level.clone()), level.clone()));
+                options.push((Some(level.clone()), level.clone(), None));
             }
-            for (val, text) in options {
+            for (val, text, subtitle) in options {
                 let is_selected = current_effort == val;
                 let entity = entity.clone();
                 let popover = popover.clone();
                 card = card.child(popover_option_row(
                     SharedString::from(format!("pick-effort-{}", text)),
                     SharedString::from(text),
-                    None,
+                    subtitle.map(SharedString::from),
                     is_selected,
                     &t,
                     move |window, cx| {
@@ -685,7 +719,7 @@ fn tools_popover(
                 (qaqh_types::MINIMAL_B, "精简 B", "轻量只读检查与检索"),
                 (qaqh_types::MINIMAL_C, "精简 C", "最小对话工具集"),
             ];
-            let mut card = popover_card(&t, 224.);
+            let mut card = popover_card(cx, &t, 224.);
             card = card.child(
                 div()
                     .px_2()
@@ -730,7 +764,9 @@ pub fn model_params_modal(
     }
 
     let settings_meta = store.settings.as_ref().map(|s| &s.meta);
-    let current_model = settings_meta.and_then(|m| m.model_selection.as_ref());
+    let effective_model = store.effective_model_selection();
+    let current_model = effective_model.as_ref();
+    let is_inherited = settings_meta.and_then(|m| m.model_selection.as_ref()).is_none();
     let model_def = store
         .catalog
         .as_deref()
@@ -743,9 +779,11 @@ pub fn model_params_modal(
                 .get(&sel.model_id)
         });
 
-    let model_text = current_model
-        .map(|m| format!("{} / {}", m.provider_id, m.model_id))
-        .unwrap_or_else(|| "继承全局默认".to_owned());
+    let model_text = match current_model {
+        Some(m) if is_inherited => format!("{} / {} (继承全局默认)", m.provider_id, m.model_id),
+        Some(m) => format!("{} / {}", m.provider_id, m.model_id),
+        None => "继承全局默认".to_owned(),
+    };
     let ctx_badge = model_def.map(|m| format!("{} ctx", token_badge(m.context_window)));
 
     let mut rows: Vec<AnyElement> = Vec::new();
@@ -1080,8 +1118,8 @@ pub fn render(
     store: &SessionStore,
     cx: &mut Context<SessionStore>,
     t: &Palette,
-    content_width: f32,
 ) -> Div {
+    let max_width = qaqh_gpui_kit::settings::MESSAGE_MAX_WIDTH_PX;
     // ADR-016:封箱会话 loop 已闭门,置灰禁用输入并提供后继会话直达入口。
     if let Some(seal) = store.handoff_seal.as_ref() {
         let summary = seal.work_summary.trim();
@@ -1092,7 +1130,7 @@ pub fn render(
         };
         return div()
             .w_full()
-            .max_w(px(content_width + 48.))
+            .max_w(px(max_width))
             .mx_auto()
             .px_4()
             .pb_3()
@@ -1364,7 +1402,7 @@ pub fn render(
             t.accent,
             t.on_accent,
             t.accent_hover,
-            "发送消息 (Enter)",
+            "发送消息",
             blocked.is_some(),
             cx.listener(|store, _, _, cx| {
                 store.composer_send(cx);
@@ -1375,7 +1413,7 @@ pub fn render(
 
     div()
         .w_full()
-        .max_w(px(content_width + 48.))
+        .max_w(px(max_width))
         .mx_auto()
         .px_4()
         .pb_3()

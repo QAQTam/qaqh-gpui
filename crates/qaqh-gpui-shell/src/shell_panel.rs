@@ -13,6 +13,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{Context, Div, Entity, FontWeight, Hsla, SharedString, Window, div, px};
 use gpui_kit::component::{Icon, Sizable, Size, WindowExt as _};
 use gpui_kit::assets::IconName;
+use qaqh_gpui_kit::icons::{render_app_icon, shell_kind_icon};
 use qaqh_gpui_kit::kit::{
     BtnKind, RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, RADIUS_STAGE, button, shadow_stage, soft,
 };
@@ -405,6 +406,10 @@ pub fn dock(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<Daem
                 status_color(&tab_status, &t),
                 is_open,
             ))
+            .children(
+                shell_kind_icon(&info.shell)
+                    .map(|icon| render_app_icon(icon, 13.0, if active { t.text } else { t.dim })),
+            )
             .child(label);
         let close_id = info.id.clone();
         chip = chip.child(
@@ -430,6 +435,9 @@ pub fn dock(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<Daem
         tabs_row = tabs_row.child(
             div()
                 .id(SharedString::from(format!("shell-open-{kind}")))
+                .flex()
+                .items_center()
+                .gap_1()
                 .px_2()
                 .py_1()
                 .rounded(px(RADIUS_CHIP))
@@ -439,6 +447,9 @@ pub fn dock(daemon: &mut DaemonStore, window: &mut Window, cx: &mut Context<Daem
                 .text_color(t.dim)
                 .hover(|style| style.text_color(t.text).bg(t.btn_hover))
                 .on_click(cx.listener(move |daemon, _, _, cx| open(daemon, kind, cx)))
+                .children(
+                    shell_kind_icon(kind).map(|icon| render_app_icon(icon, 12.0, t.dim)),
+                )
                 .child(SharedString::from(format!("+ {kind}"))),
         );
     }

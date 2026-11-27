@@ -28,6 +28,11 @@ pub fn status_dot_colored(label: &str, color: Hsla, _t: &Palette) -> Div {
 
 /// 设置分区卡:小节标题 + 悬浮圆角卡片容器。
 pub fn section_card(title: &str, rows: Vec<Div>, t: &Palette) -> Div {
+    let last_ix = rows.len().saturating_sub(1);
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(ix, row)| if ix == last_ix { row.border_b_0() } else { row });
     div()
         .flex()
         .flex_col()

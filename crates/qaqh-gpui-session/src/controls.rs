@@ -111,7 +111,9 @@ pub fn search(store: &SessionStore, cx: &mut Context<SessionStore>) -> Option<gp
             .border_t_1()
             .border_color(t.border_subtle)
             .children(matches.into_iter().map(|(entry_index, preview)| {
-                let target_index = crate::timeline::display_index_for_entry(store, entry_index);
+                let collapse_work_trace = qaqh_gpui_kit::settings::get(cx).behavior.collapse_work_trace;
+                let (target_index, trace_key) =
+                    crate::timeline::display_index_for_entry(store, collapse_work_trace, entry_index);
                 div()
                     .id(("search-hit", entry_index))
                     .px_2()
@@ -123,7 +125,11 @@ pub fn search(store: &SessionStore, cx: &mut Context<SessionStore>) -> Option<gp
                     .cursor_pointer()
                     .hover(|style| style.bg(t.hover).text_color(t.text))
                     .child(preview)
-                    .on_click(cx.listener(move |store, _, _, _| {
+                    .on_click(cx.listener(move |store, _, _, cx| {
+                        if let Some(key) = &trace_key {
+                            store.expanded_traces.insert(key.clone());
+                            cx.notify();
+                        }
                         store.timeline_list.scroll_to_reveal_item(target_index)
                     }))
             }))

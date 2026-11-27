@@ -38,6 +38,66 @@ pub fn spring_panel_policy() -> Spring {
         .with_epsilon(0.5)
 }
 
+pub struct SplitDrawerSample {
+    pub full_width: f32,
+    pub animated_width: f32,
+    pub card_width: f32,
+}
+
+/// 采样左右二分侧边抽屉的物理宽度(与左侧工作区列表共用 `spring_panel_policy`)。
+/// 每帧必须无条件调用以保持 `0.0` 初值锚定;完全收起后返回 `None`。
+pub fn sample_split_drawer(
+    id: impl Into<TransitionId>,
+    open: bool,
+    sibling_open: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<SplitDrawerSample> {
+    let viewport_w = f32::from(window.viewport_size().width);
+    let available = (viewport_w - 16.0).max(320.0);
+    let fraction = if sibling_open { 0.36 } else { 0.52 };
+    let full_width = (available * fraction)
+        .round()
+        .clamp(320.0, (available - 240.0).max(320.0));
+    let target_width = if open { full_width } else { 0.0 };
+    let animated_width = spring_f32(id, target_width, spring_panel_policy(), window, cx).max(0.0);
+    if !open && animated_width <= 0.5 {
+        return None;
+    }
+    Some(SplitDrawerSample {
+        full_width,
+        animated_width,
+        card_width: (full_width - 8.0).max(280.0),
+    })
+}
+
+/// 包装右侧二分抽屉卡片:外层裁切与淡入淡出,内层锁定目标宽免除文本重排并叠加 16px 平滑滑入。
+pub fn wrap_split_drawer(sample: SplitDrawerSample, card: AnyElement, cx: &App) -> Div {
+    let ratio = (sample.animated_width / sample.full_width).clamp(0.0, 1.0);
+    let gutter = if effective_motion(cx) == MotionLevel::Full {
+        8.0 + (1.0 - ratio) * 16.0
+    } else {
+        8.0
+    };
+    div()
+        .h_full()
+        .min_h_0()
+        .w(px(sample.animated_width))
+        .max_w(gpui_kit::relative(0.60))
+        .opacity(ratio)
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(
+            div()
+                .w(px(sample.full_width))
+                .h_full()
+                .min_h_0()
+                .pl(px(gutter))
+                .flex_shrink_0()
+                .child(card),
+        )
+}
+
 /// 手风琴/折叠内容归一化(0..1)弹簧策略。
 pub fn spring_reveal_policy() -> Spring {
     Spring::new(Duration::from_millis(210))
@@ -210,15 +270,13 @@ pub fn stagger_enter(
     }
 }
 
-/// 页面切换轻微滑入 + 淡入(160ms EaseOut,保持 flex-1 全尺寸占位)。
-pub fn page_enter(
+fn enter_progress(
     id: impl Into<TransitionId>,
-    child: AnyElement,
     window: &mut Window,
     cx: &mut App,
-) -> AnyElement {
+) -> Option<(f32, f32)> {
     let duration_ms = match effective_motion(cx) {
-        MotionLevel::Off => return child,
+        MotionLevel::Off => return None,
         MotionLevel::Reduced => 90,
         MotionLevel::Full => 160,
     };
@@ -230,24 +288,59 @@ pub fn page_enter(
     let timing = Timing::new(Duration::from_millis(duration_ms)).ease(Easing::EaseOut);
     let p = animate_keyframes(id, &keyframes, timing, window, cx).value;
     if p >= 0.999 {
-        child
-    } else {
-        let shift = if effective_motion(cx) == MotionLevel::Reduced {
-            0.0
-        } else {
-            6.0 * (1.0 - p)
-        };
-        div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .mt(px(shift))
-            .opacity(p)
-            .child(child)
-            .into_any_element()
+        return None;
     }
+    let shift = if effective_motion(cx) == MotionLevel::Reduced {
+        0.0
+    } else {
+        6.0 * (1.0 - p)
+    };
+    Some((p, shift))
+}
+
+/// 页面切换轻微滑入 + 淡入(160ms EaseOut,保持 flex-1 全尺寸占位)。
+pub fn page_enter(
+    id: impl Into<TransitionId>,
+    child: AnyElement,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let Some((p, shift)) = enter_progress(id, window, cx) else {
+        return child;
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .mt(px(shift))
+        .opacity(p)
+        .child(child)
+        .into_any_element()
+}
+
+/// 滚动内容轻微滑入 + 淡入(160ms EaseOut,不限制纵向高度)。
+pub fn scroll_enter(
+    id: impl Into<TransitionId>,
+    constrain_width: bool,
+    child: AnyElement,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let Some((p, shift)) = enter_progress(id, window, cx) else {
+        return child;
+    };
+    let wrapper = if constrain_width {
+        div().w_full().min_w_0()
+    } else {
+        div().min_w_full()
+    };
+    wrapper
+        .mt(px(shift))
+        .opacity(p)
+        .child(child)
+        .into_any_element()
 }
 
 /// 0..1 往返正弦呼吸曲线。
@@ -303,6 +396,18 @@ pub fn shimmer_label(
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.dim)
         .into_any_element()
+}
+
+/// 顶部渐隐过渡层:覆盖于有限高度滚动视窗上缘,让旧轨迹柔和淡入舞台背景。
+pub fn top_fade_mask(stage_color: Hsla, height_px: f32) -> Div {
+    div()
+        .h(px(height_px))
+        .w_full()
+        .bg(linear_gradient(
+            0.,
+            linear_color_stop(crate::kit::soft(stage_color, 0.0), 0.0),
+            linear_color_stop(stage_color, 1.0),
+        ))
 }
 
 /// 底部渐隐过渡层:覆盖于时间线视口底缘,让滚动文本柔和沉入悬浮 Composer 后方。

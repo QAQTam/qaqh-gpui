@@ -770,6 +770,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "calloop"
@@ -889,6 +892,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "cobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1431,6 +1443,18 @@ dependencies = [
  "vswhom",
  "winreg",
 ]
+
+[[package]]
+name = "embedded-io"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "encoding_rs"
@@ -5194,6 +5218,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "postcard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5431b3dcfdf6d1985c87d11f267a171c0dec0a8cd544c6727b747d36365f1fca"
+dependencies = [
+ "cobs",
+ "embedded-io 0.4.0",
+ "embedded-io 0.6.1",
+ "serde",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5306,9 +5342,12 @@ dependencies = [
  "futures-util",
  "hex",
  "log",
+ "qaqh-core-vocab",
  "qaqh-ringing",
  "qaqh-ringing-contract",
+ "qaqh-ringing-v3",
  "qaqh-types",
+ "qaqh-v3-transport",
  "reqwest",
  "rustls",
  "serde",
@@ -5318,6 +5357,15 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+]
+
+[[package]]
+name = "qaqh-core-vocab"
+version = "4.2.0"
+dependencies = [
+ "hex",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5467,6 +5515,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qaqh-ringing-v3"
+version = "4.2.0"
+dependencies = [
+ "bytes",
+ "postcard",
+ "qaqh-core-vocab",
+ "serde",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "qaqh-types"
 version = "4.2.0"
 dependencies = [
@@ -5481,6 +5541,21 @@ dependencies = [
  "tempfile",
  "toml 1.2.0+spec-1.1.0",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "qaqh-v3-transport"
+version = "4.2.0"
+dependencies = [
+ "log",
+ "qaqh-ringing-v3",
+ "rustix",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "windows-sys 0.61.2",
+ "yamux",
 ]
 
 [[package]]
@@ -7219,6 +7294,7 @@ checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "libc",
  "pin-project-lite",
@@ -9056,6 +9132,21 @@ name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
+
+[[package]]
+name = "yamux"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f4e661d6ba6f09a768e31c6f3d88f9fac596ad5d376515d598a37b62d220b34"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "static_assertions",
+ "web-time",
+]
 
 [[package]]
 name = "yazi"

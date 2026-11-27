@@ -21,9 +21,8 @@ use qaqh_gpui_wire::bridge::{
 };
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::WindowExt;
-use qaqh_profile::ConfigDto;
-use qaqh_profile::ProfilesDocument;
-use qaqh_types::ModelSelection;
+use qaqh_profile::{ConfigDto, ProfilesDocument};
+use qaqh_types::{CredentialSource, ModelSelection};
 use qaqh_gpui_session::store::{SessionStore, SessionRow, TodoRow, SettingsEditor, AccountService, AccountSignIn, StreamState, rows_from, todos_from, model_options_from};
 use crate::shell_panel::ShellTabState;
 fn now_ms() -> u64 {
@@ -154,6 +153,10 @@ pub struct DaemonStore {
     pub siwc: Option<qaqh_client::service_types::SiwcStatus>,
     pub dsaccount: Option<qaqh_client::service_types::DsAccountStatus>,
     pub ds_balance: Option<qaqh_client::service_types::DsAccountBalance>,
+    pub ds_bonuses: Vec<qaqh_client::service_types::DsAccountBonus>,
+    /// DeepSeek 账号模型同步状态与首登/启动自检标记。
+    pub ds_models_syncing: bool,
+    ds_auto_synced: bool,
     /// 进行中的浏览器登录流程(Some = 轮询中)。
     pub sign_in: Option<AccountSignIn>,
     /// 账号页操作结果行(错误/提示)。
@@ -177,6 +180,8 @@ pub struct DaemonStore {
     pub shell_error: Option<String>,
     /// 工作台面板收折态(弹簧动画驱动)。
     pub sidebar_open: bool,
+    /// 因右侧二分抽屉（代码面板或后台执行观察窗）展开而自动收起侧栏;关闭或切走时按原样恢复。
+    pub sidebar_restore_on_side_panel_close: bool,
     pub inspector_open: bool,
     /// 工作区页行内路径输入框。
     pub workspace_path_input: Entity<InputState>,
@@ -275,6 +280,9 @@ impl DaemonStore {
             siwc: None,
             dsaccount: None,
             ds_balance: None,
+            ds_bonuses: Vec::new(),
+            ds_models_syncing: false,
+            ds_auto_synced: false,
             sign_in: None,
             account_line: None,
             stores: Vec::new(),
@@ -289,6 +297,7 @@ impl DaemonStore {
             shell_opening: None,
             shell_error: None,
             sidebar_open: true,
+            sidebar_restore_on_side_panel_close: false,
             inspector_open: false,
             workspace_path_input,
             global_inputs,
@@ -337,6 +346,37 @@ impl DaemonStore {
         self.global_inputs.seeded = true;
     }
 
+    pub(crate) fn active_side_panel_open(&self, cx: &gpui_kit::App) -> bool {
+        self.section == PrimarySection::Home
+            && !self.new_session_open
+            && self.current.as_ref().is_some_and(|store| {
+                let s = store.read(cx);
+                s.code_panel.is_open() || s.terminal_panel.open
+            })
+    }
+
+    /// 联动左侧工作区列表与右侧二分面板(代码/文档面板或后台执行观察窗):
+    /// 右侧面板展开时自动收回侧栏形成左右二分;收回或切离时恢复侧栏原样。
+    pub(crate) fn sync_sidebar_for_side_panel(&mut self, cx: &mut Context<Self>) {
+        if self.active_side_panel_open(cx) {
+            if self.sidebar_open {
+                self.sidebar_open = false;
+                self.sidebar_restore_on_side_panel_close = true;
+                cx.notify();
+            }
+        } else if self.sidebar_restore_on_side_panel_close {
+            self.sidebar_open = true;
+            self.sidebar_restore_on_side_panel_close = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_sidebar_manual(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
+        self.sidebar_restore_on_side_panel_close = false;
+        self.sidebar_open = open.unwrap_or(!self.sidebar_open);
+        cx.notify();
+    }
+
     /// 切换主导航分区(主页 / 工具 / 团队 / 接入)并自动触发对应数据加载。
     pub fn navigate(
         &mut self,
@@ -382,6 +422,7 @@ impl DaemonStore {
                 let _ = self.requests.unbounded_send(BridgeRequest::QueryConfig);
             }
         }
+        self.sync_sidebar_for_side_panel(cx);
         cx.notify();
     }
 
@@ -405,6 +446,7 @@ impl DaemonStore {
         let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
         self.startup_input
             .update(cx, |field, cx| field.focus(window, cx));
+        self.sync_sidebar_for_side_panel(cx);
         cx.notify();
     }
 
@@ -467,6 +509,12 @@ impl DaemonStore {
                     .requests
                     .unbounded_send(BridgeRequest::ListProviderPresets);
             }
+            if matches!(
+                editor,
+                SettingsEditor::Accounts | SettingsEditor::Catalog
+            ) {
+                self.refresh_accounts();
+            }
         }
         cx.notify();
     }
@@ -491,6 +539,7 @@ impl DaemonStore {
                         if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                             self.last_operation = Some(format!("{label} · 被拒绝 · {} {}", ack.code.unwrap_or_default(), ack.message.unwrap_or_default()));
                         } else {
+                            self.last_operation = None;
                             // 成功受理走瞬时气泡;常驻状态行只承载失败/待确认。
                             let status = if ack.result.is_some() { "已完成" } else { "已受理" };
                             window.push_notification(
@@ -512,6 +561,7 @@ impl DaemonStore {
                 self.connection = state;
                 if id.is_some() {
                     self.shell_error = None;
+                    self.refresh_accounts();
                     if self.shell_dock_open {
                         let _ = self.requests.unbounded_send(BridgeRequest::ShellList);
                     }
@@ -660,13 +710,33 @@ impl DaemonStore {
                     }),
                     _ => None,
                 };
+                let is_foreground = self
+                    .current
+                    .as_ref()
+                    .is_some_and(|store| store.read(cx).session_id == seed);
                 let review_turn = match &frame.event {
-                    SessionEvent::TurnEnded { turn_id, .. }
-                        if self.current.as_ref().is_some_and(|store| store.read(cx).session_id == seed) =>
-                    {
+                    SessionEvent::TurnEnded { turn_id, .. } if is_foreground => {
                         Some(turn_id.clone())
                     }
                     _ => None,
+                };
+                let live_patch_event = if is_foreground {
+                    match &frame.event {
+                        SessionEvent::ToolArgumentsDelta {
+                            call_id, tool_name, ..
+                        } if tool_name == "apply_patch" => Some(
+                            qaqh_gpui_session::code_panel::LivePatchEvent::Delta(call_id.clone()),
+                        ),
+                        SessionEvent::ToolFinished {
+                            call_id, outcome, ..
+                        } => Some(qaqh_gpui_session::code_panel::LivePatchEvent::Finished {
+                            call_id: call_id.clone(),
+                            success: outcome.is_success(),
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
                 // 工具完成/回合结束刷新 todo(与 electron 同触发时机)。
                 let refresh_todos = matches!(
@@ -695,9 +765,14 @@ impl DaemonStore {
                     }
                     let previous_seq = store.seq;
                     qaqh_gpui_session::reducer::apply_frame(store, frame, cx);
+                    if store.seq > previous_seq
+                        && let Some(event) = live_patch_event
+                    {
+                        qaqh_gpui_session::code_panel::on_live_patch_event(store, event, cx);
+                    }
                     if store.seq > previous_seq && let Some(title) = notification { crate::desktop::notify(cx, &store.session_id, title); }
                     if store.seq > previous_seq && let Some(turn) = review_turn {
-                        qaqh_gpui_session::code_panel::auto_review(store, turn);
+                        qaqh_gpui_session::code_panel::auto_review(store, turn, cx);
                     }
                     cx.notify();
                 });
@@ -833,6 +908,7 @@ impl DaemonStore {
                         .or_else(|| model_options_from(&catalog).into_iter().next());
                 }
                 self.providers = Some(catalog);
+                self.maybe_auto_sync_dsaccount();
                 cx.notify();
             }
             BridgeMsg::ProviderPresets(presets) => {
@@ -901,13 +977,70 @@ impl DaemonStore {
         self.service("dsaccount.status");
     }
 
+    pub fn siwc_ready(&self) -> bool {
+        self.siwc.as_ref().is_some_and(|s| {
+            s.status == qaqh_client::service_types::SiwcConnectionState::Connected && s.sharing
+        })
+    }
+
+    pub fn dsaccount_signed_in(&self) -> bool {
+        self.dsaccount.as_ref().is_some_and(|s| s.signed_in)
+    }
+
+    fn sync_account_readiness(&self, cx: &mut Context<Self>) {
+        let siwc_ready = self.siwc_ready();
+        let ds_ready = self.dsaccount_signed_in();
+        for store in &self.stores {
+            store.update(cx, |store, cx| {
+                if store.siwc_ready != siwc_ready || store.dsaccount_signed_in != ds_ready {
+                    store.siwc_ready = siwc_ready;
+                    store.dsaccount_signed_in = ds_ready;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    fn has_dsaccount_models(&self) -> bool {
+        self.providers.as_deref().is_some_and(|catalog| {
+            catalog.providers.values().any(|provider| {
+                provider.credential == CredentialSource::DeepseekAccount
+                    && !provider.models.is_empty()
+            })
+        })
+    }
+
+    fn maybe_auto_sync_dsaccount(&mut self) {
+        if self.dsaccount_signed_in()
+            && self.providers.is_some()
+            && !self.ds_auto_synced
+            && !self.ds_models_syncing
+            && !self.has_dsaccount_models()
+        {
+            self.ds_auto_synced = true;
+            self.sync_dsaccount_models();
+        }
+    }
+
     /// 浏览器登录入口:起流程并打开授权页;轮询由 2s 定时器驱动。
     pub fn sign_in_start(&mut self, service: AccountService) {
-        let method = match service {
-            AccountService::Siwc => "siwc.sign_in.start",
-            AccountService::Dsaccount => "dsaccount.sign_in.start",
+        if self.sign_in.as_ref().is_some_and(|flow| flow.service != service) {
+            self.sign_in_cancel();
+        }
+        let (method, params) = match service {
+            AccountService::Siwc => (
+                "siwc.sign_in.start",
+                serde_json::Value::Object(Default::default()),
+            ),
+            AccountService::Dsaccount => (
+                "dsaccount.sign_in.start",
+                serde_json::json!({ "locale": "zh" }),
+            ),
         };
-        self.service(method);
+        let _ = self.requests.unbounded_send(BridgeRequest::Service {
+            method: method.into(),
+            params,
+        });
     }
 
     pub fn sign_in_cancel(&mut self) {
@@ -932,11 +1065,30 @@ impl DaemonStore {
         self.service(method);
     }
 
-    /// 2s 定时器:登录流程轮询 + 过期收口。
+    pub fn verify_dsaccount(&mut self) {
+        self.account_line = Some("正在校验 DeepSeek 账号凭据…".into());
+        self.service("dsaccount.verify");
+    }
+
+    pub fn ack_dsaccount_bonus(&mut self, order_id: String) {
+        self.ds_bonuses.retain(|bonus| bonus.order_id != order_id);
+        let _ = self.requests.unbounded_send(BridgeRequest::Service {
+            method: "dsaccount.bonus.ack".into(),
+            params: serde_json::json!({ "order_id": order_id }),
+        });
+    }
+
+    pub fn sync_dsaccount_models(&mut self) {
+        self.last_operation = None;
+        self.ds_models_syncing = true;
+        self.service("dsaccount.models");
+    }
+
+    /// 2s 定时器:登录流程轮询 + 过期收口(同时向后端发送 cancel 关闭回环监听)。
     pub fn poll_sign_in(&mut self) {
         let Some(flow) = &self.sign_in else { return };
         if now_ms() > flow.expires_at_ms {
-            self.sign_in = None;
+            self.sign_in_cancel();
             self.account_line = Some("登录流程已过期，请重试".into());
             return;
         }
@@ -954,29 +1106,90 @@ impl DaemonStore {
     ) {
         use qaqh_client::service_types as st;
         let Ok(value) = result else {
-            self.account_line = Some(result.unwrap_err());
+            let error = result.unwrap_err();
+            if method == "dsaccount.models" {
+                self.ds_models_syncing = false;
+                self.last_operation = Some(format!("同步 DeepSeek 模型失败：{error}"));
+            }
+            self.account_line = Some(error);
             return;
         };
         match method {
             "siwc.status" => match decode(method, value) {
-                Ok(status) => self.siwc = Some(status),
+                Ok(status) => {
+                    self.siwc = Some(status);
+                    self.sync_account_readiness(cx);
+                }
                 Err(error) => self.account_line = Some(error),
             },
             "dsaccount.status" => {
-                match decode(method, value) {
-                    Ok(status) => self.dsaccount = Some(status),
+                match decode::<st::DsAccountStatus>(method, value) {
+                    Ok(status) => {
+                        let signed_in = status.signed_in;
+                        self.dsaccount = Some(status);
+                        if signed_in {
+                            self.service("dsaccount.balance");
+                            self.service("dsaccount.bonuses");
+                            self.maybe_auto_sync_dsaccount();
+                        } else {
+                            self.ds_balance = None;
+                            self.ds_bonuses.clear();
+                            self.ds_auto_synced = false;
+                            self.ds_models_syncing = false;
+                        }
+                        self.sync_account_readiness(cx);
+                    }
                     Err(error) => self.account_line = Some(error),
-                }
-                if self.dsaccount.as_ref().is_some_and(|status| status.signed_in)
-                    && self.ds_balance.is_none()
-                {
-                    self.service("dsaccount.balance");
                 }
             }
             "dsaccount.balance" => match decode(method, value) {
                 Ok(balance) => self.ds_balance = Some(balance),
                 Err(error) => self.account_line = Some(error),
             },
+            "dsaccount.bonuses" => match decode(method, value) {
+                Ok(bonuses) => self.ds_bonuses = bonuses,
+                Err(error) => self.account_line = Some(error),
+            },
+            "dsaccount.bonus.ack" => {
+                self.service("dsaccount.bonuses");
+            }
+            "dsaccount.verify" => match decode::<st::DsAccountVerify>(method, value) {
+                Ok(verify) if verify.valid => {
+                    self.account_line = Some("DeepSeek 账号凭据验证通过".into());
+                }
+                Ok(verify) if verify.cleared => {
+                    self.ds_balance = None;
+                    self.ds_bonuses.clear();
+                    self.service("dsaccount.status");
+                    self.account_line = Some(match verify.reason {
+                        Some(reason) => format!("DeepSeek 凭据已失效并清除：{reason}"),
+                        None => "DeepSeek 凭据已失效并清除，请重新登录".into(),
+                    });
+                }
+                Ok(verify) => {
+                    self.account_line = Some(match verify.reason {
+                        Some(reason) => format!("DeepSeek 凭据暂未验证通过：{reason}"),
+                        None => "DeepSeek 凭据暂未验证通过".into(),
+                    });
+                }
+                Err(error) => self.account_line = Some(error),
+            },
+            "dsaccount.models" => {
+                self.ds_models_syncing = false;
+                match decode::<Vec<st::DsAccountModel>>(method, value) {
+                    Ok(models) => {
+                        let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
+                        self.account_line = Some(format!(
+                            "已同步 {} 个 DeepSeek 账号模型",
+                            models.len()
+                        ));
+                    }
+                    Err(error) => {
+                        self.last_operation = Some(error.clone());
+                        self.account_line = Some(error);
+                    }
+                }
+            }
             "siwc.sign_in.start" => match decode::<st::SiwcSignInStart>(method, value) {
                 Ok(start) => {
                     self.sign_in = Some(AccountSignIn {
@@ -994,6 +1207,7 @@ impl DaemonStore {
                     st::SiwcFlowState::Completed => {
                         self.sign_in = None;
                         self.service("siwc.status");
+                        let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
                         self.account_line = Some("ChatGPT 套餐已登录".into());
                     }
                     st::SiwcFlowState::Failed => {
@@ -1039,22 +1253,34 @@ impl DaemonStore {
             }
             "dsaccount.sign_in.status" => {
                 match decode::<st::DsAccountSignInStatus>(method, value) {
-                    Ok(status) => match status.state {
-                        st::DsFlowState::SignedIn => {
+                    Ok(status) => {
+                        if let Some(current) = &self.sign_in
+                            && current.service == AccountService::Dsaccount
+                            && let Some(attempt_id) = status.attempt_id.as_deref()
+                            && attempt_id != current.flow_id
+                        {
                             self.sign_in = None;
-                            self.ds_balance = None;
-                            self.service("dsaccount.status");
-                            self.account_line = Some("DeepSeek 账号已登录".into());
+                            return;
                         }
-                        st::DsFlowState::Failed | st::DsFlowState::Cancelled => {
-                            self.sign_in = None;
-                            self.account_line = Some(match status.error {
-                                Some(error) => format!("登录未完成:{error}"),
-                                None => "登录未完成".into(),
-                            });
+                        match status.state {
+                            st::DsFlowState::SignedIn => {
+                                self.sign_in = None;
+                                self.ds_balance = None;
+                                self.ds_auto_synced = true;
+                                self.service("dsaccount.status");
+                                let _ = self.requests.unbounded_send(BridgeRequest::ListProviders);
+                                self.account_line = Some("DeepSeek 账号已登录".into());
+                            }
+                            st::DsFlowState::Failed | st::DsFlowState::Cancelled => {
+                                self.sign_in = None;
+                                self.account_line = Some(match status.error {
+                                    Some(error) => format!("登录未完成:{error}"),
+                                    None => "登录未完成".into(),
+                                });
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                     Err(error) => self.account_line = Some(error),
                 }
             }
@@ -1065,6 +1291,10 @@ impl DaemonStore {
             "dsaccount.sign_out" => {
                 self.dsaccount = None;
                 self.ds_balance = None;
+                self.ds_bonuses.clear();
+                self.ds_auto_synced = false;
+                self.ds_models_syncing = false;
+                self.sync_account_readiness(cx);
                 self.service("dsaccount.status");
                 self.account_line = Some("已登出 DeepSeek 账号".into());
             }
@@ -1215,16 +1445,21 @@ impl DaemonStore {
                 store.update(cx, |store, _| { store.snapshot_pending = true; store.buffered_frames.clear(); });
                 let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
                 self.current = Some(store);
+                self.sync_sidebar_for_side_panel(cx);
                 cx.notify();
             }
             None => {
                 let requests = self.requests.clone();
                 let anchors = self.handoff_anchors.clone();
                 let draft = self.workbench.drafts.get(&seed).cloned().unwrap_or_default();
+                let siwc_ready = self.siwc_ready();
+                let ds_ready = self.dsaccount_signed_in();
                 let store = cx.new(|cx| SessionStore::new(seed.clone(), requests, draft, window, cx));
                 store.update(cx, |store, _| {
                     store.handoff_anchors = anchors;
                     store.catalog = self.providers.clone();
+                    store.siwc_ready = siwc_ready;
+                    store.dsaccount_signed_in = ds_ready;
                     store.client_session_id = match &self.connection {
                         qaqh_gpui_wire::bridge::ConnectionState::Ready { client_session_id } => Some(client_session_id.clone()), _ => None,
                     };
@@ -1239,16 +1474,27 @@ impl DaemonStore {
                     &store,
                     window,
                     |daemon, _, event: &qaqh_gpui_session::store::SessionNavEvent, window, cx| {
-                        let qaqh_gpui_session::store::SessionNavEvent::OpenSession {
-                            session_id,
-                            fly_from_session,
-                        } = event;
-                        daemon.jump_with_fly(
-                            session_id.clone(),
-                            fly_from_session.clone(),
-                            window,
-                            cx,
-                        );
+                        match event {
+                            qaqh_gpui_session::store::SessionNavEvent::OpenSession {
+                                session_id,
+                                fly_from_session,
+                            } => {
+                                daemon.jump_with_fly(
+                                    session_id.clone(),
+                                    fly_from_session.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            qaqh_gpui_session::store::SessionNavEvent::SidePanelOpenChanged {
+                                ..
+                            } => {
+                                daemon.sync_sidebar_for_side_panel(cx);
+                            }
+                            qaqh_gpui_session::store::SessionNavEvent::OpenAccess => {
+                                daemon.navigate(PrimarySection::Access, window, cx);
+                            }
+                        }
                     },
                 );
                 self.session_subs.push((seed.clone(), sub));
@@ -1260,6 +1506,7 @@ impl DaemonStore {
                     self.session_subs.retain(|(sid, _)| sid != &evicted_id);
                 }
                 let _ = self.requests.unbounded_send(BridgeRequest::Select(seed));
+                self.sync_sidebar_for_side_panel(cx);
                 cx.notify();
             }
         }

@@ -7,8 +7,8 @@
 //! - 落后或交叉保留窗口 → reset 重建;单实例屏,切换会话即重建(抽屉纪律 3)。
 //!
 //! 观察窗布局与宽对齐:
-//! - 列宽锁定后端 PTY 列数(`BACKEND_EXEC_PTY_COLS = 80`),杜绝窄栏二次折行与光标定位错位;
-//! - 默认 `10px` 高密度等宽字号(支持 `9–14px` 局部步进微调并持久化),侧栏态宽自动对齐 `80` 列;
+//! - 列宽锁定后端 exec PTY 列数(`BACKEND_EXEC_PTY_COLS = 160`),杜绝窄栏二次折行与光标定位错位;
+//! - 默认 `10px` 高密度等宽字号(支持 `9–14px` 局部步进微调并持久化);
 //! - 支持一键展开为居中 L3 悬浮大窗(`Option A`,复用 `Presence` 物理进退场 + `Esc` 还原)。
 
 use std::cell::Cell;
@@ -26,22 +26,22 @@ use qaqh_gpui_kit::kit::{
     RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, RADIUS_STAGE, shadow_card, shadow_popover,
     shadow_stage, soft,
 };
-use qaqh_gpui_kit::motion::{live_dot, spring_f32, spring_panel_policy};
+use qaqh_gpui_kit::motion::{
+    live_dot, sample_split_drawer, spring_f32, spring_panel_policy, wrap_split_drawer,
+};
 use qaqh_gpui_kit::settings::{self, Typography};
 use qaqh_gpui_kit::theme::{Palette, terminal_palette};
 use qaqh_ringing_contract::fact::ExecSessionId;
 use qaqh_ringing_contract::state::{ExecSessionOutcome, ExecSessionState, ExecSessionView};
 
 use crate::store::SessionStore;
-use crate::terminal_view::{ColsMode, TerminalView, measure_mono_cell_width};
+use crate::terminal_view::{ColsMode, TerminalView};
 use crate::timeline::content_text;
 
-/// 后端 `qaqh-pty::SessionSpec::new` 当前固定列数(80 列);未来协议透传 `pty_cols` 时由此唯一入口接管。
-pub const BACKEND_EXEC_PTY_COLS: usize = 80;
+/// 后端 exec 会话当前固定列数(160 列);未来协议透传 `pty_cols` 时由此唯一入口接管。
+pub const BACKEND_EXEC_PTY_COLS: usize = 160;
 const EXEC_FONT_MIN: f32 = 9.0;
 const EXEC_FONT_MAX: f32 = 14.0;
-/// 侧栏容器内除画布文本区之外的水平占用(外框 2 + 画布 mx_2 16 + 画布边 2 + 画布 p_2 16 + 滚动条 6)。
-const DOCKED_CHROME_X_PX: f32 = 42.0;
 
 /// 终态同步标记:终态权威 output 只 rehydrate 一次,此后屏面静态。
 const FINAL_END: u64 = u64::MAX;
@@ -71,6 +71,7 @@ pub struct ActiveTerminal {
 pub struct TerminalPanel {
     pub open: bool,
     pub expanded: bool,
+    closing: bool,
     pub list_collapsed: bool,
     pub selected: Option<ExecSessionId>,
     /// 单实例屏:同一时刻只解析当前选中会话(抽屉纪律 3)。
@@ -96,6 +97,7 @@ impl TerminalPanel {
         Self {
             open: false,
             expanded: false,
+            closing: false,
             list_collapsed: false,
             selected: None,
             active: None,
@@ -149,21 +151,32 @@ pub fn open(
     exec_id: Option<ExecSessionId>,
     cx: &mut Context<SessionStore>,
 ) {
+    let was_open = store.terminal_panel.open;
     store.terminal_panel.open = true;
+    store.terminal_panel.closing = false;
     store.terminal_panel.selected = exec_id.or_else(|| default_pick(store));
     store.terminal_panel.active = None;
     store.terminal_panel.synced = None;
     store.terminal_panel.synced_style = None;
+    if !was_open {
+        cx.emit(crate::store::SessionNavEvent::SidePanelOpenChanged { open: true });
+    }
     cx.notify();
 }
 
 pub fn close(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
+    let was_open = store.terminal_panel.open;
     store.terminal_panel.open = false;
     store.terminal_panel.expanded = false;
-    store.terminal_panel.selected = None;
-    store.terminal_panel.active = None;
-    store.terminal_panel.synced = None;
-    store.terminal_panel.synced_style = None;
+    store.terminal_panel.closing = was_open;
+    if !was_open {
+        store.terminal_panel.selected = None;
+        store.terminal_panel.active = None;
+        store.terminal_panel.synced = None;
+        store.terminal_panel.synced_style = None;
+    } else {
+        cx.emit(crate::store::SessionNavEvent::SidePanelOpenChanged { open: false });
+    }
     cx.notify();
 }
 
@@ -237,12 +250,14 @@ pub fn sync(store: &mut SessionStore, cx: &mut Context<SessionStore>) {
     }
 
     if !store.terminal_panel.open {
-        let had_active = store.terminal_panel.active.take().is_some();
-        let had_synced = store.terminal_panel.synced.take().is_some();
-        store.terminal_panel.synced_style = None;
-        if had_active || had_synced {
-            let view = store.terminal_panel.view.clone();
-            view.update(cx, |view, _| view.reset_quiet());
+        if !store.terminal_panel.closing {
+            let had_active = store.terminal_panel.active.take().is_some();
+            let had_synced = store.terminal_panel.synced.take().is_some();
+            store.terminal_panel.synced_style = None;
+            if had_active || had_synced {
+                let view = store.terminal_panel.view.clone();
+                view.update(cx, |view, _| view.reset_quiet());
+            }
         }
         return;
     }
@@ -502,7 +517,7 @@ fn render_header(
     let cols = backend_cols_for(selected_session);
     let meta_label = SharedString::from(format!("{cols}c · {}px", font_size.round() as i32));
     let meta_tip = SharedString::from(format!(
-        "后端 PTY 列对齐: {cols} 列 · 字号 {}px\n支持 Shift+滚轮或触控板左右平移",
+        "后端 PTY 列对齐: {cols} 列 · 字号 {}px\n支持触控板或横向滚轮平移",
         font_size.round() as i32
     ));
 
@@ -627,7 +642,7 @@ fn render_header(
                     t.dim,
                     t.text,
                     if mode == PanelMode::Expanded {
-                        "还原侧栏观察窗 (Esc)"
+                        "还原侧栏观察窗"
                     } else {
                         "展开宽屏观察窗"
                     },
@@ -924,17 +939,45 @@ fn render_body(
     }
 }
 
-/// 侧栏观察窗外框:宽严格对齐后端 PTY 列数(`80` 列 × 实测等宽字宽 + chrome)。
+/// 侧栏观察窗外框:与代码面板共用二分抽屉物理弹簧(`sample_split_drawer` + `wrap_split_drawer`),
+/// 展开时自动收回左侧工作区列表,与消息区构成左右二分。
 pub fn render(
-    store: &SessionStore,
+    store: &mut SessionStore,
     t: &Palette,
-    ty: &Typography,
+    _ty: &Typography,
     window: &mut Window,
     cx: &mut Context<SessionStore>,
 ) -> Option<Div> {
-    if !store.terminal_panel.open || store.terminal_panel.modal_visible() {
+    if store.terminal_panel.modal_visible() {
+        let _ = spring_f32(
+            "exec-panel-width",
+            0.0,
+            spring_panel_policy().with_travel(false),
+            window,
+            cx,
+        );
         return None;
     }
+
+    let sibling_open = store.code_panel.is_open();
+    let Some(sample) = sample_split_drawer(
+        "exec-panel-width",
+        store.terminal_panel.open,
+        sibling_open,
+        window,
+        cx,
+    ) else {
+        if store.terminal_panel.closing {
+            store.terminal_panel.closing = false;
+            store.terminal_panel.selected = None;
+            store.terminal_panel.active = None;
+            store.terminal_panel.synced = None;
+            store.terminal_panel.synced_style = None;
+            let view = store.terminal_panel.view.clone();
+            view.update(cx, |view, _| view.reset_quiet());
+        }
+        return None;
+    };
 
     let order = sorted_order(store);
     let running_count = store
@@ -948,55 +991,40 @@ pub fn render(
         .as_ref()
         .and_then(|id| store.exec_sessions.iter().find(|session| &session.id == id));
 
-    let font_size = ty.exec_font_size.clamp(EXEC_FONT_MIN, EXEC_FONT_MAX);
-    let cw = measure_mono_cell_width(font_size, window);
-    let target_cols = backend_cols_for(selected_session);
-    let ideal_width = ((target_cols as f32 * cw).ceil() + DOCKED_CHROME_X_PX).max(320.0);
-    let width = spring_f32(
-        "exec-panel-width",
-        ideal_width,
-        spring_panel_policy(),
-        window,
-        cx,
-    )
-    .max(320.0);
-
     let entity = cx.entity();
-    Some(
-        div()
-            .ml_2()
-            .w(px(width))
-            .max_w(relative(0.64))
-            .h_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .rounded(px(RADIUS_STAGE))
-            .bg(t.stage)
-            .border_1()
-            .border_color(t.border_subtle)
-            .shadow(shadow_stage(t))
-            .overflow_hidden()
-            .child(render_header(
-                store,
-                entity.clone(),
-                order.len(),
-                running_count,
-                selected_session,
-                PanelMode::Docked,
-                t,
-                cx,
-            ))
-            .child(render_body(
-                store,
-                entity,
-                &order,
-                selected_session,
-                PanelMode::Docked,
-                t,
-                cx,
-            )),
-    )
+    let card = div()
+        .w(px(sample.card_width))
+        .h_full()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .rounded(px(RADIUS_STAGE))
+        .bg(t.stage)
+        .border_1()
+        .border_color(t.border_subtle)
+        .shadow(shadow_stage(t))
+        .overflow_hidden()
+        .child(render_header(
+            store,
+            entity.clone(),
+            order.len(),
+            running_count,
+            selected_session,
+            PanelMode::Docked,
+            t,
+            cx,
+        ))
+        .child(render_body(
+            store,
+            entity,
+            &order,
+            selected_session,
+            PanelMode::Docked,
+            t,
+            cx,
+        ));
+
+    Some(wrap_split_drawer(sample, card.into_any_element(), cx))
 }
 
 /// Option A 居中 L3 悬浮观察大窗(由 `DaemonStore` 经 `presence_overlay` 驱动进退场)。

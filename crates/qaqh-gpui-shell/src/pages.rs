@@ -16,14 +16,14 @@ use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::{Disableable, Icon, Sizable, Size};
 use qaqh_gpui_kit::kit::{
     BtnKind, RADIUS_CARD, RADIUS_CHIP, RADIUS_COMPOSER, RADIUS_CONTROL, RADIUS_POPOVER, button,
-    card, kbd, pill, segmented_item, segmented_strip, shadow_composer, shadow_popover, soft,
+    card, pill, segmented_item, segmented_strip, shadow_composer, shadow_popover, soft,
 };
 use qaqh_gpui_kit::motion::{
     accordion_reveal, effective_motion, live_dot, shimmer_label, spring_chevron, stagger_enter,
 };
 use qaqh_gpui_kit::settings::MotionLevel;
 use qaqh_gpui_kit::theme::Palette;
-use qaqh_gpui_session::store::{SettingsEditor, model_effort_levels};
+use qaqh_gpui_session::store::{SettingsEditor, model_default_effort, model_effort_levels};
 use qaqh_gpui_wire::bridge::{BridgeRequest, ConnectionState, ScannedSkill};
 use qaqh_ringing_contract::team::snapshot::TeamAgentStatus;
 use qaqh_ringing_contract::team::task_types::TaskState;
@@ -406,26 +406,6 @@ pub(crate) fn startup_page(
 
     let composer_island = startup_composer_island(daemon, cx, t);
 
-    let shortcuts = div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .text_xs()
-        .text_color(t.faint)
-        .child(kbd("Enter", t))
-        .child("发送并建会话")
-        .child(div().mx_0p5().child("·"))
-        .child(kbd("Shift+Enter", t))
-        .child("换行")
-        .child(div().mx_0p5().child("·"))
-        .child(kbd("Ctrl+B", t))
-        .child("侧栏")
-        .child(div().mx_0p5().child("·"))
-        .child(kbd("Ctrl+,", t))
-        .child("设置");
-
     div()
         .id("startup-scroll")
         .flex_1()
@@ -454,8 +434,7 @@ pub(crate) fn startup_page(
                         .gap_0p5()
                         .children(suggestion_rows),
                 )
-                .child(composer_island)
-                .child(shortcuts),
+                .child(composer_island),
         )
         .into_any_element()
 }
@@ -589,6 +568,7 @@ fn startup_composer_island(
     #[derive(Clone)]
     struct ModelGroup {
         provider_name: String,
+        unauthenticated: bool,
         items: Vec<(ModelSelection, String, String)>,
     }
     let model_groups: Vec<ModelGroup> = daemon
@@ -617,12 +597,20 @@ fn startup_composer_island(
                             items.push((selection, display, ctx));
                         }
                     }
+                    let unauthenticated = match provider.credential {
+                        qaqh_types::CredentialSource::ApiKey => false,
+                        qaqh_types::CredentialSource::ChatgptPlan => !daemon.siwc_ready(),
+                        qaqh_types::CredentialSource::DeepseekAccount => {
+                            !daemon.dsaccount_signed_in()
+                        }
+                    };
                     (!items.is_empty()).then(|| ModelGroup {
                         provider_name: if provider.name.is_empty() {
                             pid.clone()
                         } else {
                             provider.name.clone()
                         },
+                        unauthenticated,
                         items,
                     })
                 })
@@ -674,16 +662,35 @@ fn startup_composer_island(
                         div()
                             .px_2()
                             .pt_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t_copy.faint)
-                            .child(group.provider_name.clone()),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t_copy.faint)
+                                    .child(group.provider_name.clone()),
+                            )
+                            .children(group.unauthenticated.then(|| {
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(t_copy.warn)
+                                    .child("未登录")
+                            })),
                     )
                     .children(group.items.iter().map(|(selection, display, ctx)| {
+                        let unauthenticated = group.unauthenticated;
                         let is_selected = m_current.as_ref().is_some_and(|cur| {
                             cur.provider_id == selection.provider_id
                                 && cur.model_id == selection.model_id
                         });
+                        let subtitle = if unauthenticated {
+                            "需先登录对应账号".to_owned()
+                        } else {
+                            ctx.clone()
+                        };
                         let sel = selection.clone();
                         let w = m_weak.clone();
                         let pop = popover.clone();
@@ -693,14 +700,22 @@ fn startup_composer_island(
                                 sel.provider_id, sel.model_id
                             )),
                             SharedString::from(display.clone()),
-                            Some(SharedString::from(ctx.clone())),
+                            Some(SharedString::from(subtitle)),
                             is_selected,
                             &t_copy,
                             move |window, cx| {
                                 let sel = sel.clone();
                                 let _ = w.update(cx, |daemon, cx| {
-                                    daemon.new_model = Some(sel);
-                                    cx.notify();
+                                    if unauthenticated {
+                                        daemon.navigate(
+                                            crate::daemon::PrimarySection::Access,
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        daemon.new_model = Some(sel);
+                                        cx.notify();
+                                    }
                                 });
                                 let _ = pop.update(cx, |state, cx| state.dismiss(window, cx));
                             },
@@ -729,20 +744,39 @@ fn startup_composer_island(
         })
         .into_any_element();
 
-    // 3) 推理强度 Popover(仅当前所选模型支持推理档位时显示)
+    // 3) 推理强度 Popover(仅当前所选模型或继承的全局默认模型支持推理档位时显示)
+    let effective_model = daemon
+        .new_model
+        .as_ref()
+        .or_else(|| {
+            daemon
+                .providers
+                .as_deref()
+                .and_then(|catalog| catalog.default_model_selection.as_ref())
+        })
+        .cloned();
     let levels = daemon
         .providers
         .as_deref()
-        .zip(daemon.new_model.as_ref())
+        .zip(effective_model.as_ref())
         .map(|(catalog, model)| model_effort_levels(catalog, model))
         .unwrap_or_default();
+    let default_effort = daemon
+        .providers
+        .as_deref()
+        .zip(effective_model.as_ref())
+        .and_then(|(catalog, model)| model_default_effort(catalog, model));
     let effort_popover = (!levels.is_empty()).then(|| {
-        let current_effort = daemon
-            .new_model
+        let current_effort = effective_model
             .as_ref()
             .and_then(|m| m.options.reasoning_effort.clone());
-        let effort_label = current_effort.as_deref().unwrap_or("默认").to_owned();
+        let effort_label = match (&current_effort, &default_effort) {
+            (Some(effort), _) => effort.clone(),
+            (None, Some(def)) => format!("默认 · {def}"),
+            (None, None) => "默认".to_owned(),
+        };
         let e_weak = weak.clone();
+        let base_model = effective_model.clone();
         Popover::new("startup-effort-popover")
             .anchor(Anchor::BottomLeft)
             .appearance(false)
@@ -766,25 +800,35 @@ fn startup_composer_island(
                         .text_color(t_copy.faint)
                         .child("推理强度"),
                 );
-                let mut opts: Vec<(Option<String>, String)> = vec![(None, "默认".to_owned())];
+                let default_sub = default_effort
+                    .as_deref()
+                    .map(|def| format!("模型默认 ({def})"));
+                let mut opts: Vec<(Option<String>, String, Option<String>)> =
+                    vec![(None, "默认".to_owned(), default_sub)];
                 for lvl in &levels {
-                    opts.push((Some(lvl.clone()), lvl.clone()));
+                    opts.push((Some(lvl.clone()), lvl.clone(), None));
                 }
-                for (val, text) in opts {
+                for (val, text, subtitle) in opts {
                     let selected = current_effort == val;
                     let w = e_weak.clone();
                     let pop = popover.clone();
+                    let fallback = base_model.clone();
                     card_box = card_box.child(popover_option_row(
                         SharedString::from(format!("startup-effort-{text}")),
                         SharedString::from(text),
-                        None,
+                        subtitle.map(SharedString::from),
                         selected,
                         &t_copy,
                         move |window, cx| {
                             let val = val.clone();
+                            let fallback = fallback.clone();
                             let _ = w.update(cx, |daemon, cx| {
                                 if let Some(model) = &mut daemon.new_model {
                                     model.options.reasoning_effort = val;
+                                    cx.notify();
+                                } else if let Some(mut model) = fallback {
+                                    model.options.reasoning_effort = val;
+                                    daemon.new_model = Some(model);
                                     cx.notify();
                                 }
                             });
@@ -873,7 +917,7 @@ fn startup_composer_island(
             })
             .text_color(t.on_accent),
         )
-        .tooltip("发送首条消息并创建对话 (Enter)")
+        .tooltip("发送首条消息并创建对话")
         .when(send_disabled, |b| b.disabled(true))
         .on_click(cx.listener(|daemon, _, _, cx| {
             daemon.submit_startup(cx);
@@ -2124,7 +2168,7 @@ pub(crate) fn access_page(
         cx,
         BtnKind::Primary,
         "access-open-catalog",
-        "管理 BYOK 服务商",
+        "管理服务商与模型",
         t,
         cx.listener(|daemon, _, window, cx| {
             daemon.open_settings(SettingsEditor::Catalog, window, cx);
@@ -2204,7 +2248,7 @@ pub(crate) fn access_page(
                 cx,
                 BtnKind::Ghost,
                 "access-edit-byok",
-                "配置 API Key / 端点 →",
+                "管理服务商目录 →",
                 t,
                 cx.listener(|daemon, _, window, cx| {
                     daemon.open_settings(SettingsEditor::Catalog, window, cx);

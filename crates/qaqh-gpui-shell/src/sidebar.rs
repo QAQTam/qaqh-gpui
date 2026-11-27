@@ -14,7 +14,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::assets::IconName;
 use qaqh_gpui_kit::kit::{
-    RADIUS_CONTROL, RADIUS_POPOVER, kbd, shadow_card, shadow_popover, soft, stage_surface,
+    RADIUS_CONTROL, RADIUS_POPOVER, shadow_card, shadow_popover, soft, stage_surface,
 };
 use qaqh_gpui_kit::motion::{
     accordion_reveal, effective_motion, page_enter, presence_overlay, spring_chevron,
@@ -379,7 +379,6 @@ impl Render for DaemonStore {
             .shadow(shadow_card(&t))
             .flex()
             .items_center()
-            .justify_between()
             .cursor_pointer()
             .hover(|style| style.bg(t.card_hover))
             .on_click(cx.listener(|daemon: &mut DaemonStore, _, window, cx| {
@@ -402,8 +401,7 @@ impl Render for DaemonStore {
                             .text_color(t.text)
                             .child("新建对话"),
                     ),
-            )
-            .child(kbd("Ctrl+N", &t));
+            );
 
         let skills_badge = self.skills_report.as_ref().and_then(|report| {
             let count = report.project.len() + report.user.len();
@@ -558,6 +556,11 @@ impl Render for DaemonStore {
         )
         .max(0.0);
         let sidebar_ratio = (animated_width / full_width).clamp(0.0, 1.0);
+        let sidebar_slide_x = if effective_motion(cx) == MotionLevel::Full {
+            -((1.0 - sidebar_ratio) * 16.0)
+        } else {
+            0.0
+        };
         let sidebar_shell = if !self.sidebar_open && animated_width <= 0.5 {
             div().w(px(0.)).h_full().flex_shrink_0()
         } else {
@@ -567,7 +570,7 @@ impl Render for DaemonStore {
                 .opacity(sidebar_ratio)
                 .flex_shrink_0()
                 .overflow_hidden()
-                .child(sidebar_inner)
+                .child(sidebar_inner.ml(px(sidebar_slide_x)))
         };
 
         let raw_main: AnyElement = match self.section {
@@ -625,12 +628,7 @@ impl Render for DaemonStore {
             cx,
         );
 
-        let family = settings.typography.ui_font_family;
-        let root_font = if family.trim().is_empty() {
-            qaqh_gpui_kit::fonts::ui_font_family()
-        } else {
-            SharedString::from(family)
-        };
+        let root_font = qaqh_gpui_kit::fonts::ui_font(&settings.typography.ui_font_family);
         let main_area = div()
             .flex_1()
             .min_w_0()
@@ -721,7 +719,7 @@ impl Render for DaemonStore {
             .flex_col()
             .bg(t.chrome)
             .text_color(t.text)
-            .font_family(root_font)
+            .font(root_font)
             .on_key_down(cx.listener(|daemon, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if daemon.ctx_menu.is_some() {
@@ -750,6 +748,21 @@ impl Render for DaemonStore {
                     if daemon.new_session_open {
                         daemon.new_session_open = false;
                         daemon.settings_form = None;
+                        daemon.sync_sidebar_for_side_panel(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if daemon.active_side_panel_open(cx)
+                        && let Some(current) = &daemon.current
+                    {
+                        current.update(cx, |store, cx| {
+                            if store.code_panel.is_open() {
+                                qaqh_gpui_session::code_panel::close(store, cx);
+                            } else if store.terminal_panel.open {
+                                qaqh_gpui_session::terminal_panel::close(store, cx);
+                            }
+                        });
                         cx.stop_propagation();
                         cx.notify();
                         return;
@@ -760,13 +773,13 @@ impl Render for DaemonStore {
                 }
                 match event.keystroke.key.as_str() {
                     "b" => {
-                        daemon.sidebar_open = !daemon.sidebar_open;
+                        daemon.toggle_sidebar_manual(None, cx);
                     }
                     "n" => {
                         daemon.open_startup(None, window, cx);
                     }
                     "k" => {
-                        daemon.sidebar_open = true;
+                        daemon.toggle_sidebar_manual(Some(true), cx);
                         daemon
                             .session_search
                             .update(cx, |field, cx| field.focus(window, cx));

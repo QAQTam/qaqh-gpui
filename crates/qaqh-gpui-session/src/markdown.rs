@@ -1,5 +1,5 @@
 //! Markdown 渲染(M6 · Plan B):基于 `gpui_kit::base::text::TextView` 原生排版引擎。
-//! - 原生跨段文本拖选、双击选词、三击选段与 `Ctrl+C` 复制;
+//! - 原生跨段文本拖选、双击选词、三击选段与复制;
 //! - 行内 `` `code` `` 等宽字体 + `0.875x` 缩字号 + `code_fg` 微色差 + 4px 圆角描边胶囊;
 //! - H1/H2 标题底部分割线;
 //! - 通过 `MarkdownPlugin` 保留文件/网址 Lucide 图标联动(`code_panel` / 浏览器)与 `widget` 卡片,
@@ -8,8 +8,10 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::HoverCard;
 use gpui_kit::base::text::{
     CodeBlock, InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode,
     MarkdownParseContext, MarkdownPlugin, TextView, TextViewStyle, markdown_ast,
@@ -17,13 +19,16 @@ use gpui_kit::base::text::{
 use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, FontWeight, HighlightStyle, Hsla, Overflow, SharedString,
-    StyleRefinement, WeakEntity, Window, div, px, relative, rems,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Div, FontWeight,
+    HighlightStyle, Hsla, Overflow, SharedString, Stateful, StyleRefinement, WeakEntity, Window,
+    div, px, relative, rems,
 };
+use qaqh_gpui_kit::icons::{AppIcon, file_icon, render_app_icon};
 use qaqh_gpui_kit::kit::{
-    RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, shadow_card, soft,
+    RADIUS_CARD, RADIUS_CHIP, RADIUS_CONTROL, RADIUS_POPOVER, shadow_card, shadow_popover, soft,
 };
-use qaqh_gpui_kit::settings::Typography;
+use qaqh_gpui_kit::motion::effective_motion;
+use qaqh_gpui_kit::settings::{MotionLevel, Typography};
 use qaqh_gpui_kit::theme::{ActiveTheme, Palette};
 
 use crate::store::SessionStore;
@@ -32,16 +37,15 @@ const LINK_ICON_NODE: &str = "qaqh-link-icon";
 const WIDGET_NODE: &str = "qaqh-widget";
 const MAX_PILL_CHARS: usize = 72;
 
-/// 正文阅读轨外框附加宽度(含左右 `px_4` 内边距),与原时间线内容宽保持像素一致。
-pub const PROSE_RAIL_PAD_PX: f32 = 48.0;
-/// 顶层 Markdown 表格对称破栏宽出量(左右各 +120px,4px 网格),充分利用宽屏舞台留白。
-pub const TABLE_BREAKOUT_EXTRA_PX: f32 = 240.0;
-/// 超过该列数才启用横向滚动兜底;常规 2~6 列表格默认积极折行、一屏完整展示。
-const WIDE_TABLE_SCROLL_COLS: usize = 7;
+/// 顶层 Markdown 宽表格相对正文栏宽的对称拓展上限(左右各 +15px,总 +30px)。
+pub const TABLE_BREAKOUT_EXTRA_PX: f32 = 30.0;
+/// 超过该列数才启用横向滚动兜底;常规 2~4 列表格默认积极折行、一屏完整展示。
+const WIDE_TABLE_SCROLL_COLS: usize = 5;
 
 #[derive(Clone, PartialEq, Eq)]
 enum LinkTarget {
     Web(String),
+    GitHub(crate::github_preview::GitHubRef),
     Source(crate::code_panel::Location),
 }
 
@@ -86,7 +90,9 @@ fn is_http_url(url: &str) -> bool {
 }
 
 fn classify_href(url: &str) -> Option<LinkTarget> {
-    if is_http_url(url) {
+    if let Some(gh) = crate::github_preview::GitHubRef::parse_url(url) {
+        Some(LinkTarget::GitHub(gh))
+    } else if is_http_url(url) {
         Some(LinkTarget::Web(url.to_owned()))
     } else {
         crate::code_panel::Location::parse(url, false).map(LinkTarget::Source)
@@ -102,19 +108,26 @@ fn web_host(url: &str) -> &str {
     authority.split(':').next().unwrap_or("")
 }
 
-fn link_icons(target: &LinkTarget) -> ((IconName, IconRole), Option<(IconName, IconRole)>) {
+fn link_icons(target: &LinkTarget) -> ((AppIcon, IconRole), Option<(IconName, IconRole)>) {
     match target {
+        LinkTarget::GitHub(_) => (
+            (AppIcon::Lucide(IconName::Github), IconRole::Web),
+            Some((IconName::ExternalLink, IconRole::Dim)),
+        ),
         LinkTarget::Web(url) => {
             let host = web_host(url).to_ascii_lowercase();
             let lead = if host == "github.com" || host.ends_with(".github.com") {
-                (IconName::Github, IconRole::Web)
+                (AppIcon::Lucide(IconName::Github), IconRole::Web)
             } else {
-                (IconName::Globe, IconRole::Web)
+                (AppIcon::Lucide(IconName::Globe), IconRole::Web)
             };
             (lead, Some((IconName::ExternalLink, IconRole::Dim)))
         }
         LinkTarget::Source(loc) => {
             let path = loc.path();
+            if let Some(brand) = file_icon(path) {
+                return ((AppIcon::Brand(brand), IconRole::Dim), None);
+            }
             let file_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -204,7 +217,7 @@ fn link_icons(target: &LinkTarget) -> ((IconName, IconRole), Option<(IconName, I
             } else {
                 (IconName::FileText, IconRole::Dim)
             };
-            (lead, None)
+            ((AppIcon::Lucide(lead.0), lead.1), None)
         }
     }
 }
@@ -264,12 +277,24 @@ impl MarkdownPlugin for LinkIconPlugin {
         match node {
             markdown_ast::Node::Link(link) => {
                 let target = classify_href(&link.url)?;
-                let mut label = String::new();
-                collect_plain_text(&link.children, &mut label);
-                let label = label.trim().to_owned();
-                if label.is_empty() || label.chars().count() > MAX_PILL_CHARS {
-                    return None;
-                }
+                let mut raw_label = String::new();
+                collect_plain_text(&link.children, &mut raw_label);
+                let trimmed = raw_label.trim();
+                let label = match &target {
+                    LinkTarget::GitHub(gh)
+                        if trimmed.is_empty()
+                            || is_http_url(trimmed)
+                            || trimmed.chars().count() > MAX_PILL_CHARS =>
+                    {
+                        gh.short_label()
+                    }
+                    _ => {
+                        if trimmed.is_empty() || trimmed.chars().count() > MAX_PILL_CHARS {
+                            return None;
+                        }
+                        trimmed.to_owned()
+                    }
+                };
                 let is_code =
                     matches!(link.children.as_slice(), [markdown_ast::Node::InlineCode(_)]);
                 let data = LinkIconData {
@@ -304,8 +329,20 @@ impl MarkdownPlugin for LinkIconPlugin {
     ) -> Option<InlineElement> {
         let data = node.data::<LinkIconData>()?.clone();
         let t = *cx.colors();
-        let ((lead_icon, lead_role), trail) = link_icons(&data.target);
         let id_offset = node.source_range().map_or(0, |r| r.start);
+        if let LinkTarget::GitHub(gh_ref) = data.target {
+            return Some(render_github_pill(
+                gh_ref,
+                data.label,
+                id_offset,
+                context,
+                self.session.clone(),
+                &t,
+                cx,
+            ));
+        }
+
+        let ((lead_icon, lead_role), trail) = link_icons(&data.target);
         let is_web = matches!(data.target, LinkTarget::Web(_));
 
         let label_view = if data.is_code {
@@ -343,6 +380,7 @@ impl MarkdownPlugin for LinkIconPlugin {
             .hover(|style| style.bg(t.hover))
             .on_click(move |_, _, cx| match &target {
                 LinkTarget::Web(url) => cx.open_url(url),
+                LinkTarget::GitHub(gh) => cx.open_url(&gh.url),
                 LinkTarget::Source(location) => {
                     let location = location.clone();
                     let _ = session.update(cx, |store, cx| {
@@ -350,11 +388,7 @@ impl MarkdownPlugin for LinkIconPlugin {
                     });
                 }
             })
-            .child(
-                Icon::new(lead_icon)
-                    .with_size(Size::XSmall)
-                    .text_color(lead_role.color(&t)),
-            )
+            .child(render_app_icon(lead_icon, 13.0, lead_role.color(&t)))
             .child(label_view);
 
         if let Some((trail_icon, trail_role)) = trail {
@@ -367,6 +401,254 @@ impl MarkdownPlugin for LinkIconPlugin {
 
         Some(InlineElement::new(row))
     }
+}
+
+fn github_state_visual(
+    kind: crate::github_preview::GitHubKind,
+    state: crate::github_preview::GitHubItemState,
+    t: &Palette,
+) -> (IconName, Hsla) {
+    use crate::github_preview::{GitHubItemState, GitHubKind};
+    match (kind, state) {
+        (GitHubKind::Pull, GitHubItemState::Open) => (IconName::GitPullRequest, t.ok),
+        (GitHubKind::Pull, GitHubItemState::Merged) => (IconName::GitMerge, t.syn_keyword),
+        (GitHubKind::Pull, GitHubItemState::Closed) => (IconName::GitPullRequestClosed, t.bad),
+        (GitHubKind::Pull, GitHubItemState::Draft) => (IconName::GitPullRequestDraft, t.dim),
+        (GitHubKind::Issue, GitHubItemState::Open) => (IconName::CircleDot, t.ok),
+        (GitHubKind::Issue, GitHubItemState::Merged | GitHubItemState::Closed) => {
+            (IconName::CircleCheck, t.syn_keyword)
+        }
+        (GitHubKind::Issue, GitHubItemState::Draft) => (IconName::CircleDot, t.dim),
+    }
+}
+
+fn render_github_pill(
+    gh_ref: crate::github_preview::GitHubRef,
+    label: String,
+    id_offset: usize,
+    context: &InlineRenderContext,
+    session: WeakEntity<SessionStore>,
+    t: &Palette,
+    cx: &App,
+) -> InlineElement {
+    let (ready_meta, is_loading) = crate::github_preview::snapshot(cx, &gh_ref);
+    let animate = effective_motion(cx) != MotionLevel::Off;
+
+    let lead_icon: AnyElement = if is_loading {
+        let spinner = Icon::new(IconName::LoaderCircle)
+            .with_size(Size::XSmall)
+            .text_color(t.dim);
+        if animate {
+            spinner
+                .with_animation(
+                    SharedString::from(format!("gh-spin-{}-{}", id_offset, gh_ref.number)),
+                    Animation::new(Duration::from_millis(900)).repeat(),
+                    |icon, delta| icon.rotate(gpui_kit::Radians(delta * std::f32::consts::TAU)),
+                )
+                .into_any_element()
+        } else {
+            spinner.into_any_element()
+        }
+    } else if let Some(meta) = &ready_meta {
+        let (icon_name, color) = github_state_visual(meta.reference.kind, meta.state, t);
+        Icon::new(icon_name)
+            .with_size(Size::XSmall)
+            .text_color(color)
+            .into_any_element()
+    } else {
+        Icon::new(IconName::Github)
+            .with_size(Size::XSmall)
+            .text_color(t.dim)
+            .into_any_element()
+    };
+
+    let gh_for_hover = gh_ref.clone();
+    let url_for_click = gh_ref.url.clone();
+    let pill = div()
+        .id(("md-gh-pill", id_offset ^ (gh_ref.number as usize)))
+        .px(px(5.))
+        .py(px(1.))
+        .rounded(px(RADIUS_CHIP))
+        .bg(t.surface_subtle)
+        .border_1()
+        .border_color(t.border_subtle)
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .text_size(context.font_size())
+        .line_height(context.line_height())
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_hover(move |hovered, _window, cx| {
+            if *hovered {
+                crate::github_preview::request_on_hover(
+                    gh_for_hover.clone(),
+                    session.clone(),
+                    cx,
+                );
+            }
+        })
+        .on_click(move |_, _, cx| cx.open_url(&url_for_click))
+        .child(lead_icon)
+        .child(
+            div()
+                .text_color(t.syn_function)
+                .child(SharedString::from(label)),
+        );
+
+    let card_id = SharedString::from(format!(
+        "gh-hover-{}-{}-{}-{}",
+        gh_ref.owner, gh_ref.repo, gh_ref.number, id_offset
+    ));
+    let hover_card = HoverCard::new(card_id)
+        .anchor(Anchor::TopLeft)
+        .open_delay(Duration::from_millis(220))
+        .close_delay(Duration::from_millis(260))
+        .trigger(pill)
+        .when_some(ready_meta, |card, meta| {
+            card.content(move |_, _, cx| render_github_hover_card(&meta, cx))
+        });
+
+    InlineElement::new(hover_card)
+}
+
+fn render_github_hover_card(
+    meta: &crate::github_preview::GitHubItemMeta,
+    cx: &App,
+) -> Stateful<Div> {
+    let t = *cx.colors();
+    let (state_icon, state_color) = github_state_visual(meta.reference.kind, meta.state, &t);
+    let url = meta.reference.url.clone();
+
+    let header = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .id("gh-card-repo-link")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .on_click(move |_, _, cx| cx.open_url(&url))
+                .child(
+                    Icon::new(IconName::Github)
+                        .with_size(Size::XSmall)
+                        .text_color(t.text),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.syn_function)
+                        .child(SharedString::from(meta.reference.full_label())),
+                ),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py(px(1.))
+                .rounded_full()
+                .bg(soft(state_color, 0.14))
+                .border_1()
+                .border_color(soft(state_color, 0.28))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(state_color)
+                .child(
+                    Icon::new(state_icon)
+                        .with_size(Size::XSmall)
+                        .text_color(state_color),
+                )
+                .child(meta.state.label()),
+        );
+
+    let mut card = div()
+        .id("gh-pr-hover-card")
+        .w(px(360.))
+        .max_w(px(400.))
+        .p_3()
+        .rounded(px(RADIUS_POPOVER))
+        .bg(t.card)
+        .border_1()
+        .border_color(t.border)
+        .shadow(shadow_popover(&t))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(header)
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.text)
+                .child(SharedString::from(meta.title.clone())),
+        );
+
+    if meta.branch.is_some() || meta.author.is_some() {
+        let mut rows = div().flex().flex_col().gap_1();
+        if let Some((head, base)) = &meta.branch {
+            rows = rows.child(github_meta_row(
+                "Branch",
+                div()
+                    .font_family(qaqh_gpui_kit::fonts::mono_font_family())
+                    .text_xs()
+                    .text_color(t.text)
+                    .child(SharedString::from(format!("{head} → {base}"))),
+                &t,
+            ));
+        }
+        if let Some(author) = &meta.author {
+            rows = rows.child(github_meta_row(
+                "Author",
+                div()
+                    .text_xs()
+                    .text_color(t.text)
+                    .child(SharedString::from(format!("@{author}"))),
+                &t,
+            ));
+        }
+        card = card.child(rows);
+    }
+
+    if let Some(summary) = &meta.summary {
+        card = card
+            .child(div().h(px(1.)).w_full().bg(t.border_subtle))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(t.dim)
+                    .child(SharedString::from(summary.clone())),
+            );
+    }
+
+    card
+}
+
+fn github_meta_row(label: &'static str, value: impl IntoElement, t: &Palette) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap_2()
+        .child(
+            div()
+                .w(px(52.))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(t.faint)
+                .child(label),
+        )
+        .child(div().flex_1().min_w_0().child(value))
 }
 
 struct WidgetBlockPlugin;
@@ -571,6 +853,7 @@ fn build_text_view_style(t: &Palette, compact: bool, scroll_tables: bool) -> Tex
     let table_head = StyleRefinement::default()
         .bg(t.surface_subtle)
         .text_color(t.text);
+    let table_cell = StyleRefinement::default().px(px(10.)).py(px(6.));
 
     TextViewStyle::default()
         .with_foreground(t.text)
@@ -598,6 +881,7 @@ fn build_text_view_style(t: &Palette, compact: bool, scroll_tables: bool) -> Tex
         .with_code_block(code_block)
         .with_table(table)
         .with_table_head(table_head)
+        .with_table_cell(table_cell)
         .with_table_row_hover(t.hover)
         .with_dark(t.bg.l <= 0.5)
 }
@@ -875,10 +1159,42 @@ pub fn render_document(
     .into_any_element()
 }
 
-/// 主对话正文 Markdown 渲染(支持顶层表格对称破栏宽出):
-/// - 普通正文守住 `content_width + PROSE_RAIL_PAD_PX` 最佳阅读行宽;
-/// - 顶层表格对称向外借用 `TABLE_BREAKOUT_EXTRA_PX` 舞台留白,窗口窄时自动贴边收缩;
-/// - 2~6 列表格默认积极折行一屏完整可见,7+ 列超宽表启用横向滚动兜底与图标操作条。
+/// 估算 GFM 表格的自然总宽(px),用于让 2~3 列短表紧贴内容自适应收束,不拉满整行大空白;
+/// 长内容表格自动放大至栏宽上限并在单元格内自动换行。
+fn estimate_table_natural_width(markdown: &str, cols: usize) -> f32 {
+    let mut col_max = vec![48.0_f32; cols.max(1)];
+    for (row_ix, line) in markdown.lines().enumerate() {
+        if row_ix == 1 && parse_table_delimiter_cols(line).is_some() {
+            continue;
+        }
+        for (col_ix, cell) in split_table_cells(line).into_iter().take(cols).enumerate() {
+            let trimmed = cell.trim();
+            let mut text_w = 0.0_f32;
+            let mut has_inline_code = false;
+            for ch in trimmed.chars() {
+                if ch == '`' {
+                    has_inline_code = true;
+                    continue;
+                }
+                text_w += if ch.is_ascii() { 8.0 } else { 15.0 };
+            }
+            if has_inline_code {
+                text_w += 16.0;
+            }
+            let cell_w = (text_w * 1.15 + 24.0).max(56.0);
+            if cell_w > col_max[col_ix] {
+                col_max[col_ix] = cell_w;
+            }
+        }
+    }
+    col_max.into_iter().sum::<f32>() + 16.0
+}
+
+/// 主对话正文 Markdown 渲染(支持顶层表格自适应排版):
+/// - 普通正文守住 `MESSAGE_MAX_WIDTH_PX`(880px)最佳阅读行宽,窄窗口自动压缩;
+/// - 2~3 列表格贴合正文左缘按内容估算宽度自适应收束(不超过 880px),长单元格自动换行;
+/// - 4+ 列表格最多对称向正文左右各拓展 15px(`TABLE_BREAKOUT_EXTRA_PX = 30px`),窄屏自动收缩;
+/// - 5+ 列超宽表先按行宽折行,超出最小列宽后启用横向滚动兜底与图标操作条。
 pub fn render_document_breakout(
     id: impl Into<SharedString>,
     source: &str,
@@ -888,8 +1204,8 @@ pub fn render_document_breakout(
     ty: &Typography,
 ) -> AnyElement {
     let base_id = id.into();
-    let prose_max = px(ty.content_width + PROSE_RAIL_PAD_PX);
-    let table_max = px(ty.content_width + PROSE_RAIL_PAD_PX + TABLE_BREAKOUT_EXTRA_PX);
+    let prose_max = px(qaqh_gpui_kit::settings::MESSAGE_MAX_WIDTH_PX);
+    let table_max = px(qaqh_gpui_kit::settings::MESSAGE_MAX_WIDTH_PX + TABLE_BREAKOUT_EXTRA_PX);
     let segments = split_markdown_tables(source);
 
     if !segments
@@ -930,6 +1246,12 @@ pub fn render_document_breakout(
                 } else {
                     doc_style.clone()
                 };
+                let fit_inner = if cols <= 3 {
+                    let inner_limit = qaqh_gpui_kit::settings::MESSAGE_MAX_WIDTH_PX - 32.0;
+                    Some(estimate_table_natural_width(&markdown, cols).clamp(320.0, inner_limit))
+                } else {
+                    None
+                };
                 let copy_md: SharedString = markdown.clone().into();
                 let view = build_document_view(
                     seg_id,
@@ -961,7 +1283,7 @@ pub fn render_document_breakout(
                                         .with_size(Size::XSmall)
                                         .text_color(t.faint),
                                 )
-                                .child("Shift+滚轮或触控板横滑")
+                                .child("可横向滑动查看")
                         }))
                         .child(
                             div()
@@ -990,7 +1312,18 @@ pub fn render_document_breakout(
                                 ),
                         )
                 });
-                stack = stack.child(div().w_full().max_w(table_max).mx_auto().px_4().child(view));
+                let table_block = if let Some(fit_inner) = fit_inner {
+                    // `prose_max` 容器左右各有 `px_4` (合计 32px),内层按内容自适应并在超长时封顶贴齐正文右缘。
+                    div()
+                        .w_full()
+                        .max_w(prose_max)
+                        .mx_auto()
+                        .px_4()
+                        .child(div().w_full().max_w(px(fit_inner)).child(view))
+                } else {
+                    div().w_full().max_w(table_max).mx_auto().px_4().child(view)
+                };
+                stack = stack.child(table_block);
             }
         }
     }
