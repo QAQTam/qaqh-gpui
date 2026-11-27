@@ -12,6 +12,7 @@ workspace = true
 base64 = { workspace = true }
 futures = { workspace = true }
 qaqh-client = { workspace = true, features = ["shell-stream"] }
+qaqh-ringing-v3 = { workspace = true }
 qaqh-ringing-contract = { workspace = true }
 qaqh-types = { workspace = true }
 qaqh-profile = { workspace = true }

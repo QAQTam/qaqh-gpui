@@ -5456,6 +5456,7 @@ dependencies = [
  "qaqh-client",
  "qaqh-profile",
  "qaqh-ringing-contract",
+ "qaqh-ringing-v3",
  "qaqh-types",
  "serde",
  "serde_json",
